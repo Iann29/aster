@@ -41,11 +41,7 @@ pub trait CapsuleStore: Send + Sync {
     /// `StoreError::NotFound`. NotFound is reserved for "the *store* doesn't
     /// know how to answer this question", e.g. the requested timestamp is
     /// outside the retention window.
-    fn read_point(
-        &self,
-        key: &DocumentId,
-        ts: Timestamp,
-    ) -> Result<VersionedDocument, StoreError>;
+    fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError>;
 
     /// Read every document whose key starts with `prefix`, up to `limit` rows,
     /// at the given snapshot. Used by the v0.3 prefix read trap path.
@@ -125,11 +121,7 @@ impl CapsuleStore for &MvccStore {
         Ok(MvccStore::snapshot_ts(self))
     }
 
-    fn read_point(
-        &self,
-        key: &DocumentId,
-        ts: Timestamp,
-    ) -> Result<VersionedDocument, StoreError> {
+    fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
         Ok(MvccStore::read_at(self, key, ts))
     }
 
@@ -151,7 +143,9 @@ impl CapsuleStore for &MvccStore {
     ) -> Result<SnapshotCapsule, StoreError> {
         // The in-memory store has a hot-path build_capsule that avoids the
         // per-key Mutex-lock loop the default trait impl would take.
-        Ok(MvccStore::build_capsule(self, tenant, deployment, ts, prewarm))
+        Ok(MvccStore::build_capsule(
+            self, tenant, deployment, ts, prewarm,
+        ))
     }
 }
 
@@ -163,11 +157,7 @@ impl CapsuleStore for MvccStore {
         Ok(MvccStore::snapshot_ts(self))
     }
 
-    fn read_point(
-        &self,
-        key: &DocumentId,
-        ts: Timestamp,
-    ) -> Result<VersionedDocument, StoreError> {
+    fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
         Ok(MvccStore::read_at(self, key, ts))
     }
 
@@ -187,7 +177,9 @@ impl CapsuleStore for MvccStore {
         ts: Timestamp,
         prewarm: Vec<DocumentId>,
     ) -> Result<SnapshotCapsule, StoreError> {
-        Ok(MvccStore::build_capsule(self, tenant, deployment, ts, prewarm))
+        Ok(MvccStore::build_capsule(
+            self, tenant, deployment, ts, prewarm,
+        ))
     }
 }
 
@@ -199,11 +191,7 @@ impl<S: CapsuleStore + ?Sized> CapsuleStore for Arc<S> {
         (**self).snapshot_ts()
     }
 
-    fn read_point(
-        &self,
-        key: &DocumentId,
-        ts: Timestamp,
-    ) -> Result<VersionedDocument, StoreError> {
+    fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
         (**self).read_point(key, ts)
     }
 
@@ -291,4 +279,3 @@ mod tests {
         assert!(backend.to_string().contains("syntax error"));
     }
 }
-
