@@ -28,9 +28,8 @@ jobs:
         run: |
           # The repo pins rust-version 1.75 in workspace.package; we use
           # stable so we automatically pick up patch updates the team has
-          # been validating against. cargo fmt + clippy live on the same
-          # toolchain to keep CI behaviour boring.
-          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          # been validating against. fmt + clippy live on the same toolchain.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 
       - name: Cache cargo registry + git
