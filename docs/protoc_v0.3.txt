@@ -1,0 +1,2 @@
+$ protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.3.pb proto/aster.proto
+-rw-r--r-- 1 ian ian 3756 May  3 17:18 /tmp/aster-v0.3.pb

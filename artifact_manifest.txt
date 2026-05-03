@@ -1,31 +1,42 @@
-Aster Runner v0.2 artifact manifest
+Aster Runner v0.3 artifact manifest
 
 Core workspace:
 - Cargo.toml
 - Cargo.lock
-- crates/capsule/              Snapshot capsules, MVCC store, OCC, BLAKE3 seals
+- crates/capsule/              Snapshot capsules, MVCC store, OCC, BLAKE3 seals, serde wire types
 - crates/runner/               v0.1 in-process capsule runner model
+- crates/broker/               Broker trait and in-process broker implementation
+- crates/ipc/                  v0.3 UDS IPC client, brokerd/cell binaries, process E2E
 - crates/host/                 Host facade, e2e tests, benchmark binary
-- crates/v8cell/               v0.2 real V8 Promise read-trap continuation PoC
-- proto/aster.proto            Internal Aster protocol, extended with capsule seals
+- crates/v8cell/               Real V8 Promise read-trap continuation PoC
+- proto/aster.proto            Internal Aster protocol, now with InitialCapsule flow
 
 Docs:
-- docs/ARCHITECTURE.md         v0.2 architecture document
+- docs/ARCHITECTURE.md         v0.3 architecture document
 - docs/ARCHITECTURE_V0.1.md    archived v0.1 architecture document
-- docs/V8_QUESTION.md          focused V8 answer and experiment
-- docs/THEORY_REGISTER.md      theory register
-- docs/ABSURD_IDEAS.md         absurd-ideas register
+- docs/ARCHITECTURE_V0.2.md    archived v0.2 architecture document
+- docs/ARCHITECTURE_V0.3.md    v0.3 archive pointer
+- docs/V8_QUESTION.md          focused V8 answer updated for IPC
+- docs/THEORY_REGISTER.md      theory register updated with process-boundary theory
+- docs/ABSURD_IDEAS.md         absurd-ideas register updated with one-shot socket idea
 - docs/COMPARISON_MATRIX_V0.2.md
+- docs/COMPARISON_MATRIX_V0.3.md
 - docs/SYNAPSE_MIGRATION_V0.2.md
-- docs/toolchain_check_v0.2.txt
-- docs/cargo_build_v0.2.txt
-- docs/cargo_test_v0.2.txt
-- docs/bench_results_v0.2.json
-- docs/bench_results_v0.2.stderr
-- docs/protoc_v0.2.txt
+- docs/SYNAPSE_MIGRATION_V0.3.md
+- docs/toolchain_check_v0.3.txt
+- docs/cargo_build_v0.3.txt
+- docs/cargo_test_v0.3.txt
+- docs/bench_results_v0.3.json
+- docs/bench_results_v0.3.stderr
+- docs/protoc_v0.3.txt
+- docs/ipc_process_e2e_v0.3.txt
+- docs/ipc_manual_run_v0.3.txt
 
 Validation commands executed:
+- cargo fmt --all -- --check
 - cargo build --workspace
 - cargo test --workspace
 - cargo run --release -p aster-host --bin aster_bench -- 10000 32
-- protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.2.pb proto/aster.proto
+- protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.3.pb proto/aster.proto
+- cargo test -p aster-ipc --test process_boundary -- --nocapture
+- manual aster_brokerd + aster_v8cell run over UDS

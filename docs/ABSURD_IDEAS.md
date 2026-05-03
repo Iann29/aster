@@ -1,4 +1,4 @@
-# Aster Runner v0.2 absurd-ideas register
+# Aster Runner v0.3 absurd-ideas register
 
 These are intentionally not roadmap commitments. They are ideas that sound implausible at first read but are concrete enough to falsify.
 
@@ -48,12 +48,26 @@ These are intentionally not roadmap commitments. They are ideas that sound impla
 
 **Hypothesis:** The safest broker/cell interface might not be request/response RPC. It could be a one-way shared-memory or pipe protocol where the cell can only append fixed-size trap descriptors, and the broker writes capsule deltas to a separate sealed channel. The cell never sends protobuf/JSON to the broker.
 
-**Argument:** Parser bugs in privileged brokers are a classic escape path. Aster traps are structurally small: point key, prefix key, limit, prior digest. A ring buffer with fixed records and kernel-enforced directionality would reduce attack surface. This sounds excessive for a VPS, but it directly targets the most security-sensitive boundary.
+**Argument:** Parser bugs in privileged brokers are a classic escape path. Aster traps are structurally small: point key, prefix key, limit, prior digest. A ring buffer with fixed records and kernel-enforced directionality would reduce attack surface. This sounds excessive for a VPS, but it directly targets the most security-sensitive boundary. v0.3 makes the motivation concrete: `aster_brokerd` now has a JSON parser on the privileged side of a UDS boundary, with a frame cap but no deep parser hardening.
 
 **Falsification:** Implement a UDS/protobuf broker and a ring-buffer broker, fuzz both, and measure throughput/latency under 1M traps. If protobuf+strict validation is simpler and no slower enough to matter, the diode is overengineering.
 
 **If true, consequences:** Production cells use a tiny trap ABI and the broker's parser surface shrinks dramatically.
 
 **If false, consequences:** Use tonic/UDS with strict message size caps and fuzzing.
+
+**Status:** speculative.
+
+## Absurd idea 5: Give every cell a private broker socket that self-destructs after one invocation
+
+**Hypothesis:** Instead of authenticating cell identity on a shared broker socket, the supervisor could create a fresh socketpair or private UDS path per invocation, pass one endpoint to the cell, and have the broker destroy the channel after the final capsule seal. The socket itself becomes a short-lived capability.
+
+**Argument:** v0.3's shared socket needs peer credentials, cell IDs, lease epochs, and replay protection. A one-shot channel could collapse several checks into the kernel object lifetime and supervisor handoff. It sounds operationally clumsy, but function invocations already have lifecycle boundaries and trap budgets.
+
+**Falsification:** Implement shared-socket and one-shot-socket modes, then compare p50/p99 setup overhead, leaked socket cleanup after crashes, and security bugs found by replay tests. If setup overhead dominates or cleanup is unreliable, keep the shared broker socket.
+
+**If true, consequences:** The production supervisor becomes more important, but broker authentication gets simpler: the accepted connection already names one invocation and one cell lease.
+
+**If false, consequences:** Keep the shared UDS broker and harden it with `SO_PEERCRED`, sequence numbers, nonces, and per-cell rate limits.
 
 **Status:** speculative.

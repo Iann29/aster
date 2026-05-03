@@ -1,4 +1,4 @@
-# Aster Runner v0.2 theory register
+# Aster Runner v0.3 theory register
 
 ## Theory 1: Promise-trap continuations are the V8-compatible form of read traps
 
@@ -12,7 +12,7 @@
 
 **If false, consequences:** Aster falls back to a two-pass deterministic replay model: first run records missing reads and aborts; the broker hydrates; second run restarts from entry with a larger capsule. That preserves capability separation but loses mid-execution continuation latency advantages.
 
-**Status:** demonstrated for a minimal V8 API; partially demonstrated for Convex because Convex's own runner already drives UDF async syscalls through pending PromiseResolvers and explicit microtask checkpoints.
+**Status:** demonstrated for a minimal V8 API in-process and across a UDS process boundary; partially demonstrated for Convex because Convex's own runner already drives UDF async syscalls through pending PromiseResolvers and explicit microtask checkpoints.
 
 ## Theory 2: Capsule seals are the security boundary, root hashes are just names
 
@@ -26,7 +26,7 @@
 
 **If false, consequences:** Replace keyed BLAKE3 with Ed25519 signatures over a protobuf canonical form or with HMAC-SHA-256 over a separately audited canonical encoding. The architecture still needs a seal; only the construction changes.
 
-**Status:** demonstrated in prototype for in-memory capsules; serialization format still needs production canonicalization.
+**Status:** demonstrated in prototype for in-memory capsules and serialized JSON IPC capsules. Production still needs protobuf/canonical-wire fuzzing and key rotation.
 
 ## Theory 3: Syscall inversion is a smaller Convex integration than wire emulation
 
@@ -42,7 +42,21 @@
 
 **Status:** speculative/partially demonstrated. The code experiment proves the V8 mechanism; repository reading identifies the Convex seam; no real Convex compatibility fixture yet.
 
-## Theory 4: Cells should be routed by capsule locality, not only by tenant affinity
+## Theory 4: Process boundaries are a necessary but insufficient authority boundary
+
+**Hypothesis:** Moving the broker and V8 cell into separate OS processes materially improves the authority story because cells no longer share an address space with the store or seal key, but it is not sufficient without kernel sandboxing, peer credentials, lease enforcement, and request sequencing.
+
+**Argument:** v0.3's `aster-ipc` E2E spawns `aster_brokerd` and `aster_v8cell`. The cell binary uses `UdsCapsuleBrokerClient`, has no `MvccStore` import, receives no seal key, emits a missing read over UDS, and resumes V8 after the broker reseals. Wrong-cell hydrate replay is rejected over the same socket. This closes the v0.2 in-process authority gap. However, any same-host process that can connect to the socket can still attempt parser attacks or replay valid sealed capsules unless the broker checks peer credentials and leases.
+
+**Falsification:** Show that the cell process can obtain document values or forge hydrated capsules without using the broker socket, or show that the process boundary adds no containment under a realistic V8 escape because the cell still has equivalent OS authority. A subtler falsifier is a replay/credential-spoofing attack that succeeds despite correct seals.
+
+**If true, consequences:** v0.4 should harden the process boundary rather than adding more in-process features: `SO_PEERCRED`, per-cell socket directories, supervisor-issued lease epochs, trap sequence numbers, cgroups/seccomp/namespaces, and broker parser fuzzing.
+
+**If false, consequences:** If process separation is insufficient in practice, Aster needs a stronger isolation primitive earlier: gVisor/Firecracker per cell, a broker request diode, or deterministic replay back in the trusted backend.
+
+**Status:** demonstrated as a runnable authority split, not yet production-hardened.
+
+## Theory 5: Cells should be routed by capsule locality, not only by tenant affinity
 
 **Hypothesis:** Tenant pinning is necessary for security, but insufficient for performance. For hot deployments, the scheduler should route an invocation to the cell that is most likely to already hold the capsule deltas for that function/read-set shape.
 
@@ -56,7 +70,7 @@
 
 **Status:** speculative.
 
-## Theory 5: Effect fences can be generalized into a causal ledger for all non-database authority
+## Theory 6: Effect fences can be generalized into a causal ledger for all non-database authority
 
 **Hypothesis:** The action effect fence should not be a special case for webhooks. It should be a generic causal ledger entry for every external authority: network egress, secret access, file storage, scheduled jobs, and nested Convex calls.
 

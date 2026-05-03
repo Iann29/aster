@@ -1,4 +1,4 @@
-# The V8 question in Aster v0.2
+# The V8 question in Aster v0.3
 
 ## Question
 
@@ -8,7 +8,7 @@ v0.1 modeled read-trap continuations with a Rust enum. The load-bearing question
 
 Yes, with an important narrowing: **Aster continuations are Promise continuations, not arbitrary captured V8 stacks.**
 
-The v0.2 crate `aster-v8cell` implements the proof. It installs one host API into a V8 context:
+The v0.2 crate `aster-v8cell` implemented the proof, and v0.3 keeps that proof intact while moving hydration across a Unix-domain-socket broker. The cell installs one host API into a V8 context:
 
 ```js
 Aster.read(key, field)
@@ -19,8 +19,8 @@ If the key/field is present in the capsule, the callback returns a JS value. If 
 1. drains V8 microtasks with `perform_microtask_checkpoint`,
 2. observes that the top-level Promise is pending,
 3. pops the typed read trap,
-4. reads the missing document from `MvccStore` at the original snapshot timestamp,
-5. extends the capsule,
+4. asks its `CapsuleBrokerClient` to hydrate the missing document at the original snapshot timestamp,
+5. receives a resealed capsule from either the local broker (v0.2 path) or UDS broker process (v0.3 path),
 6. resolves the exact stored `PromiseResolver`, and
 7. calls another microtask checkpoint so V8 resumes the async function.
 
@@ -34,7 +34,7 @@ async function main() {
 }
 ```
 
-With `counters/a` prewarmed and `counters/b` absent from the initial capsule, the function returns `42` after exactly one read trap inside a real V8 isolate.
+With `counters/a` prewarmed and `counters/b` absent from the initial capsule, the function returns `42` after exactly one read trap inside a real V8 isolate. In v0.3, `crates/ipc/tests/process_boundary.rs` proves the same result when the V8 isolate is in a separate `aster_v8cell` process and hydration happens through `aster_brokerd` over UDS.
 
 ## Why this is compatible with V8 internals
 
@@ -54,17 +54,19 @@ The cloned `convex-backend` repository reinforces this direction. In `crates/iso
 
 That is the production-shaped seam for Aster: replace or wrap the syscall executor for reads so missing capsule entries become typed traps to a broker, while warm entries resolve from the capsule immediately.
 
-## What v0.2 does not prove
+## What v0.3 does not prove
 
 - It does not execute the real Convex `convex/server` module loader.
 - It does not speak the Funrun remote-runner wire format.
 - It does not prove that every Convex database syscall can be represented without a backend patch.
+- It does not add seccomp/cgroups/namespaces around the cell process.
 - It does not support synchronous stack capture; if a future Convex API required synchronous database reads, Aster would need deterministic replay or an upstream async boundary.
 
 ## Validation command
 
 ```bash
 cargo test -p aster-v8cell
+cargo test -p aster-ipc --test process_boundary -- --nocapture
 ```
 
-The full workspace test suite also runs the V8 e2e test through the host crate.
+The full workspace test suite also runs the V8 e2e test through the host crate and the v0.3 process-boundary E2E through the IPC crate.

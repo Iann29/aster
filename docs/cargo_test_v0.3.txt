@@ -1,0 +1,136 @@
+$ cargo test --workspace
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/aster_broker-7f4f5b20e45142b0)
+
+running 2 tests
+test tests::broker_rejects_wrong_cell_seal_on_hydrate ... ok
+test tests::broker_hydrates_and_reseals_without_exposing_store_to_cell ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aster_capsule-47025515924ed5b5)
+
+running 4 tests
+test seal::tests::sealed_capsule_accepts_unchanged_bytes ... ok
+test seal::tests::sealed_capsule_rejects_wrong_cell_context ... ok
+test tests::commit_rejects_changed_read ... ok
+test seal::tests::sealed_capsule_rejects_tampered_document ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aster_host-e42021ab69747025)
+
+running 1 test
+test tests::host_commits_mutation_and_records_action_fence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/aster_bench.rs (target/debug/deps/aster_bench-c6535a63fca911f8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/broker_boundary.rs (target/debug/deps/broker_boundary-162ef868b1f2787c)
+
+running 2 tests
+test broker_hydrate_rejects_wrong_cell_context ... ok
+test v8_cell_uses_broker_capability_instead_of_store_handle ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/crypto_and_v8.rs (target/debug/deps/crypto_and_v8-5161732926eb52c4)
+
+running 2 tests
+test sealed_capsule_is_cell_bound_and_tamper_evident ... ok
+test v8_read_trap_continuation_executes_against_hydrated_capsule ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e.rs (target/debug/deps/e2e-08a2173eba8325d2)
+
+running 2 tests
+test two_mutation_results_over_same_snapshot_cannot_both_commit ... ok
+test query_mutation_and_action_traverse_capsule_pipeline ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aster_ipc-1148b2738ec04393)
+
+running 1 test
+test tests::frame_round_trips_json_message ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/aster_brokerd.rs (target/debug/deps/aster_brokerd-3c0ac59a0923b45b)
+
+running 1 test
+test tests::parses_seed_documents ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/aster_v8cell.rs (target/debug/deps/aster_v8cell-5cd9c286b520eff8)
+
+running 1 test
+test tests::parses_prewarm_keys ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_boundary.rs (target/debug/deps/process_boundary-f053f74bf1eb8dc8)
+
+running 1 test
+test process_separated_v8_cell_hydrates_over_uds_and_rejects_replay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/aster_runner-60416dd84dad44c9)
+
+running 1 test
+test tests::query_hydrates_missing_key_with_read_trap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aster_v8cell-052267e5b40269bc)
+
+running 2 tests
+test tests::v8_async_function_resumes_after_read_trap ... ok
+test tests::v8_async_function_resumes_through_broker_without_store_handle ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_broker
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_capsule
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_host
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_ipc
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_runner
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aster_v8cell
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

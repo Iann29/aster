@@ -17,6 +17,11 @@ service AsterExecution {
   // get arbitrary database authority; every hydrate request is scoped by a
   // sealed capsule reference and checked by the broker.
   rpc Hydrate(HydrateRequest) returns (HydrateResponse);
+
+  // v0.3 broker-side bootstrap for a real process boundary. The broker issues
+  // the first sealed capsule over IPC/UDS; cells never receive the seal key or
+  // database read authority.
+  rpc InitialCapsule(InitialCapsuleRequest) returns (InitialCapsuleResponse);
 }
 
 enum FunctionKind {
@@ -151,9 +156,21 @@ message ExecuteResponse {
   uint32 traps = 6;
 }
 
+message InitialCapsuleRequest {
+  TenantRef tenant = 1;
+  string cell_id = 2;
+  repeated DocumentKey prewarm = 3;
+}
+
+message InitialCapsuleResponse {
+  CapsuleRef capsule = 1;
+  string rejection_reason = 2;
+}
+
 message HydrateRequest {
   CapsuleRef capsule = 1;
   ReadTrap trap = 2;
+  string cell_id = 3;
 }
 
 message HydrateResponse {

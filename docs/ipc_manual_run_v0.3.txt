@@ -1,0 +1,7 @@
+$ manual brokerd + aster_v8cell over UDS
+cell_exit=0
+cell_stdout:
+{"output":42,"traps":1,"capsule_hash":14555800972481595658}
+cell_stderr:
+broker_stderr:
+aster_brokerd: ready socket=/tmp/aster-ipc-manual.Xmrxbk/broker.sock snapshot_ts=2
