@@ -99,3 +99,54 @@ jobs:
 
       - name: docker/smoke.sh — brokerd + v8cell over UDS
         run: ./docker/smoke.sh 0.3
+
+  postgres-it:
+    name: aster-store-postgres integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Independent lane so the existing Rust + Docker jobs don't slow
+    # down on a Postgres service container we don't otherwise need.
+    # The `postgres-it` cargo feature gates the integration tests; when
+    # absent (default CI on PRs that don't touch the store crate), the
+    # crate's unit tests still run as part of the `rust:` lane.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # GitHub Actions services don't have a healthcheck DSL of their
+        # own; we set --health-cmd via options so the runner gates step
+        # execution on Postgres being ready, not just the container
+        # being up.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ASTER_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-postgres-it-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo test postgres-it
+        # Only this crate's gated tests; we don't want to recompile v8 for a
+        # database test. --features postgres-it flips on tests/postgres_it.rs.
+        run: cargo test --locked -p aster-store-postgres --features postgres-it
