@@ -95,6 +95,7 @@ version = "0.2.0"
 dependencies = [
  "aster-broker",
  "aster-capsule",
+ "serde_json",
  "v8",
 ]
 

@@ -39,17 +39,42 @@ pub struct V8ReadTrap {
     pub field: String,
 }
 
+/// Generic trap descriptor — either the toy `Aster.read(key, field)` API
+/// the prototype shipped with, or a Convex async syscall (`Convex.asyncSyscall`)
+/// matching the upstream backend's wire shape. The cell scheduler dispatches
+/// on this enum and resolves the embedded `PromiseResolver` either way.
 #[derive(Debug)]
-struct PendingRead {
-    key: DocumentId,
-    field: String,
-    resolver: v8::Global<v8::PromiseResolver>,
+enum PendingTrap {
+    /// Legacy `Aster.read(key, field)` — point read for one document field.
+    AsterRead {
+        key: DocumentId,
+        field: String,
+        resolver: v8::Global<v8::PromiseResolver>,
+    },
+    /// `Convex.asyncSyscall(name, args_json_string)` — the Convex backend's
+    /// real wire shape. v0.5 only handles `name == "1.0/get"`; everything
+    /// else surfaces as a typed error (which becomes a JS exception via
+    /// `resolver.reject`).
+    ConvexSyscall {
+        name: String,
+        args_json: String,
+        resolver: v8::Global<v8::PromiseResolver>,
+    },
+}
+
+impl PendingTrap {
+    fn resolver(&self) -> &v8::Global<v8::PromiseResolver> {
+        match self {
+            Self::AsterRead { resolver, .. } => resolver,
+            Self::ConvexSyscall { resolver, .. } => resolver,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct V8CellState {
     capsule: Option<SnapshotCapsule>,
-    traps: VecDeque<PendingRead>,
+    traps: VecDeque<PendingTrap>,
 }
 
 impl V8CellState {
@@ -236,22 +261,12 @@ impl V8SandboxCell {
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        self.execute_core(state_ptr, source, |pending| {
-            sealed_capsule =
-                broker.hydrate_point(context, sealed_capsule.clone(), pending.key.clone())?;
+        self.execute_core(state_ptr, source, |key| {
+            sealed_capsule = broker.hydrate_point(context, sealed_capsule.clone(), key.clone())?;
             let capsule = sealed_capsule.capsule().clone();
-            {
-                let state = &*state_ptr;
-                state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
-            }
-            let resolved = {
-                let state = &*state_ptr;
-                let state = state.lock().expect("v8 state mutex poisoned");
-                state
-                    .read_field(&pending.key, &pending.field)
-                    .unwrap_or(Value::Null)
-            };
-            Ok(resolved)
+            let state = &*state_ptr;
+            state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
+            Ok(())
         })
     }
 
@@ -261,7 +276,7 @@ impl V8SandboxCell {
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        self.execute_core(state_ptr, source, |pending| {
+        self.execute_core(state_ptr, source, |key| {
             let ts = {
                 let state = &*state_ptr;
                 state
@@ -272,24 +287,15 @@ impl V8SandboxCell {
                     .expect("capsule present")
                     .ts
             };
-            let value = store.read_at(&pending.key, ts);
-            {
-                let state = &*state_ptr;
-                let mut state = state.lock().expect("v8 state mutex poisoned");
-                state
-                    .capsule
-                    .as_mut()
-                    .expect("capsule present")
-                    .hydrate_point(pending.key.clone(), value);
-            }
-            let resolved = {
-                let state = &*state_ptr;
-                let state = state.lock().expect("v8 state mutex poisoned");
-                state
-                    .read_field(&pending.key, &pending.field)
-                    .unwrap_or(Value::Null)
-            };
-            Ok(resolved)
+            let value = store.read_at(key, ts);
+            let state = &*state_ptr;
+            let mut state = state.lock().expect("v8 state mutex poisoned");
+            state
+                .capsule
+                .as_mut()
+                .expect("capsule present")
+                .hydrate_point(key.clone(), value);
+            Ok(())
         })
     }
 
@@ -297,7 +303,7 @@ impl V8SandboxCell {
         &self,
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
-        mut hydrate: impl FnMut(&PendingRead) -> Result<Value, V8CellError>,
+        mut hydrate: impl FnMut(&DocumentId) -> Result<(), V8CellError>,
     ) -> Result<V8ExecutionResult, V8CellError> {
         let create_params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(create_params);
@@ -310,6 +316,9 @@ impl V8SandboxCell {
 
         let global = v8::ObjectTemplate::new(scope);
         let external = v8::External::new(scope, state_ptr.cast::<c_void>());
+
+        // `Aster.read(key, field)` — legacy toy API, kept for v0.3-era
+        // tests and the `process_boundary` E2E. Not used by Convex apps.
         let read_template = v8::FunctionTemplate::builder(aster_read_callback)
             .data(external.into())
             .build(scope);
@@ -318,6 +327,20 @@ impl V8SandboxCell {
         aster_template.set(read_name.into(), read_template.into());
         let aster_name = v8::String::new(scope, "Aster").unwrap();
         global.set(aster_name.into(), aster_template.into());
+
+        // `Convex.asyncSyscall(name, argsJson)` — the upstream Convex
+        // backend's wire shape, matched verbatim so a Convex-compiled
+        // function can `await ctx.db.get(id)` (which expands to
+        // `performAsyncSyscall("1.0/get", {id})` in the user's bundle)
+        // without modification. v0.5 only handles `"1.0/get"`.
+        let convex_async_template = v8::FunctionTemplate::builder(convex_async_syscall_callback)
+            .data(external.into())
+            .build(scope);
+        let convex_template = v8::ObjectTemplate::new(scope);
+        let async_name = v8::String::new(scope, "asyncSyscall").unwrap();
+        convex_template.set(async_name.into(), convex_async_template.into());
+        let convex_name = v8::String::new(scope, "Convex").unwrap();
+        global.set(convex_name.into(), convex_template.into());
 
         let context = v8::Context::new(
             scope,
@@ -387,12 +410,53 @@ impl V8SandboxCell {
                     }
                     traps += 1;
 
-                    let resolved = hydrate(&pending)?;
-                    let resolver = v8::Local::new(scope, &pending.resolver);
-                    let js_value = capsule_value_to_v8(scope, &resolved);
-                    resolver.resolve(scope, js_value).ok_or_else(|| {
-                        V8CellError::Run("PromiseResolver::resolve failed".to_string())
-                    })?;
+                    // Dispatch the trap. AsterRead resolves with the Convex
+                    // value at (key, field). Convex.asyncSyscall("1.0/get")
+                    // resolves with a JSON string the JS side parses; v0.5
+                    // returns the document's `_raw` field verbatim (the
+                    // Postgres adapter put the upstream Convex JSON bytes
+                    // there). Other syscall names reject with a typed
+                    // V8CellError so the JS side sees a Promise rejection
+                    // rather than a hung await.
+                    let resolver = v8::Local::new(scope, pending.resolver());
+                    match &pending {
+                        PendingTrap::AsterRead { key, field, .. } => {
+                            hydrate(key)?;
+                            let value = {
+                                let state = &*state_ptr;
+                                let state = state.lock().expect("v8 state mutex poisoned");
+                                state.read_field(key, field).unwrap_or(Value::Null)
+                            };
+                            let js_value = capsule_value_to_v8(scope, &value);
+                            resolver.resolve(scope, js_value).ok_or_else(|| {
+                                V8CellError::Run("PromiseResolver::resolve failed".to_string())
+                            })?;
+                        }
+                        PendingTrap::ConvexSyscall {
+                            name, args_json, ..
+                        } if name == "1.0/get" => {
+                            let id_str = parse_get_id(args_json)?;
+                            let key = DocumentId::new(id_str);
+                            hydrate(&key)?;
+                            let json_str = doc_raw_as_json(state_ptr, &key);
+                            let js_str = v8::String::new(scope, &json_str)
+                                .unwrap_or_else(|| v8::String::empty(scope));
+                            resolver.resolve(scope, js_str.into()).ok_or_else(|| {
+                                V8CellError::Run("PromiseResolver::resolve failed".to_string())
+                            })?;
+                        }
+                        PendingTrap::ConvexSyscall { name, .. } => {
+                            // Unknown / unsupported syscall — surface as a
+                            // JS exception so the user code can catch it.
+                            let msg =
+                                format!("aster-v8cell v0.5: unsupported convex syscall {name:?}");
+                            let v8_msg = v8::String::new(scope, &msg).unwrap();
+                            let err = v8::Exception::error(scope, v8_msg);
+                            resolver.reject(scope, err).ok_or_else(|| {
+                                V8CellError::Run("PromiseResolver::reject failed".to_string())
+                            })?;
+                        }
+                    }
                 }
             }
         }
@@ -451,12 +515,114 @@ fn aster_read_callback(
         .lock()
         .expect("v8 state mutex poisoned")
         .traps
-        .push_back(PendingRead {
+        .push_back(PendingTrap::AsterRead {
             key,
             field,
             resolver: resolver_global,
         });
     rv.set(promise.into());
+}
+
+/// JS callback for `Convex.asyncSyscall(name, args_json_string)`. Mirrors
+/// the upstream backend's wire shape so a Convex-compiled module can call
+/// `db.get(id)` (which expands to `performAsyncSyscall("1.0/get", ...)`)
+/// against an Aster cell without modification.
+///
+/// The cell scheduler dispatches on `name`: only `"1.0/get"` is wired
+/// today; anything else surfaces as a typed JS rejection. The JS side
+/// receives the resolved JSON string via `await`, then parses it
+/// (Convex's `jsonToConvex` runs JS-side; Aster's host doesn't need to).
+fn convex_async_syscall_callback(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(external) = v8::Local::<v8::External>::try_from(args.data()).ok() else {
+        throw(scope, "Convex.asyncSyscall missing host state");
+        return;
+    };
+    let state_ptr = external.value() as *mut Mutex<V8CellState>;
+    if state_ptr.is_null() {
+        throw(scope, "Convex.asyncSyscall null host state");
+        return;
+    }
+
+    let name = match args.get(0).to_string(scope) {
+        Some(value) => value.to_rust_string_lossy(scope),
+        None => {
+            throw(scope, "Convex.asyncSyscall name must be string-like");
+            return;
+        }
+    };
+    // Convex's JS shim sends the args object as a stringified JSON. For
+    // the v0.5 Aster path we also accept a raw JS object — convert with
+    // JSON.stringify on the host side via v8's `to_string`.
+    let args_json = match args.get(1).to_string(scope) {
+        Some(value) => value.to_rust_string_lossy(scope),
+        None => {
+            throw(
+                scope,
+                "Convex.asyncSyscall args must be string-like or stringifiable",
+            );
+            return;
+        }
+    };
+
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw(scope, "failed to allocate V8 PromiseResolver");
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver_global = v8::Global::new(scope, resolver);
+    let state = unsafe { &*state_ptr };
+    state
+        .lock()
+        .expect("v8 state mutex poisoned")
+        .traps
+        .push_back(PendingTrap::ConvexSyscall {
+            name,
+            args_json,
+            resolver: resolver_global,
+        });
+    rv.set(promise.into());
+}
+
+/// Extract `id` from a `Convex.asyncSyscall("1.0/get", argsJson)` payload.
+/// Convex's JS shim sends this as `JSON.stringify({ id, isSystem, ...})`;
+/// we only care about `id`. The `id` is the encoded `<table_hex>/<id_hex>`
+/// Aster DocumentId — the IDv6 ↔ Aster mapping is the next slice's job.
+fn parse_get_id(args_json: &str) -> Result<String, V8CellError> {
+    let v: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|err| V8CellError::Run(format!("convex 1.0/get bad JSON args: {err}")))?;
+    let id = v
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            V8CellError::Run("convex 1.0/get: missing string field `id` in args".to_string())
+        })?
+        .to_string();
+    Ok(id)
+}
+
+/// Pull the document out of the cell's hydrated capsule and return it as
+/// a JSON string the JS side can `JSON.parse`. v0.5 keeps the bytes as
+/// the Postgres adapter wrote them — `_raw` carries the upstream Convex
+/// `json_value` blob untouched. Missing or tombstoned docs become
+/// `"null"` so JS sees `await Convex.asyncSyscall("1.0/get", ...) === null`.
+unsafe fn doc_raw_as_json(state_ptr: *mut Mutex<V8CellState>, key: &DocumentId) -> String {
+    let state = &*state_ptr;
+    let state = state.lock().expect("v8 state mutex poisoned");
+    let raw = state
+        .capsule
+        .as_ref()
+        .and_then(|capsule| capsule.get(key))
+        .and_then(|versioned| versioned.document.as_ref())
+        .and_then(|doc| doc.get("_raw"))
+        .cloned();
+    match raw {
+        Some(Value::Text(s)) => s,
+        _ => "null".to_string(),
+    }
 }
 
 fn throw(scope: &mut v8::HandleScope, message: &str) {
@@ -588,5 +754,73 @@ mod tests {
         assert_eq!(result.output, Value::Int(42));
         assert_eq!(result.traps, 1);
         assert_ne!(result.capsule_hash, 0);
+    }
+
+    #[test]
+    fn v8_convex_async_syscall_get_returns_doc_raw_as_json() {
+        // Build a doc whose `_raw` field carries a JSON blob the way
+        // PostgresCapsuleStore would after reading from convex.documents.
+        // The JS function fires `Convex.asyncSyscall("1.0/get", ...)`,
+        // gets the raw JSON string back, parses it, and returns one
+        // field — proving the wire shape matches what a Convex-compiled
+        // module would do via `await ctx.db.get(id)`.
+        let tenant = TenantId::new("tenant-convex");
+        let deployment = DeploymentId::new("dep-convex");
+        let store = MvccStore::new();
+        let doc_id = DocumentId::new("aabb/ccdd");
+        let mut doc = aster_capsule::Document::new();
+        doc.insert(
+            "_raw".to_string(),
+            Value::Text(r#"{"name":"ian","_id":"aabb/ccdd"}"#.to_string()),
+        );
+        store.seed(doc_id.clone(), doc);
+        let ts = store.snapshot_ts();
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              const json = await Convex.asyncSyscall(
+                "1.0/get",
+                JSON.stringify({ id: "aabb/ccdd", isSystem: false })
+              );
+              const doc = JSON.parse(json);
+              return doc.name;
+            }
+        "#;
+        let result = cell
+            .execute_async_main(&store, tenant, deployment, ts, vec![], source)
+            .expect("Convex.asyncSyscall(1.0/get) should complete");
+        assert_eq!(result.output, Value::Text("ian".to_string()));
+        assert_eq!(result.traps, 1, "exactly one async syscall trap");
+    }
+
+    #[test]
+    fn v8_convex_async_syscall_unsupported_name_rejects_promise() {
+        // Anything other than the v0.5-supported syscall names becomes a
+        // typed JS rejection. The cell scheduler still completes
+        // (V8 propagates the rejection to top-level main) — we observe
+        // the rejection as a Run/Rejected V8CellError on the host side.
+        let tenant = TenantId::new("tenant-rej");
+        let deployment = DeploymentId::new("dep-rej");
+        let store = MvccStore::new();
+        let ts = store.snapshot_ts();
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              return await Convex.asyncSyscall("1.0/totally-fake", "{}");
+            }
+        "#;
+        let err = cell
+            .execute_async_main(&store, tenant, deployment, ts, vec![], source)
+            .expect_err("unsupported syscall must reject");
+        match err {
+            V8CellError::Rejected(msg) => {
+                assert!(
+                    msg.contains("unsupported convex syscall"),
+                    "rejection should name the syscall, got {msg:?}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 }
