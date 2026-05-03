@@ -1,14 +1,21 @@
-//! Capsule broker boundary for Aster v0.2.
+//! Capsule broker boundary for Aster v0.2+.
 //!
 //! The v0.1 runner accepted `&MvccStore` directly, which modeled the shape of
 //! read traps but not the authority split. This crate makes the split explicit:
 //! cells talk to a `CapsuleBrokerClient`; the broker owns the read-capable
 //! store and the capsule seal key. The provided `LocalCapsuleBroker` is still
 //! in-process for tests, but the cell-facing API contains no database handle.
+//!
+//! v0.3+ generalises the storage backend behind a `CapsuleStore` trait
+//! (see `store.rs`) so a real Postgres adapter can plug in without touching
+//! the cell-facing IPC.
+
+pub mod store;
+
+pub use store::{CapsuleStore, StoreError};
 
 use aster_capsule::{
-    CapsuleSealKey, DeploymentId, DocumentId, MvccStore, SealContext, SealError, SealedCapsule,
-    TenantId,
+    CapsuleSealKey, DeploymentId, DocumentId, SealContext, SealError, SealedCapsule, TenantId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +29,21 @@ pub enum BrokerError {
 impl From<SealError> for BrokerError {
     fn from(value: SealError) -> Self {
         Self::Seal(value)
+    }
+}
+
+impl From<StoreError> for BrokerError {
+    fn from(value: StoreError) -> Self {
+        // Cells never see StoreError directly — collapse it onto the
+        // existing Remote variant with a structured prefix so operator
+        // logs can still grep for the sub-class.
+        match value {
+            StoreError::Unavailable(msg) => Self::Remote(format!("unavailable: {msg}")),
+            StoreError::Stale { requested, latest } => Self::Remote(format!(
+                "stale_snapshot: requested={requested} latest={latest}"
+            )),
+            StoreError::Backend(msg) => Self::Remote(format!("backend: {msg}")),
+        }
     }
 }
 
@@ -65,15 +87,17 @@ pub trait CapsuleBrokerClient {
 
 /// In-process broker used by the prototype and tests.
 ///
-/// It intentionally owns the only path from read traps to `MvccStore`; V8 cells
-/// in v0.2 can execute entirely through this trait and never receive `&MvccStore`.
-pub struct LocalCapsuleBroker<'a> {
-    store: &'a MvccStore,
+/// Generic over any `CapsuleStore` so a Postgres adapter can plug in without
+/// changing the cell-facing API. Today's call sites (`LocalCapsuleBroker::new(&store, ...)`)
+/// keep compiling because `&MvccStore: CapsuleStore` via the blanket in
+/// `store.rs`.
+pub struct LocalCapsuleBroker<S: CapsuleStore> {
+    store: S,
     seal_key: CapsuleSealKey,
 }
 
-impl<'a> LocalCapsuleBroker<'a> {
-    pub fn new(store: &'a MvccStore, seal_key: CapsuleSealKey) -> Self {
+impl<S: CapsuleStore> LocalCapsuleBroker<S> {
+    pub fn new(store: S, seal_key: CapsuleSealKey) -> Self {
         Self { store, seal_key }
     }
 
@@ -82,7 +106,7 @@ impl<'a> LocalCapsuleBroker<'a> {
     }
 }
 
-impl CapsuleBrokerClient for LocalCapsuleBroker<'_> {
+impl<S: CapsuleStore> CapsuleBrokerClient for LocalCapsuleBroker<S> {
     fn initial_capsule(
         &self,
         context: &SealContext,
@@ -93,7 +117,7 @@ impl CapsuleBrokerClient for LocalCapsuleBroker<'_> {
     ) -> Result<SealedCapsule, BrokerError> {
         let capsule = self
             .store
-            .build_capsule(tenant, deployment, snapshot_ts, prewarm);
+            .build_capsule(tenant, deployment, snapshot_ts, prewarm)?;
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
 
@@ -104,7 +128,7 @@ impl CapsuleBrokerClient for LocalCapsuleBroker<'_> {
         key: DocumentId,
     ) -> Result<SealedCapsule, BrokerError> {
         let mut capsule = capsule.into_capsule(&self.seal_key, context)?;
-        let value = self.store.read_at(&key, capsule.ts);
+        let value = self.store.read_point(&key, capsule.ts)?;
         capsule.hydrate_point(key, value);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
@@ -113,7 +137,7 @@ impl CapsuleBrokerClient for LocalCapsuleBroker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_capsule::{doc_with_i64, Value};
+    use aster_capsule::{doc_with_i64, MvccStore, Value};
 
     #[test]
     fn broker_hydrates_and_reseals_without_exposing_store_to_cell() {
