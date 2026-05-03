@@ -175,6 +175,10 @@ impl V8SandboxCell {
     ) -> Result<V8ExecutionResult, V8CellError> {
         let create_params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(create_params);
+        // Host-controlled continuation: V8 should not decide when to drain
+        // Promise jobs. The cell scheduler hydrates traps, resolves exactly one
+        // host promise, then explicitly checkpoints microtasks.
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let mut hs = v8::HandleScope::new(&mut isolate);
         let scope = &mut hs;
 

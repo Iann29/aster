@@ -15,7 +15,7 @@ service AsterExecution {
 
   // Hydrate missing data for the same immutable snapshot. Runner cells do not
   // get arbitrary database authority; every hydrate request is scoped by a
-  // capsule reference and checked by the broker.
+  // sealed capsule reference and checked by the broker.
   rpc Hydrate(HydrateRequest) returns (HydrateResponse);
 }
 
@@ -64,11 +64,24 @@ message CapsuleEntry {
   VersionedDocument value = 2;
 }
 
+message CapsuleSeal {
+  // v0.2: "aster-blake3-keyed-v1". This is not a TLS substitute; it is the
+  // bearer-capability seal over the canonical capsule bytes and cell context.
+  string algorithm = 1;
+  bytes digest = 2;
+  bytes mac = 3;
+  string cell_id = 4;
+  uint64 lease_epoch = 5;
+}
+
 message CapsuleRef {
   TenantRef tenant = 1;
+  // v0.1 compatibility field. v0.2 treats seal.digest as authoritative when a
+  // seal is present; this field remains for older harnesses and human debugging.
   bytes root_hash = 2;
   uint64 ttl_ms = 3;
   repeated CapsuleEntry entries = 4;
+  CapsuleSeal seal = 5;
 }
 
 message PointRead {
@@ -116,6 +129,9 @@ message ProgramRef {
   string module = 1;
   string function = 2;
   bytes args = 3;
+  // v0.2: optional source for the V8 proof-of-concept harness. Production cells
+  // load already-validated Convex modules rather than accepting raw source here.
+  string js_source = 4;
 }
 
 message ExecuteRequest {
@@ -145,4 +161,5 @@ message HydrateResponse {
   bytes new_root_hash = 2;
   bool stale_snapshot = 3;
   string rejection_reason = 4;
+  CapsuleSeal seal = 5;
 }

@@ -1,37 +1,26 @@
-# Aster Runner
+# Aster Runner v0.2
 
-Aster Runner is a prototype open-source execution plane for self-hosted Convex deployments. It demonstrates a design that scales function execution past the per-process V8 isolate-thread ceiling without copying Convex Cloud's Funrun architecture.
+Aster Runner is a research prototype for capability-narrowed Convex function execution.
 
-The core idea is **Snapshot Capsules + Read-Trap Continuations + Tenant-Pinned Sandbox Cells**:
+v0.2 adds two real properties over v0.1:
 
-- The Convex backend remains the single writer and committer.
-- Runner cells receive immutable, tenant-scoped MVCC capsules instead of database credentials.
-- Missing reads become explicit read traps against a broker at the same snapshot timestamp.
-- Mutations return read/write sets; OCC decides whether they commit.
-- Actions return effect fences so side effects are not blindly retried.
+1. **V8-backed Promise read traps.** `aster-v8cell` embeds the real Rust `v8` crate. A JavaScript async function can `await Aster.read(...)`, suspend on a missing capsule entry, let the host hydrate the capsule, and resume inside the same isolate.
+2. **Cryptographic capsule seals.** `aster-capsule::seal` provides a canonical BLAKE3 digest plus keyed BLAKE3 MAC bound to cell identity and lease epoch. Wrong-cell replay and tampering are tested.
 
-This repository is a prototype for review, not production infrastructure. The code is intentionally `std`-only so a reviewer can inspect the invariants without generated code or service scaffolding.
-
-## Layout
-
-```text
-crates/capsule   MVCC store, snapshot capsules, read/write sets, OCC committer
-crates/runner    Tenant-pinned sandbox cells and read-trap execution loop
-crates/host      Adapter-like facade, E2E tests, and benchmark binary
-proto/aster.proto Open internal capsule-fabric protocol
-docs/ARCHITECTURE.md Full design analysis
-docs/bench_results.md Benchmark and theoretical analysis
-```
-
-## Intended commands on a Rust-equipped machine
+Run:
 
 ```bash
+cargo build --workspace
 cargo test --workspace
 cargo run --release -p aster-host --bin aster_bench -- 10000 32
+protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.2.pb proto/aster.proto
 ```
 
-The generation environment for this artifact did not include `rustc`, `cargo`, or `protoc`; see `docs/toolchain_check.txt`. The Python mirror benchmark in `scripts/mirror_bench.py` was executed in that environment and records the same core algorithmic path.
+Important docs:
 
-## License
-
-Dual licensed under Apache-2.0 or MIT, at your option.
+- `docs/ARCHITECTURE.md` — v0.2 architecture
+- `docs/V8_QUESTION.md` — V8 experiment memo
+- `docs/THEORY_REGISTER.md` — research theories
+- `docs/ABSURD_IDEAS.md` — intentionally strange/falsifiable ideas
+- `docs/COMPARISON_MATRIX_V0.2.md` — prior-art matrix
+- `docs/SYNAPSE_MIGRATION_V0.2.md` — operator migration path

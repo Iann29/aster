@@ -1,26 +1,31 @@
-/mnt/data/aster-runner/Cargo.toml
-/mnt/data/aster-runner/LICENSE-APACHE
-/mnt/data/aster-runner/LICENSE-MIT
-/mnt/data/aster-runner/README.md
-/mnt/data/aster-runner/artifact_manifest.txt
-/mnt/data/aster-runner/buf.yaml
-/mnt/data/aster-runner/crates/capsule/Cargo.toml
-/mnt/data/aster-runner/crates/capsule/src/lib.rs
-/mnt/data/aster-runner/crates/host/Cargo.toml
-/mnt/data/aster-runner/crates/host/src/bin/aster_bench.rs
-/mnt/data/aster-runner/crates/host/src/lib.rs
-/mnt/data/aster-runner/crates/host/tests/e2e.rs
-/mnt/data/aster-runner/crates/runner/Cargo.toml
-/mnt/data/aster-runner/crates/runner/src/lib.rs
-/mnt/data/aster-runner/docs/ARCHITECTURE.md
-/mnt/data/aster-runner/docs/FIRST_200_LINES.rs
-/mnt/data/aster-runner/docs/FIRST_200_LINES_numbered.txt
-/mnt/data/aster-runner/docs/apt_update.txt
-/mnt/data/aster-runner/docs/architecture_word_count.txt
-/mnt/data/aster-runner/docs/bench_results.md
-/mnt/data/aster-runner/docs/python_mirror_bench.json
-/mnt/data/aster-runner/docs/static_check.txt
-/mnt/data/aster-runner/docs/toolchain_check.txt
-/mnt/data/aster-runner/proto/aster.proto
-/mnt/data/aster-runner/scripts/mirror_bench.py
-/mnt/data/aster-runner/scripts/static_check.py
+Aster Runner v0.2 artifact manifest
+
+Core workspace:
+- Cargo.toml
+- Cargo.lock
+- crates/capsule/              Snapshot capsules, MVCC store, OCC, BLAKE3 seals
+- crates/runner/               v0.1 in-process capsule runner model
+- crates/host/                 Host facade, e2e tests, benchmark binary
+- crates/v8cell/               v0.2 real V8 Promise read-trap continuation PoC
+- proto/aster.proto            Internal Aster protocol, extended with capsule seals
+
+Docs:
+- docs/ARCHITECTURE.md         v0.2 architecture document
+- docs/ARCHITECTURE_V0.1.md    archived v0.1 architecture document
+- docs/V8_QUESTION.md          focused V8 answer and experiment
+- docs/THEORY_REGISTER.md      theory register
+- docs/ABSURD_IDEAS.md         absurd-ideas register
+- docs/COMPARISON_MATRIX_V0.2.md
+- docs/SYNAPSE_MIGRATION_V0.2.md
+- docs/toolchain_check_v0.2.txt
+- docs/cargo_build_v0.2.txt
+- docs/cargo_test_v0.2.txt
+- docs/bench_results_v0.2.json
+- docs/bench_results_v0.2.stderr
+- docs/protoc_v0.2.txt
+
+Validation commands executed:
+- cargo build --workspace
+- cargo test --workspace
+- cargo run --release -p aster-host --bin aster_bench -- 10000 32
+- protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.2.pb proto/aster.proto
