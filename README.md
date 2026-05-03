@@ -19,7 +19,27 @@ cargo run --release -p aster-host --bin aster_bench -- 10000 32
 protoc --proto_path=proto --descriptor_set_out=/tmp/aster-v0.3.pb proto/aster.proto
 ```
 
-Important docs:
+## Docker images
+
+Both binaries ship as separate runtime images out of the same multi-stage
+Dockerfile:
+
+```bash
+# Build
+docker build --target=runtime-broker -t aster-brokerd:0.3 -f docker/Dockerfile .
+docker build --target=runtime-v8cell -t aster-v8cell:0.3 -f docker/Dockerfile .
+
+# End-to-end smoke (assertions inside the script)
+./docker/smoke.sh 0.3
+```
+
+The `docker/smoke.sh` script runs `aster-brokerd` as a long-lived service
+behind a per-deployment Docker volume, then runs `aster-v8cell` as a
+one-shot container that opens the shared socket and prints
+`{"output":42,"traps":1,"capsule_hash":...}` if the capability boundary
+holds.
+
+## Important docs
 
 - `docs/ARCHITECTURE.md` — v0.3 architecture
 - `docs/V8_QUESTION.md` — V8 experiment memo updated for IPC

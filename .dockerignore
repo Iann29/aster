@@ -1,0 +1,22 @@
+# Heavy local artifacts — Docker rebuilds these from scratch in the
+# builder stage anyway, so shipping them in the build context just
+# wastes bytes (target/ is 2-3 GB after a v8 build).
+target
+**/target
+
+.git
+.github
+
+# Editor cruft.
+*.swp
+.vscode
+.idea
+.DS_Store
+
+# Validation artifacts produced locally — not needed at build time.
+docs/cargo_*.txt
+docs/protoc_*.txt
+docs/toolchain_check_*.txt
+docs/bench_results_v0.*.json
+docs/bench_results_v0.*.stderr
+docs/ipc_*_v0.*.txt

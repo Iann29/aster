@@ -1,0 +1,102 @@
+name: CI
+
+# Hard-stops after 30 minutes per job: a v8 dependency build is the
+# slow path and shouldn't take more than ~10 of those even on a cold
+# cache; longer means the runner is wedged and we want a fast fail.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          # The repo pins rust-version 1.75 in workspace.package; we use
+          # stable so we automatically pick up patch updates the team has
+          # been validating against. cargo fmt + clippy live on the same
+          # toolchain to keep CI behaviour boring.
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.rusty_v8
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/**') }}
+          restore-keys: target-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: cargo run aster_bench (smoke)
+        run: cargo run --release --locked -p aster-host --bin aster_bench -- 1000 8
+
+  docker:
+    name: Docker images + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The Docker job builds its own copy of the workspace inside the
+    # builder stage; it does NOT depend on `rust:` so that a transient
+    # rustfmt nit doesn't block the image smoke. Both jobs must pass
+    # for a PR to land — branch protection enforces that.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build aster-brokerd image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-broker
+          tags: aster-brokerd:0.3
+          load: true
+          cache-from: type=gha,scope=brokerd
+          cache-to: type=gha,scope=brokerd,mode=max
+
+      - name: Build aster-v8cell image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-v8cell
+          tags: aster-v8cell:0.3
+          load: true
+          cache-from: type=gha,scope=v8cell
+          cache-to: type=gha,scope=v8cell,mode=max
+
+      - name: docker/smoke.sh — brokerd + v8cell over UDS
+        run: ./docker/smoke.sh 0.3
