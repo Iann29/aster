@@ -16,6 +16,7 @@ pub enum BrokerError {
     Seal(SealError),
     TenantMismatch,
     DeploymentMismatch,
+    Remote(String),
 }
 
 impl From<SealError> for BrokerError {
@@ -32,6 +33,7 @@ impl std::fmt::Display for BrokerError {
             Self::DeploymentMismatch => {
                 write!(f, "hydrate deployment did not match broker deployment")
             }
+            Self::Remote(error) => write!(f, "remote broker error: {error}"),
         }
     }
 }
