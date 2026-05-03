@@ -17,7 +17,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Mutex, Once};
 
-use aster_capsule::{DeploymentId, Document, DocumentId, MvccStore, SnapshotCapsule, TenantId, Value};
+use aster_broker::{BrokerError, CapsuleBrokerClient};
+use aster_capsule::{
+    DeploymentId, Document, DocumentId, MvccStore, SealContext, SnapshotCapsule, TenantId, Value,
+};
 
 static V8_INIT: Once = Once::new();
 
@@ -76,25 +79,37 @@ pub enum V8CellError {
     PendingWithoutTrap,
     Rejected(String),
     UnsupportedValue(String),
+    Broker(String),
 }
 
 impl std::fmt::Display for V8CellError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongTenant => write!(f, "invocation tenant does not match V8 cell tenant"),
-            Self::WrongDeployment => write!(f, "invocation deployment does not match V8 cell deployment"),
+            Self::WrongDeployment => {
+                write!(f, "invocation deployment does not match V8 cell deployment")
+            }
             Self::Compile(error) => write!(f, "JavaScript compile error: {error}"),
             Self::Run(error) => write!(f, "JavaScript run error: {error}"),
             Self::NotAPromise => write!(f, "JavaScript entrypoint did not return a Promise"),
             Self::TooManyTraps { limit } => write!(f, "too many V8 read traps, limit {limit}"),
-            Self::PendingWithoutTrap => write!(f, "Promise is pending but no read trap was emitted"),
+            Self::PendingWithoutTrap => {
+                write!(f, "Promise is pending but no read trap was emitted")
+            }
             Self::Rejected(error) => write!(f, "JavaScript promise rejected: {error}"),
             Self::UnsupportedValue(error) => write!(f, "unsupported JavaScript value: {error}"),
+            Self::Broker(error) => write!(f, "broker error: {error}"),
         }
     }
 }
 
 impl std::error::Error for V8CellError {}
+
+impl From<BrokerError> for V8CellError {
+    fn from(value: BrokerError) -> Self {
+        Self::Broker(value.to_string())
+    }
+}
 
 /// A tenant/deployment pinned V8 cell.
 ///
@@ -123,6 +138,52 @@ impl V8SandboxCell {
     /// Aster.read(key, field)`. This method drains all typed traps by reading
     /// from `store` at the original snapshot timestamp and resolving the exact
     /// V8 `PromiseResolver` that caused the trap.
+    pub fn execute_async_main_with_broker(
+        &self,
+        broker: &impl CapsuleBrokerClient,
+        cell_id: impl Into<String>,
+        lease_epoch: u64,
+        tenant: TenantId,
+        deployment: DeploymentId,
+        snapshot_ts: u64,
+        prewarm: Vec<DocumentId>,
+        source: &str,
+    ) -> Result<V8ExecutionResult, V8CellError> {
+        if tenant != self.tenant {
+            return Err(V8CellError::WrongTenant);
+        }
+        if deployment != self.deployment {
+            return Err(V8CellError::WrongDeployment);
+        }
+
+        let context = SealContext::new(cell_id, lease_epoch);
+        let initial = broker.initial_capsule(&context, tenant, deployment, snapshot_ts, prewarm)?;
+        let boxed_state = Box::new(Mutex::new(V8CellState {
+            capsule: Some(initial.capsule().clone()),
+            traps: VecDeque::new(),
+        }));
+        let state_ptr: *mut Mutex<V8CellState> = Box::into_raw(boxed_state);
+
+        let result = unsafe {
+            self.execute_with_broker_state_ptr(broker, &context, initial, state_ptr, source)
+        };
+
+        let state_box = unsafe { Box::from_raw(state_ptr) };
+        match result {
+            Ok(mut output) => {
+                let state = state_box.lock().expect("v8 state mutex poisoned");
+                let hash = state
+                    .capsule
+                    .as_ref()
+                    .map(|capsule| capsule.root_hash)
+                    .unwrap_or_default();
+                output.capsule_hash = hash;
+                Ok(output)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn execute_async_main(
         &self,
         store: &MvccStore,
@@ -162,9 +223,36 @@ impl V8SandboxCell {
                     .unwrap_or_default();
                 output.capsule_hash = hash;
                 Ok(output)
-            },
+            }
             Err(error) => Err(error),
         }
+    }
+
+    unsafe fn execute_with_broker_state_ptr(
+        &self,
+        broker: &impl CapsuleBrokerClient,
+        context: &SealContext,
+        mut sealed_capsule: aster_capsule::SealedCapsule,
+        state_ptr: *mut Mutex<V8CellState>,
+        source: &str,
+    ) -> Result<V8ExecutionResult, V8CellError> {
+        self.execute_core(state_ptr, source, |pending| {
+            sealed_capsule =
+                broker.hydrate_point(context, sealed_capsule.clone(), pending.key.clone())?;
+            let capsule = sealed_capsule.capsule().clone();
+            {
+                let state = &*state_ptr;
+                state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
+            }
+            let resolved = {
+                let state = &*state_ptr;
+                let state = state.lock().expect("v8 state mutex poisoned");
+                state
+                    .read_field(&pending.key, &pending.field)
+                    .unwrap_or(Value::Null)
+            };
+            Ok(resolved)
+        })
     }
 
     unsafe fn execute_with_state_ptr(
@@ -172,6 +260,44 @@ impl V8SandboxCell {
         store: &MvccStore,
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
+    ) -> Result<V8ExecutionResult, V8CellError> {
+        self.execute_core(state_ptr, source, |pending| {
+            let ts = {
+                let state = &*state_ptr;
+                state
+                    .lock()
+                    .expect("v8 state mutex poisoned")
+                    .capsule
+                    .as_ref()
+                    .expect("capsule present")
+                    .ts
+            };
+            let value = store.read_at(&pending.key, ts);
+            {
+                let state = &*state_ptr;
+                let mut state = state.lock().expect("v8 state mutex poisoned");
+                state
+                    .capsule
+                    .as_mut()
+                    .expect("capsule present")
+                    .hydrate_point(pending.key.clone(), value);
+            }
+            let resolved = {
+                let state = &*state_ptr;
+                let state = state.lock().expect("v8 state mutex poisoned");
+                state
+                    .read_field(&pending.key, &pending.field)
+                    .unwrap_or(Value::Null)
+            };
+            Ok(resolved)
+        })
+    }
+
+    unsafe fn execute_core(
+        &self,
+        state_ptr: *mut Mutex<V8CellState>,
+        source: &str,
+        mut hydrate: impl FnMut(&PendingRead) -> Result<Value, V8CellError>,
     ) -> Result<V8ExecutionResult, V8CellError> {
         let create_params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(create_params);
@@ -217,9 +343,9 @@ impl V8SandboxCell {
         let main_fn = v8::Local::<v8::Function>::try_from(main_value)
             .map_err(|_| V8CellError::Run("globalThis.main is not a function".to_string()))?;
         let undefined = v8::undefined(scope).into();
-        let promise_value = main_fn
-            .call(scope, undefined, &[])
-            .ok_or_else(|| V8CellError::Run("main() threw before returning a Promise".to_string()))?;
+        let promise_value = main_fn.call(scope, undefined, &[]).ok_or_else(|| {
+            V8CellError::Run("main() threw before returning a Promise".to_string())
+        })?;
         let promise = v8::Local::<v8::Promise>::try_from(promise_value)
             .map_err(|_| V8CellError::NotAPromise)?;
         let promise_global = v8::Global::new(scope, promise);
@@ -237,11 +363,11 @@ impl V8SandboxCell {
                         traps,
                         capsule_hash: 0,
                     });
-                },
+                }
                 v8::PromiseState::Rejected => {
                     let value = promise.result(scope);
                     return Err(V8CellError::Rejected(value_to_string(scope, value)));
-                },
+                }
                 v8::PromiseState::Pending => {
                     let pending = {
                         let state = &*state_ptr;
@@ -261,37 +387,13 @@ impl V8SandboxCell {
                     }
                     traps += 1;
 
-                    let value = store.read_at(&pending.key, {
-                        let state = &*state_ptr;
-                        state
-                            .lock()
-                            .expect("v8 state mutex poisoned")
-                            .capsule
-                            .as_ref()
-                            .expect("capsule present")
-                            .ts
-                    });
-                    {
-                        let state = &*state_ptr;
-                        let mut state = state.lock().expect("v8 state mutex poisoned");
-                        state
-                            .capsule
-                            .as_mut()
-                            .expect("capsule present")
-                            .hydrate_point(pending.key.clone(), value);
-                    }
-
-                    let resolved = {
-                        let state = &*state_ptr;
-                        let state = state.lock().expect("v8 state mutex poisoned");
-                        state.read_field(&pending.key, &pending.field).unwrap_or(Value::Null)
-                    };
+                    let resolved = hydrate(&pending)?;
                     let resolver = v8::Local::new(scope, &pending.resolver);
                     let js_value = capsule_value_to_v8(scope, &resolved);
                     resolver.resolve(scope, js_value).ok_or_else(|| {
                         V8CellError::Run("PromiseResolver::resolve failed".to_string())
                     })?;
-                },
+                }
             }
         }
     }
@@ -317,14 +419,14 @@ fn aster_read_callback(
         None => {
             throw(scope, "Aster.read key must be string-like");
             return;
-        },
+        }
     };
     let field = match args.get(1).to_string(scope) {
         Some(value) => value.to_rust_string_lossy(scope),
         None => {
             throw(scope, "Aster.read field must be string-like");
             return;
-        },
+        }
     };
     let key = DocumentId::new(key);
 
@@ -363,7 +465,10 @@ fn throw(scope: &mut v8::HandleScope, message: &str) {
     scope.throw_exception(error);
 }
 
-fn capsule_value_to_v8<'s>(scope: &mut v8::HandleScope<'s>, value: &Value) -> v8::Local<'s, v8::Value> {
+fn capsule_value_to_v8<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    value: &Value,
+) -> v8::Local<'s, v8::Value> {
     match value {
         Value::Int(value) => v8::Number::new(scope, *value as f64).into(),
         Value::Text(value) => v8::String::new(scope, value).unwrap().into(),
@@ -372,11 +477,18 @@ fn capsule_value_to_v8<'s>(scope: &mut v8::HandleScope<'s>, value: &Value) -> v8
     }
 }
 
-fn v8_value_to_capsule_value(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> Result<Value, V8CellError> {
+fn v8_value_to_capsule_value(
+    scope: &mut v8::HandleScope,
+    value: v8::Local<v8::Value>,
+) -> Result<Value, V8CellError> {
     if value.is_int32() {
-        Ok(Value::Int(value.int32_value(scope).unwrap_or_default() as i64))
+        Ok(Value::Int(
+            value.int32_value(scope).unwrap_or_default() as i64
+        ))
     } else if value.is_number() {
-        Ok(Value::Int(value.number_value(scope).unwrap_or_default() as i64))
+        Ok(Value::Int(
+            value.number_value(scope).unwrap_or_default() as i64
+        ))
     } else if value.is_boolean() {
         Ok(Value::Bool(value.boolean_value(scope)))
     } else if value.is_string() {
@@ -407,6 +519,44 @@ pub fn document_from_i64(field: &str, value: i64) -> Document {
 mod tests {
     use super::*;
     use aster_capsule::doc_with_i64;
+
+    #[test]
+    fn v8_async_function_resumes_through_broker_without_store_handle() {
+        let tenant = TenantId::new("tenant-v8-broker");
+        let deployment = DeploymentId::new("dep-v8-broker");
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("counters/a"), doc_with_i64("value", 20));
+        store.seed(DocumentId::new("counters/b"), doc_with_i64("value", 22));
+        let ts = store.snapshot_ts();
+        let broker = aster_broker::LocalCapsuleBroker::new(
+            &store,
+            aster_capsule::CapsuleSealKey::derive_for_tests(b"v8-broker-test"),
+        );
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              const a = await Aster.read("counters/a", "value");
+              const b = await Aster.read("counters/b", "value");
+              return a + b;
+            }
+        "#;
+        let result = cell
+            .execute_async_main_with_broker(
+                &broker,
+                "cell-v8-1",
+                3,
+                tenant,
+                deployment,
+                ts,
+                vec![DocumentId::new("counters/a")],
+                source,
+            )
+            .expect("V8 async function should complete through broker");
+        assert_eq!(result.output, Value::Int(42));
+        assert_eq!(result.traps, 1);
+        assert_ne!(result.capsule_hash, 0);
+    }
 
     #[test]
     fn v8_async_function_resumes_after_read_trap() {

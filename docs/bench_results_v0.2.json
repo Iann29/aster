@@ -1,1 +1,1 @@
-{"iterations":10000,"keys":32,"warm_query_avg_ns":37077,"cold_trap_query_avg_ns":76319,"mutation_avg_ns":963}
+{"iterations":10000,"keys":32,"warm_query_avg_ns":36717,"cold_trap_query_avg_ns":76536,"mutation_avg_ns":991}

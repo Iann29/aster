@@ -10,4 +10,5 @@ aster-capsule = { path = "../capsule" }
 aster-runner = { path = "../runner" }
 
 [dev-dependencies]
+aster-broker = { path = "../broker" }
 aster-v8cell = { path = "../v8cell" }

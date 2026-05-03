@@ -76,7 +76,7 @@ impl Program {
             Program::Sum { keys, field } => evaluate_sum(kind, capsule, keys, field),
             Program::Increment { key, field, by } => {
                 evaluate_increment(kind, capsule, key, field, *by)
-            },
+            }
             Program::EffectAfterRead {
                 key,
                 field,
@@ -198,12 +198,12 @@ impl<'a> CapsuleBroker<'a> {
             ReadTrap::Point(key) => {
                 let value = self.store.read_at(&key, capsule.ts);
                 capsule.hydrate_point(key, value);
-            },
+            }
             ReadTrap::Prefix { prefix, limit } => {
                 for (key, value) in self.store.prefix_at(&prefix, limit, capsule.ts) {
                     capsule.hydrate_point(key, value);
                 }
-            },
+            }
         }
     }
 }
@@ -281,7 +281,7 @@ impl SandboxCell {
                         effect.snapshot_hash = capsule.root_hash;
                     }
                     return Ok(result);
-                },
+                }
                 StepOutcome::Trap(trap) => {
                     if traps >= self.max_traps {
                         return Err(CellError::TooManyTraps {
@@ -290,7 +290,7 @@ impl SandboxCell {
                     }
                     traps += 1;
                     broker.hydrate(&mut capsule, trap);
-                },
+                }
             }
         }
     }

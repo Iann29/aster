@@ -2,6 +2,7 @@
 members = [
     "crates/capsule",
     "crates/runner",
+    "crates/broker",
     "crates/host",
     "crates/v8cell",
 ]

@@ -1,4 +1,7 @@
-use aster_capsule::{doc_with_i64, CapsuleSealKey, DeploymentId, DocumentId, MvccStore, SealContext, SealError, SealedCapsule, TenantId, Value};
+use aster_capsule::{
+    doc_with_i64, CapsuleSealKey, DeploymentId, DocumentId, MvccStore, SealContext, SealError,
+    SealedCapsule, TenantId, Value,
+};
 use aster_v8cell::V8SandboxCell;
 
 #[test]
@@ -8,12 +11,7 @@ fn sealed_capsule_is_cell_bound_and_tamper_evident() {
     let deployment = DeploymentId::new("dep-sealed");
     let key = DocumentId::new("docs/alpha");
     store.seed(key.clone(), doc_with_i64("value", 11));
-    let capsule = store.build_capsule(
-        tenant,
-        deployment,
-        store.snapshot_ts(),
-        vec![key.clone()],
-    );
+    let capsule = store.build_capsule(tenant, deployment, store.snapshot_ts(), vec![key.clone()]);
 
     let seal_key = CapsuleSealKey::derive_for_tests(b"host-e2e-seal-key");
     let cell_a = SealContext::new("cell-a", 7);
@@ -24,13 +22,17 @@ fn sealed_capsule_is_cell_bound_and_tamper_evident() {
     assert_eq!(sealed.verify(&seal_key, &cell_b), Err(SealError::WrongCell));
 
     let mut tampered = sealed.clone();
-    tampered
-        .capsule_mut_for_test()
-        .hydrate_point(key, aster_capsule::VersionedDocument {
+    tampered.capsule_mut_for_test().hydrate_point(
+        key,
+        aster_capsule::VersionedDocument {
             version: Some(99),
             document: Some(doc_with_i64("value", 12)),
-        });
-    assert_eq!(tampered.verify(&seal_key, &cell_a), Err(SealError::DigestMismatch));
+        },
+    );
+    assert_eq!(
+        tampered.verify(&seal_key, &cell_a),
+        Err(SealError::DigestMismatch)
+    );
 }
 
 #[test]

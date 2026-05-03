@@ -30,6 +30,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "aster-broker"
+version = "0.2.0"
+dependencies = [
+ "aster-capsule",
+]
+
+[[package]]
 name = "aster-capsule"
 version = "0.2.0"
 dependencies = [
@@ -40,6 +47,7 @@ dependencies = [
 name = "aster-host"
 version = "0.2.0"
 dependencies = [
+ "aster-broker",
  "aster-capsule",
  "aster-runner",
  "aster-v8cell",
@@ -56,6 +64,7 @@ dependencies = [
 name = "aster-v8cell"
 version = "0.2.0"
 dependencies = [
+ "aster-broker",
  "aster-capsule",
  "v8",
 ]

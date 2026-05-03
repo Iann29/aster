@@ -1,7 +1,7 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use aster_capsule::{DocumentId, TenantId, DeploymentId};
+use aster_capsule::{DeploymentId, DocumentId, TenantId};
 use aster_host::AsterHost;
 use aster_runner::{FunctionKind, Invocation, Program};
 

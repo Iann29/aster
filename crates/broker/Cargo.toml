@@ -1,11 +1,9 @@
 [package]
-name = "aster-v8cell"
+name = "aster-broker"
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
-v8 = "0.106"

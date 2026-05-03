@@ -8,7 +8,9 @@
 //! bearer capabilities, while the broker can reject tampering, cross-cell
 //! replay, and stale lease epochs before hydrating data.
 
-use crate::{DeploymentId, Document, DocumentId, SnapshotCapsule, TenantId, Value, VersionedDocument};
+use crate::{
+    DeploymentId, Document, DocumentId, SnapshotCapsule, TenantId, Value, VersionedDocument,
+};
 
 const ASTER_SEAL_ALG: &str = "aster-blake3-keyed-v1";
 
@@ -112,7 +114,11 @@ impl SealedCapsule {
         &self.seal
     }
 
-    pub fn into_capsule(self, key: &CapsuleSealKey, context: &SealContext) -> Result<SnapshotCapsule, SealError> {
+    pub fn into_capsule(
+        self,
+        key: &CapsuleSealKey,
+        context: &SealContext,
+    ) -> Result<SnapshotCapsule, SealError> {
         self.verify(key, context)?;
         Ok(self.capsule)
     }
@@ -159,7 +165,12 @@ fn capsule_mac(
     // Bind the identity fields twice: once through the digest, once as explicit
     // MAC domain separation. This makes audit tooling able to inspect a seal
     // without canonical-decoding the full capsule.
-    put_identity(&mut hasher, &capsule.tenant, &capsule.deployment, capsule.ts);
+    put_identity(
+        &mut hasher,
+        &capsule.tenant,
+        &capsule.deployment,
+        capsule.ts,
+    );
     *hasher.finalize().as_bytes()
 }
 
@@ -173,7 +184,12 @@ fn encode_capsule(hasher: &mut blake3::Hasher, capsule: &SnapshotCapsule) {
     }
 }
 
-fn put_identity(hasher: &mut blake3::Hasher, tenant: &TenantId, deployment: &DeploymentId, ts: u64) {
+fn put_identity(
+    hasher: &mut blake3::Hasher,
+    tenant: &TenantId,
+    deployment: &DeploymentId,
+    ts: u64,
+) {
     put_str(hasher, &tenant.0);
     put_str(hasher, &deployment.0);
     put_u64(hasher, ts);
@@ -188,19 +204,19 @@ fn put_versioned_document(hasher: &mut blake3::Hasher, value: &VersionedDocument
         Some(version) => {
             hasher.update(&[1]);
             put_u64(hasher, version);
-        },
+        }
         None => {
             hasher.update(&[0]);
-        },
+        }
     }
     match &value.document {
         Some(document) => {
             hasher.update(&[1]);
             put_document(hasher, document);
-        },
+        }
         None => {
             hasher.update(&[0]);
-        },
+        }
     }
 }
 
@@ -217,17 +233,17 @@ fn put_value(hasher: &mut blake3::Hasher, value: &Value) {
         Value::Int(value) => {
             hasher.update(&[b'i']);
             hasher.update(&value.to_le_bytes());
-        },
+        }
         Value::Text(value) => {
             hasher.update(&[b's']);
             put_str(hasher, value);
-        },
+        }
         Value::Bool(value) => {
             hasher.update(&[b'b', u8::from(*value)]);
-        },
+        }
         Value::Null => {
             hasher.update(&[b'n']);
-        },
+        }
     }
 }
 
@@ -270,23 +286,35 @@ mod tests {
         let deployment = DeploymentId::new("dep-a");
         let key = DocumentId::new("docs/1");
         store.seed(key.clone(), doc_with_i64("value", 7));
-        let capsule = store.build_capsule(tenant, deployment, store.snapshot_ts(), vec![key.clone()]);
+        let capsule =
+            store.build_capsule(tenant, deployment, store.snapshot_ts(), vec![key.clone()]);
         let seal_key = CapsuleSealKey::derive_for_tests(b"unit-test-key");
         let context = SealContext::new("cell-a", 11);
         let mut sealed = SealedCapsule::new(capsule, &seal_key, &context);
-        sealed
-            .capsule_mut_for_test()
-            .hydrate_point(key, VersionedDocument { version: Some(99), document: Some(doc_with_i64("value", 8)) });
-        assert_eq!(sealed.verify(&seal_key, &context), Err(SealError::DigestMismatch));
+        sealed.capsule_mut_for_test().hydrate_point(
+            key,
+            VersionedDocument {
+                version: Some(99),
+                document: Some(doc_with_i64("value", 8)),
+            },
+        );
+        assert_eq!(
+            sealed.verify(&seal_key, &context),
+            Err(SealError::DigestMismatch)
+        );
     }
 
     #[test]
     fn sealed_capsule_rejects_wrong_cell_context() {
-        let capsule = SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 1);
+        let capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 1);
         let seal_key = CapsuleSealKey::derive_for_tests(b"unit-test-key");
         let context = SealContext::new("cell-a", 11);
         let sealed = SealedCapsule::new(capsule, &seal_key, &context);
         let wrong_cell = SealContext::new("cell-b", 11);
-        assert_eq!(sealed.verify(&seal_key, &wrong_cell), Err(SealError::WrongCell));
+        assert_eq!(
+            sealed.verify(&seal_key, &wrong_cell),
+            Err(SealError::WrongCell)
+        );
     }
 }

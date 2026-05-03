@@ -18,10 +18,12 @@
 
 pub mod seal;
 
-pub use seal::{capsule_digest, CapsuleSeal, CapsuleSealKey, SealContext, SealError, SealedCapsule};
+pub use seal::{
+    capsule_digest, CapsuleSeal, CapsuleSealKey, SealContext, SealError, SealedCapsule,
+};
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
@@ -288,7 +290,12 @@ impl MvccStore {
         Self::read_at_inner(&inner, key, ts)
     }
 
-    pub fn prefix_at(&self, prefix: &str, limit: usize, ts: Timestamp) -> Vec<(DocumentId, VersionedDocument)> {
+    pub fn prefix_at(
+        &self,
+        prefix: &str,
+        limit: usize,
+        ts: Timestamp,
+    ) -> Vec<(DocumentId, VersionedDocument)> {
         let inner = self.inner.lock().expect("mvcc mutex poisoned");
         inner
             .docs
@@ -377,7 +384,11 @@ pub enum CommitError {
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CommitError::Conflict { key, observed, live } => write!(
+            CommitError::Conflict {
+                key,
+                observed,
+                live,
+            } => write!(
                 f,
                 "OCC conflict on {:?}: observed {:?}, live {:?}",
                 key, observed, live

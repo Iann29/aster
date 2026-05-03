@@ -8,10 +8,10 @@
 
 use std::sync::Mutex;
 
-use aster_capsule::{
-    CommitError, DeploymentId, DocumentId, MvccStore, TenantId, Timestamp,
+use aster_capsule::{CommitError, DeploymentId, DocumentId, MvccStore, TenantId, Timestamp};
+use aster_runner::{
+    CellError, EffectFence, ExecutionResult, FunctionKind, Invocation, SandboxCell,
 };
-use aster_runner::{CellError, EffectFence, ExecutionResult, FunctionKind, Invocation, SandboxCell};
 
 #[derive(Debug)]
 pub struct AsterHost {
@@ -88,8 +88,10 @@ impl AsterHost {
     }
 
     pub fn seed_i64(&self, key: impl Into<String>, field: &str, value: i64) -> Timestamp {
-        self.store
-            .seed(DocumentId::new(key.into()), aster_capsule::doc_with_i64(field, value))
+        self.store.seed(
+            DocumentId::new(key.into()),
+            aster_capsule::doc_with_i64(field, value),
+        )
     }
 
     pub fn snapshot_ts(&self) -> Timestamp {
@@ -114,7 +116,7 @@ impl AsterHost {
                         .push(effect.clone());
                 }
                 None
-            },
+            }
         };
         Ok(HostOutcome {
             execution: result,
@@ -183,7 +185,10 @@ mod tests {
             prewarm: vec![],
         };
         let action_outcome = host.execute(action).expect("action should fence");
-        assert_eq!(action_outcome.execution.output, Value::Text("effect:notify:webhook".to_string()));
+        assert_eq!(
+            action_outcome.execution.output,
+            Value::Text("effect:notify:webhook".to_string())
+        );
         assert_eq!(host.effect_log().len(), 1);
     }
 }
