@@ -6,6 +6,7 @@ members = [
     "crates/ipc",
     "crates/host",
     "crates/v8cell",
+    "crates/store-postgres",
 ]
 resolver = "2"
 
