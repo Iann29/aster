@@ -10,3 +10,4 @@ path = "src/lib.rs"
 
 [dependencies]
 blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }

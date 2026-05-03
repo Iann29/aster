@@ -11,6 +11,7 @@
 use crate::{
     DeploymentId, Document, DocumentId, SnapshotCapsule, TenantId, Value, VersionedDocument,
 };
+use serde::{Deserialize, Serialize};
 
 const ASTER_SEAL_ALG: &str = "aster-blake3-keyed-v1";
 
@@ -33,7 +34,7 @@ impl CapsuleSealKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SealContext {
     pub cell_id: String,
     pub lease_epoch: u64,
@@ -48,16 +49,16 @@ impl SealContext {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapsuleSeal {
-    pub algorithm: &'static str,
+    pub algorithm: String,
     pub digest: [u8; 32],
     pub mac: [u8; 32],
     pub cell_id: String,
     pub lease_epoch: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SealedCapsule {
     capsule: SnapshotCapsule,
     seal: CapsuleSeal,
@@ -93,7 +94,7 @@ impl SealedCapsule {
         Self {
             capsule,
             seal: CapsuleSeal {
-                algorithm: ASTER_SEAL_ALG,
+                algorithm: ASTER_SEAL_ALG.to_string(),
                 digest,
                 mac,
                 cell_id: context.cell_id.clone(),
