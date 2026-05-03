@@ -149,4 +149,7 @@ jobs:
       - name: cargo test postgres-it
         # Only this crate's gated tests; we don't want to recompile v8 for a
         # database test. --features postgres-it flips on tests/postgres_it.rs.
-        run: cargo test --locked -p aster-store-postgres --features postgres-it
+        # --test-threads=1 because the integration tests share a schema —
+        # parallel runs race on `CREATE SCHEMA convex_dev` and one of them
+        # gets a unique-violation on pg_namespace_nspname_index.
+        run: cargo test --locked -p aster-store-postgres --features postgres-it -- --test-threads=1
