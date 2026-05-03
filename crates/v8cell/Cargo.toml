@@ -9,3 +9,7 @@ rust-version.workspace = true
 aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
 v8 = "0.106"
+# serde_json parses the JSON payload Convex.asyncSyscall hands across
+# the V8 boundary (e.g. the `{id}` arg of "1.0/get") and serialises the
+# document back into a JSON string the JS side can `JSON.parse`.
+serde_json = "1"
