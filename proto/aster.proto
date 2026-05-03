@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package aster.runner.v1;
+
+// Aster's internal protocol is deliberately not Convex Funrun's private wire
+// format. The outside adapter can speak whatever unmodified convex-backend
+// expects; this protocol is the open-source capsule fabric behind that adapter.
+
+option java_multiple_files = true;
+option java_package = "dev.aster.runner.v1";
+
+service AsterExecution {
+  // Execute one query, mutation, or action inside a tenant-pinned sandbox cell.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Hydrate missing data for the same immutable snapshot. Runner cells do not
+  // get arbitrary database authority; every hydrate request is scoped by a
+  // capsule reference and checked by the broker.
+  rpc Hydrate(HydrateRequest) returns (HydrateResponse);
+}
+
+enum FunctionKind {
+  FUNCTION_KIND_UNSPECIFIED = 0;
+  FUNCTION_KIND_QUERY = 1;
+  FUNCTION_KIND_MUTATION = 2;
+  FUNCTION_KIND_ACTION = 3;
+}
+
+message TenantRef {
+  string tenant_id = 1;
+  string deployment_id = 2;
+  uint64 snapshot_ts = 3;
+  uint64 lease_epoch = 4;
+}
+
+message DocumentKey {
+  // Production adapters map Convex table/document IDs to this stable form.
+  string table = 1;
+  string id = 2;
+}
+
+message Value {
+  oneof value {
+    int64 int_value = 1;
+    string string_value = 2;
+    bool bool_value = 3;
+    bool null_value = 4;
+    bytes convex_json = 15;
+  }
+}
+
+message Document {
+  map<string, Value> fields = 1;
+}
+
+message VersionedDocument {
+  bool exists = 1;
+  uint64 version = 2;
+  Document document = 3;
+}
+
+message CapsuleEntry {
+  DocumentKey key = 1;
+  VersionedDocument value = 2;
+}
+
+message CapsuleRef {
+  TenantRef tenant = 1;
+  bytes root_hash = 2;
+  uint64 ttl_ms = 3;
+  repeated CapsuleEntry entries = 4;
+}
+
+message PointRead {
+  DocumentKey key = 1;
+}
+
+message PrefixRead {
+  string table = 1;
+  string prefix = 2;
+  uint32 limit = 3;
+}
+
+message ReadTrap {
+  oneof trap {
+    PointRead point = 1;
+    PrefixRead prefix = 2;
+  }
+}
+
+message ReadObservation {
+  DocumentKey key = 1;
+  bool observed_exists = 2;
+  uint64 observed_version = 3;
+}
+
+message WriteOp {
+  DocumentKey key = 1;
+  oneof op {
+    Document put = 2;
+    bool delete = 3;
+  }
+}
+
+message EffectFence {
+  string effect_kind = 1;
+  string idempotency_key = 2;
+  bytes capsule_hash = 3;
+  repeated ReadObservation reads = 4;
+  bytes payload = 5;
+}
+
+message ProgramRef {
+  // In the prototype this may be a tiny built-in program name. In production it
+  // is the Convex module/function reference plus module hash.
+  string module = 1;
+  string function = 2;
+  bytes args = 3;
+}
+
+message ExecuteRequest {
+  TenantRef tenant = 1;
+  FunctionKind kind = 2;
+  ProgramRef program = 3;
+  CapsuleRef initial_capsule = 4;
+  uint32 max_read_traps = 5;
+}
+
+message ExecuteResponse {
+  bytes result = 1;
+  repeated ReadObservation read_set = 2;
+  repeated WriteOp write_set = 3;
+  EffectFence effect = 4;
+  bytes final_capsule_hash = 5;
+  uint32 traps = 6;
+}
+
+message HydrateRequest {
+  CapsuleRef capsule = 1;
+  ReadTrap trap = 2;
+}
+
+message HydrateResponse {
+  repeated CapsuleEntry entries = 1;
+  bytes new_root_hash = 2;
+  bool stale_snapshot = 3;
+  string rejection_reason = 4;
+}

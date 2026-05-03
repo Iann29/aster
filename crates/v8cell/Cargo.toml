@@ -1,0 +1,10 @@
+[package]
+name = "aster-v8cell"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aster-capsule = { path = "../capsule" }
+v8 = "0.106"

@@ -1,0 +1,12 @@
+[package]
+name = "aster-capsule"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1.8"

@@ -1,0 +1,200 @@
+     1	//! Snapshot capsules: the production spine of Aster Runner.
+     2	//!
+     3	//! This file is deliberately small enough to read in one sitting, but it is
+     4	//! not a toy API. The production service would replace the in-memory MVCC map
+     5	//! with a Postgres/WAL-backed snapshot fabric and replace `DefaultHasher` with
+     6	//! BLAKE3 or SHA-256. The shapes are the important part: a runner receives a
+     7	//! bounded, immutable, tenant-scoped capsule; all missing data is requested via
+     8	//! explicit read traps; all writes are committed by a single writer that checks
+     9	//! the read set against the live MVCC state.
+    10	//!
+    11	//! The main design intent is capability separation. Aster runners never need
+    12	//! database credentials. They do not get an open-ended "read from the DB" RPC.
+    13	//! They get a cryptographically named capsule and may ask the capsule broker to
+    14	//! hydrate particular missing keys for the same tenant/deployment/snapshot.
+    15	//! That is the architectural line between this prototype and a conventional
+    16	//! remote function runner.
+    17	
+    18	use std::collections::{BTreeMap, BTreeSet};
+    19	use std::collections::hash_map::DefaultHasher;
+    20	use std::fmt;
+    21	use std::hash::{Hash, Hasher};
+    22	use std::sync::Mutex;
+    23	
+    24	/// Convex deployments belong to tenants in a self-hosted control plane.
+    25	///
+    26	/// The type is a newtype instead of a bare string so APIs cannot accidentally
+    27	/// pass a deployment name where a tenant boundary is required. In production
+    28	/// this identifier would be minted by Synapse or another OSS control plane.
+    29	#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    30	pub struct TenantId(pub String);
+    31	
+    32	impl TenantId {
+    33	    pub fn new(value: impl Into<String>) -> Self {
+    34	        Self(value.into())
+    35	    }
+    36	}
+    37	
+    38	/// A single Convex deployment under a tenant.
+    39	///
+    40	/// The lease-backed Convex backend remains authoritative for commits. Aster's
+    41	/// deployment identifier is used to make capsules unforgeably narrow: a capsule
+    42	/// for deployment A is never accepted by a runner cell pinned to deployment B.
+    43	#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    44	pub struct DeploymentId(pub String);
+    45	
+    46	impl DeploymentId {
+    47	    pub fn new(value: impl Into<String>) -> Self {
+    48	        Self(value.into())
+    49	    }
+    50	}
+    51	
+    52	/// Prototype timestamp. Convex's real timestamp type is richer, but the
+    53	/// relevant property here is a monotonically increasing MVCC version.
+    54	pub type Timestamp = u64;
+    55	
+    56	/// Prototype document key.
+    57	///
+    58	/// A production adapter maps Convex's internal document/table IDs and index
+    59	/// ranges into this key space. The core machinery only requires total ordering
+    60	/// so capsules can be hashed deterministically.
+    61	#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    62	pub struct DocumentId(pub String);
+    63	
+    64	impl DocumentId {
+    65	    pub fn new(value: impl Into<String>) -> Self {
+    66	        Self(value.into())
+    67	    }
+    68	}
+    69	
+    70	/// Minimal Convex-like value domain for the prototype.
+    71	///
+    72	/// Keeping the value domain tiny lets the example focus on the distributed
+    73	/// systems idea: snapshot shipping, read traps, and OCC. Production code would
+    74	/// use Convex's existing `ConvexValue` serialization.
+    75	#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    76	pub enum Value {
+    77	    Int(i64),
+    78	    Text(String),
+    79	    Bool(bool),
+    80	    Null,
+    81	}
+    82	
+    83	impl Value {
+    84	    pub fn as_i64(&self) -> Option<i64> {
+    85	        match self {
+    86	            Value::Int(value) => Some(*value),
+    87	            _ => None,
+    88	        }
+    89	    }
+    90	}
+    91	
+    92	/// A document is an ordered map so hashing is deterministic.
+    93	pub type Document = BTreeMap<String, Value>;
+    94	
+    95	/// A document plus the exact MVCC version visible in a capsule.
+    96	///
+    97	/// `document == None` is a tombstone/nonexistent read. The version remains
+    98	/// explicit because reading absence is part of OCC: if a document appears after
+    99	/// the snapshot began, a mutation that depended on absence must conflict.
+   100	#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+   101	pub struct VersionedDocument {
+   102	    pub version: Option<Timestamp>,
+   103	    pub document: Option<Document>,
+   104	}
+   105	
+   106	impl VersionedDocument {
+   107	    pub fn missing() -> Self {
+   108	        Self {
+   109	            version: None,
+   110	            document: None,
+   111	        }
+   112	    }
+   113	}
+   114	
+   115	/// A point-read set with observed versions.
+   116	///
+   117	/// The committer validates this structure against the live MVCC state. This is
+   118	/// the same logical contract Convex relies on: functions execute against a
+   119	/// consistent snapshot; the single writer rejects a mutation when a read changed
+   120	/// before commit.
+   121	#[derive(Clone, Debug, Default, Eq, PartialEq)]
+   122	pub struct ReadSet {
+   123	    points: BTreeMap<DocumentId, Option<Timestamp>>,
+   124	}
+   125	
+   126	impl ReadSet {
+   127	    pub fn observe(&mut self, key: DocumentId, version: Option<Timestamp>) {
+   128	        self.points.entry(key).or_insert(version);
+   129	    }
+   130	
+   131	    pub fn contains(&self, key: &DocumentId) -> bool {
+   132	        self.points.contains_key(key)
+   133	    }
+   134	
+   135	    pub fn iter(&self) -> impl Iterator<Item = (&DocumentId, &Option<Timestamp>)> {
+   136	        self.points.iter()
+   137	    }
+   138	
+   139	    pub fn len(&self) -> usize {
+   140	        self.points.len()
+   141	    }
+   142	
+   143	    pub fn is_empty(&self) -> bool {
+   144	        self.points.is_empty()
+   145	    }
+   146	}
+   147	
+   148	/// A mutation write set. Queries and actions return an empty write set.
+   149	#[derive(Clone, Debug, Default, Eq, PartialEq)]
+   150	pub struct WriteSet {
+   151	    writes: BTreeMap<DocumentId, Option<Document>>,
+   152	}
+   153	
+   154	impl WriteSet {
+   155	    pub fn put(&mut self, key: DocumentId, document: Document) {
+   156	        self.writes.insert(key, Some(document));
+   157	    }
+   158	
+   159	    pub fn delete(&mut self, key: DocumentId) {
+   160	        self.writes.insert(key, None);
+   161	    }
+   162	
+   163	    pub fn iter(&self) -> impl Iterator<Item = (&DocumentId, &Option<Document>)> {
+   164	        self.writes.iter()
+   165	    }
+   166	
+   167	    pub fn len(&self) -> usize {
+   168	        self.writes.len()
+   169	    }
+   170	
+   171	    pub fn is_empty(&self) -> bool {
+   172	        self.writes.is_empty()
+   173	    }
+   174	}
+   175	
+   176	/// A read trap is a structured continuation request, not a database query.
+   177	///
+   178	/// The runner says "I cannot continue this function until the capsule contains
+   179	/// this key/range at the same snapshot timestamp." The broker may hydrate the
+   180	/// capsule, reject it as stale, or route the invocation to a better-prewarmed
+   181	/// cell. The runner itself still never receives general database authority.
+   182	#[derive(Clone, Debug, Eq, PartialEq)]
+   183	pub enum ReadTrap {
+   184	    Point(DocumentId),
+   185	    Prefix { prefix: String, limit: usize },
+   186	}
+   187	
+   188	/// The immutable capability passed into a sandbox cell.
+   189	///
+   190	/// `root_hash` is recomputed whenever the broker hydrates more data. A worker
+   191	/// can include it in every result so the host can audit exactly which snapshot
+   192	/// bytes influenced the function outcome.
+   193	#[derive(Clone, Debug, Eq, PartialEq)]
+   194	pub struct SnapshotCapsule {
+   195	    pub tenant: TenantId,
+   196	    pub deployment: DeploymentId,
+   197	    pub ts: Timestamp,
+   198	    pub docs: BTreeMap<DocumentId, VersionedDocument>,
+   199	    pub root_hash: u64,
+   200	}

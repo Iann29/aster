@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/capsule",
+    "crates/runner",
+    "crates/host",
+    "crates/v8cell",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://example.invalid/aster-runner"
+rust-version = "1.75"

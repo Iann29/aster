@@ -1,0 +1,2 @@
+static_check: balanced delimiters and required proto declarations OK
+py_compile OK

@@ -1,0 +1,9 @@
+[package]
+name = "aster-runner"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aster-capsule = { path = "../capsule" }

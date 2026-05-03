@@ -1,0 +1,16 @@
+{
+  "cold_trap_query_avg_ns": 56476,
+  "cold_trap_query_p50_ns": 53631,
+  "cold_trap_query_p95_ns": 73086,
+  "cold_trap_query_total_ns": 282381317,
+  "iterations": 5000,
+  "keys": 32,
+  "mutation_avg_ns": 2354,
+  "mutation_p50_ns": 1978,
+  "mutation_p95_ns": 3836,
+  "mutation_total_ns": 11773697,
+  "warm_query_avg_ns": 13090,
+  "warm_query_p50_ns": 12492,
+  "warm_query_p95_ns": 16540,
+  "warm_query_total_ns": 65454440
+}
