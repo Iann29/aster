@@ -1,0 +1,52 @@
+# Smoke harness for the Aster v0.3 IPC: brokerd as a long-lived service,
+# v8cell as a one-shot job that opens the shared socket, runs main.js,
+# and exits with a JSON line on stdout.
+#
+# Usage:
+#   docker compose -f docker/compose.smoke.yml up -d brokerd
+#   docker compose -f docker/compose.smoke.yml run --rm v8cell
+#   docker compose -f docker/compose.smoke.yml down -v
+#
+# A scripted version with assertions lives at docker/smoke.sh.
+
+services:
+  brokerd:
+    image: aster-brokerd:0.3
+    container_name: aster-smoke-brokerd
+    environment:
+      ASTER_BROKER_SOCK: /run/aster/broker.sock
+      ASTER_TENANT: tenant-smoke
+      ASTER_DEPLOYMENT: dep-smoke
+      ASTER_SEED_I64: "counters/a:value:20,counters/b:value:22"
+      ASTER_SEAL_SEED: smoke-seed
+      ASTER_MAX_CONNECTIONS: "8"
+    volumes:
+      - aster-smoke-sock:/run/aster
+    # The brokerd writes "ready" to stderr, but it doesn't expose any
+    # HTTP endpoint, so a network healthcheck would be lying. We rely on
+    # docker's container-state machine and let `docker compose run`'s
+    # depends_on retry semantics handle the cell's connect.
+    restart: "no"
+
+  v8cell:
+    image: aster-v8cell:0.3
+    container_name: aster-smoke-v8cell
+    environment:
+      ASTER_BROKER_SOCK: /run/aster/broker.sock
+      ASTER_TENANT: tenant-smoke
+      ASTER_DEPLOYMENT: dep-smoke
+      ASTER_SNAPSHOT_TS: "2"
+      ASTER_CELL_ID: cell-smoke-1
+      ASTER_LEASE_EPOCH: "7"
+      ASTER_PREWARM: counters/a
+      ASTER_JS: /tenant/main.js
+      ASTER_MAX_TRAPS: "8"
+    volumes:
+      - aster-smoke-sock:/run/aster
+      - ./tenant:/tenant:ro
+    depends_on:
+      - brokerd
+
+volumes:
+  aster-smoke-sock:
+    name: aster-smoke-sock
