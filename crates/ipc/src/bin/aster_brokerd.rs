@@ -1,8 +1,9 @@
 use std::fs;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use aster_broker::{BrokerError, CapsuleBrokerClient};
+use aster_broker::{BrokerError, CapsuleBrokerClient, CapsuleStore};
 use aster_capsule::{
     CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, SealContext, SealedCapsule,
     TenantId, Value,
@@ -62,14 +63,22 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
         fs::remove_file(&config.socket_path)?;
     }
 
-    let store = MvccStore::new();
+    // Build the in-memory store and hand it to ProcessBroker as an
+    // Arc<dyn CapsuleStore>. The Arc indirection is what lets a future
+    // PostgresCapsuleStore plug in here without changing the broker
+    // request loop — see docs/POSTGRES_ADAPTER_PLAN.md commit 3.
+    let mvcc = MvccStore::new();
     for (key, document) in config.seeds {
-        store.seed(key, document);
+        mvcc.seed(key, document);
     }
-    let snapshot_ts = if config.snapshot_ts == 0 {
-        store.snapshot_ts()
+    let configured_ts = config.snapshot_ts;
+    let store: Arc<dyn CapsuleStore + Send + Sync> = Arc::new(mvcc);
+    let snapshot_ts = if configured_ts == 0 {
+        store
+            .snapshot_ts()
+            .map_err(|err| format!("snapshot_ts: {err}"))?
     } else {
-        config.snapshot_ts
+        configured_ts
     };
     let broker = ProcessBroker {
         store,
@@ -148,9 +157,8 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
     }
 }
 
-#[derive(Debug)]
 struct ProcessBroker {
-    store: MvccStore,
+    store: Arc<dyn CapsuleStore + Send + Sync>,
     seal_key: CapsuleSealKey,
     tenant: TenantId,
     deployment: DeploymentId,
@@ -180,7 +188,7 @@ impl CapsuleBrokerClient for ProcessBroker {
         }
         let capsule = self
             .store
-            .build_capsule(tenant, deployment, snapshot_ts, prewarm);
+            .build_capsule(tenant, deployment, snapshot_ts, prewarm)?;
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
 
@@ -203,7 +211,7 @@ impl CapsuleBrokerClient for ProcessBroker {
                 capsule.ts, self.snapshot_ts
             )));
         }
-        let value = self.store.read_at(&key, capsule.ts);
+        let value = self.store.read_point(&key, capsule.ts)?;
         capsule.hydrate_point(key, value);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
