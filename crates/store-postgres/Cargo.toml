@@ -21,3 +21,8 @@ deadpool-postgres = "0.14"
 # Default CI runs without a database; the dedicated postgres-it lane
 # (commit 5/5) flips this on with a postgres:16 service container.
 postgres-it = []
+
+[dev-dependencies]
+# tokio with `rt`+macros so the integration tests can use #[tokio::test]
+# and drive the fixture reset without us hand-rolling a runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

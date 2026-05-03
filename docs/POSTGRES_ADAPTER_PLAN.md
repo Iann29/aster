@@ -9,12 +9,23 @@ The plan is staged into five commits, each independently
 
 ## What's already done
 
-- **Commit 1 (this PR)** — introduce `CapsuleStore` trait + `StoreError` in
-  `crates/broker/src/store.rs`, make `LocalCapsuleBroker` generic over `S:
-  CapsuleStore`. Blanket impls cover `&MvccStore`, `MvccStore`, and
-  `Arc<S>`. No behaviour change; existing 20 tests pass + 3 new trait tests.
+- **Commit 1** — `CapsuleStore` trait + `StoreError` in
+  `crates/broker/src/store.rs`. `LocalCapsuleBroker` generic over `S:
+  CapsuleStore`. Blanket impls cover `&MvccStore`, `MvccStore`, `Arc<S>`.
+- **Commit 2** — `aster_brokerd` uses `Arc<dyn CapsuleStore + Send + Sync>`.
+  Same behaviour, narrower type — the Postgres impl plugs in here.
+- **Commit 3** — `crates/store-postgres/` scaffold with `tokio-postgres` +
+  `deadpool-postgres`, sync API + internal tokio runtime, stub queries.
+- **Commit 4** — real SQL: `snapshot_ts` queries `documents` + the
+  `max_repeatable_ts` fence; `read_point` does a direct `DISTINCT ON (id)`
+  on `documents`; `read_prefix` is a bounded variant. Integration tests
+  against `postgres:16` cover snapshot_ts, point reads at multiple ts
+  values, prefix scans honouring limit + ts, malformed-id classification,
+  and unreachable-server handling.
+- **Commit 5** — CI lane with `postgres:16` service container running the
+  gated `postgres-it` tests.
 
-## Remaining commits
+## Remaining work
 
 ### Commit 2 — push trait through brokerd
 - `crates/ipc/src/bin/aster_brokerd.rs`: `ProcessBroker.store: MvccStore` →
