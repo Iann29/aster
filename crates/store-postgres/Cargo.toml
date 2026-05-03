@@ -1,0 +1,23 @@
+[package]
+name = "aster-store-postgres"
+version = "0.4.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aster-broker = { path = "../broker" }
+aster-capsule = { path = "../capsule" }
+# rt-multi-thread is the runtime flavour brokerd's "async island"
+# (block_on from sync threads) needs. We avoid `full` to keep the
+# compile graph slim — no fs/net features beyond what tokio-postgres
+# pulls in itself.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+
+[features]
+# `postgres-it` gates the integration tests in tests/postgres_it.rs.
+# Default CI runs without a database; the dedicated postgres-it lane
+# (commit 5/5) flips this on with a postgres:16 service container.
+postgres-it = []
