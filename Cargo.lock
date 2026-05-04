@@ -51,6 +51,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-convex-codec"
+version = "0.5.0"
+
+[[package]]
 name = "aster-host"
 version = "0.2.0"
 dependencies = [
