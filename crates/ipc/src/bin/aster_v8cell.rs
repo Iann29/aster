@@ -32,12 +32,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &source,
     )?;
 
-    println!(
-        "{{\"output\":{},\"traps\":{},\"capsule_hash\":{}}}",
-        result.output.as_i64().unwrap_or_default(),
-        result.traps,
-        result.capsule_hash
-    );
+    // Serialise the Value via serde_json so strings, bools and null
+    // round-trip — the original i64-only formatter silently dropped
+    // anything that wasn't an integer (Text → 0, masking real
+    // results the JS function actually returned).
+    let output_json = match &result.output {
+        aster_capsule::Value::Int(n) => serde_json::Value::from(*n),
+        aster_capsule::Value::Text(s) => serde_json::Value::from(s.as_str()),
+        aster_capsule::Value::Bool(b) => serde_json::Value::from(*b),
+        aster_capsule::Value::Null => serde_json::Value::Null,
+    };
+    let envelope = serde_json::json!({
+        "output": output_json,
+        "traps": result.traps,
+        "capsule_hash": result.capsule_hash,
+    });
+    println!("{}", serde_json::to_string(&envelope).unwrap());
     Ok(())
 }
 
