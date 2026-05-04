@@ -40,3 +40,53 @@ VALUES (
 INSERT INTO convex_dev.persistence_globals (key, json_value)
 VALUES ('max_repeatable_ts', convert_to('200', 'UTF8'))
 ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value;
+
+-- ---------------------------------------------------------------------
+-- Table-mapping fixture (#96): the bootstrap pointer + a `_tables` row
+-- so the IDv6 → tablet UUID resolver can be exercised end-to-end.
+--
+-- The `_tables` tablet has its own well-known UUID. Convex stores it
+-- in persistence_globals['tables_table_id'] as JSON ("<base64url-no-pad
+-- of 16 bytes>"). We pick `cccccccccccccccccccccccccccccccc` (16 bytes
+-- of 0xCC) for visibility; its base64url-no-pad form is exactly
+-- `zMzMzMzMzMzMzMzMzMzMzA` (21 alternating z/M pairs + final 'A' for
+-- the 4-bit zero pad), wrapped in JSON quotes.
+INSERT INTO convex_dev.persistence_globals (key, json_value)
+VALUES (
+    'tables_table_id',
+    convert_to('"zMzMzMzMzMzMzMzMzMzMzA"', 'UTF8')
+)
+ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value;
+
+-- A `_tables` row whose `id` (the tablet UUID for the user table) is
+-- the same `0123456789abcdef0123456789abcdef` used by the documents
+-- above. The body has the `number` (10001) we'll encode into IDv6 +
+-- the `state = "active"` the cache filters on.
+INSERT INTO convex_dev.documents (id, ts, table_id, json_value, deleted, prev_ts)
+VALUES (
+    decode('0123456789abcdef0123456789abcdef', 'hex'),
+    50,
+    decode('cccccccccccccccccccccccccccccccc', 'hex'),
+    convert_to(
+        '{"name":"messages","number":10001,"state":"active"}',
+        'UTF8'
+    ),
+    false,
+    NULL
+);
+
+-- A second `_tables` row in `deleting` state. The mapping cache must
+-- skip this one — a deleted/hidden row's number could be reused for a
+-- live tablet, returning the wrong document.
+INSERT INTO convex_dev.documents (id, ts, table_id, json_value, deleted, prev_ts)
+VALUES (
+    decode('99999999999999999999999999999999', 'hex'),
+    50,
+    decode('cccccccccccccccccccccccccccccccc', 'hex'),
+    convert_to(
+        '{"name":"old_messages","number":9999,"state":"deleting"}',
+        'UTF8'
+    ),
+    false,
+    NULL
+);
