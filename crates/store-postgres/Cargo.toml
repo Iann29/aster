@@ -8,6 +8,10 @@ rust-version.workspace = true
 [dependencies]
 aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
+# Pure-Rust IDv6 + Crockford base32 codec so the adapter can decode the
+# string a Convex JS bundle hands to `db.get(id)` and translate the
+# table_number prefix into the tablet UUID the SQL schema indexes by.
+aster-convex-codec = { path = "../convex-codec" }
 # rt-multi-thread is the runtime flavour brokerd's "async island"
 # (block_on from sync threads) needs. We avoid `full` to keep the
 # compile graph slim — no fs/net features beyond what tokio-postgres
@@ -15,6 +19,14 @@ aster-capsule = { path = "../capsule" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
+# Used for two narrow jobs: parse the JSON bytes Convex stores in
+# `documents.json_value` (table metadata `{name, number, state, ...}`)
+# and parse the JSON-encoded string in `persistence_globals['tables_table_id']`.
+# Pulled in here, not in the cell-side crates, so cells stay codec-free.
+serde_json = "1"
+# Convex stores the bootstrap tablet pointer as base64-url (no pad).
+# Decoder needed to lift those 16 bytes back out.
+base64 = "0.22"
 
 [features]
 # `postgres-it` gates the integration tests in tests/postgres_it.rs.

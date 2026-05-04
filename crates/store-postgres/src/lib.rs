@@ -12,10 +12,11 @@
 //! 2. **Sync broker, async island.** This struct owns a
 //!    `tokio::runtime::Runtime` and `block_on`s into it from sync
 //!    callers. Cells (and brokerd's accept loop) never touch tokio.
-//! 3. **DocumentId encoding** is `"<table_hex>/<id_hex>"` —
-//!    `parse_document_id` is the canonical splitter. The wire form is
-//!    set so the broker can route reads without knowing Convex's IDv6
-//!    string codec.
+//! 3. **DocumentId encoding** comes in two forms — the legacy Aster
+//!    wire form `"<table_hex>/<id_hex>"` (used by tests + Aster-native
+//!    callers) and the Convex IDv6 string a JS bundle hands to
+//!    `db.get(id)`. `resolve_document_id` dispatches between them; the
+//!    IDv6 path consults a `_tables`-backed mapping cache.
 //!
 //! Coverage today (v0.5):
 //! - `snapshot_ts()` — `max(latest documents.ts, persistence_globals['max_repeatable_ts'])`.
@@ -30,10 +31,30 @@
 //!   the cell's JS runtime grows the `Convex.asyncSyscall("1.0/get")`
 //!   path that consumes it.
 //!
+//! ## DocumentId formats
+//!
+//! The adapter accepts two forms on the `read_point` / `read_prefix`
+//! interfaces, dispatched at parse time:
+//!
+//! 1. **Aster wire form** — `"<table_hex>/<id_hex>"` (32 hex + slash +
+//!    32 hex). Used by Aster-native callers and integration tests that
+//!    work directly with raw tablet UUIDs.
+//! 2. **Convex IDv6** — Crockford base32 string of `(table_number,
+//!    internal_id, fletcher16)`. Forwarded by the cell when JS calls
+//!    `db.get(id)` against an upstream Convex bundle. The adapter
+//!    decodes the IDv6, resolves `table_number → tablet_uuid` via the
+//!    table-mapping cache, and runs the same SQL as form #1.
+//!
+//! Form #1 is detected first by the presence of `/`. Form #2 is
+//! everything else. Garbage falls through to a clear error message
+//! that mentions both forms.
+//!
 //! Why not `sqlx`: its `query!` macro requires a live database at
 //! compile time, which CI cannot satisfy without a service container
 //! and a checked-in offline-query-data file. We hand-write the SQL
 //! against the Convex reference doc instead.
+
+mod table_mapping;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,11 +63,14 @@ use aster_broker::{CapsuleStore, StoreError};
 use aster_capsule::{
     DeploymentId, DocumentId, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
 };
+use aster_convex_codec::DocumentIdV6;
 use deadpool_postgres::{
     Manager, ManagerConfig, Pool, RecyclingMethod, Runtime as DeadpoolRuntime,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Config as PgConfig, NoTls};
+
+use crate::table_mapping::TableMappingCache;
 
 /// Connection / pool tunables for `PostgresCapsuleStore::connect`.
 #[derive(Clone, Debug)]
@@ -98,6 +122,10 @@ pub struct PostgresCapsuleStore {
     runtime: Arc<Runtime>,
     pool: Pool,
     schema: String,
+    /// Lazy `table_number → tablet_uuid` resolver. Populated on first
+    /// IDv6-shaped lookup, refreshed on miss. Wrapped in Arc so it can
+    /// be cloned cheaply into the per-call async closures.
+    table_mapping: Arc<TableMappingCache>,
 }
 
 impl PostgresCapsuleStore {
@@ -141,6 +169,7 @@ impl PostgresCapsuleStore {
             runtime,
             pool,
             schema: config.schema,
+            table_mapping: Arc::new(TableMappingCache::new()),
         })
     }
 
@@ -219,18 +248,14 @@ impl CapsuleStore for PostgresCapsuleStore {
     }
 
     fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
-        // Aster's DocumentId is opaque to Convex: we encode it as
-        // "<table_hex>/<id_hex>" so the broker can split it back out.
-        // Real Convex `db.get(id)` carries the table tag inside the id
-        // string; the v0.5 wire-up converts that into our format before
-        // the read trap fires.
-        let (table_id, doc_id) = parse_document_id(key)?;
-
-        // Using documents directly instead of the `by_id` index for v0.5.
-        // The index path is more correct under retention (see gotcha #5)
-        // but requires loading the table mapping first; we'll add it once
-        // the broker has a real Convex frontend driving it.
+        // Aster's DocumentId is opaque to Convex: callers send either
+        // the Aster wire form `"<table_hex>/<id_hex>"` (used by tests
+        // and any caller that already resolved a tablet) or a Convex
+        // IDv6 string (the JS bundle's `db.get(id)` path). Dispatching
+        // on the form lives inside the async block so the IDv6 case
+        // can refresh the table-mapping cache via Postgres on a miss.
         self.block_on(async {
+            let (table_id, doc_id) = self.resolve_document_id(key).await?;
             let client = self.checkout().await?;
             let ts_signed = ts as i64;
             let row = client
@@ -376,12 +401,69 @@ impl PostgresCapsuleStore {
             .await
             .map_err(|err| StoreError::Unavailable(format!("pool checkout: {err}")))
     }
+
+    /// Resolve a `DocumentId` to the `(table_id, id)` byte pair the
+    /// `documents` index expects. Two input forms are accepted:
+    ///
+    /// 1. **Aster wire form** — `"<table_hex>/<id_hex>"`. Used by tests
+    ///    and any caller that already holds a tablet UUID. Parsed
+    ///    without touching Postgres.
+    /// 2. **Convex IDv6** — Crockford base32 of `(table_number,
+    ///    internal_id, footer)`. The table-mapping cache is consulted;
+    ///    a miss triggers a refresh and one retry. Failure to resolve
+    ///    after the refresh surfaces as `StoreError::Backend` with the
+    ///    table number named so operators can audit `_tables`.
+    ///
+    /// Visible for tests via `#[cfg(test)]` callers.
+    async fn resolve_document_id(
+        &self,
+        key: &DocumentId,
+    ) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+        let raw: &str = &key.0;
+        if raw.contains('/') {
+            return parse_aster_document_id(raw);
+        }
+        // IDv6 path. Decode first — a malformed IDv6 should surface as
+        // a clear error instead of triggering a Postgres roundtrip.
+        let id = DocumentIdV6::decode(raw).map_err(|err| {
+            StoreError::Backend(format!(
+                "DocumentId {raw:?}: not '<table_hex>/<id_hex>' and not a valid IDv6 string: {err}"
+            ))
+        })?;
+        let tablet = self
+            .resolve_table_number(id.table_number)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "DocumentId {raw:?}: table_number {} unknown — \
+                     refresh ran and `_tables` does not list it (deleted? hidden?)",
+                    id.table_number
+                ))
+            })?;
+        Ok((tablet.to_vec(), id.internal_id.to_vec()))
+    }
+
+    /// Lookup with one refresh-and-retry on miss. Two roundtrips at
+    /// most: one for `persistence_globals['tables_table_id']`, one for
+    /// the `_tables` body scan. Cold-start cost is paid once per
+    /// brokerd lifetime + once per genuinely-new tablet.
+    async fn resolve_table_number(
+        &self,
+        table_number: u32,
+    ) -> Result<Option<[u8; 16]>, StoreError> {
+        if let Some(uuid) = self.table_mapping.lookup(table_number) {
+            return Ok(Some(uuid));
+        }
+        let client = self.checkout().await?;
+        self.table_mapping.refresh(&client, &self.schema).await?;
+        Ok(self.table_mapping.lookup(table_number))
+    }
 }
 
-/// Aster's `DocumentId` is the public-facing string "<table_hex>/<id_hex>".
-/// We split it back into raw bytes for the SQL bind parameters.
-fn parse_document_id(key: &DocumentId) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
-    let raw: &str = &key.0;
+/// Parse the Aster wire form `"<table_hex>/<id_hex>"` into raw bytes.
+/// Standalone so callers in `read_prefix` can reuse it without
+/// borrowing `&self` (no Postgres roundtrip needed for this form).
+fn parse_aster_document_id(raw: &str) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
     let (t, i) = raw.split_once('/').ok_or_else(|| {
         StoreError::Backend(format!(
             "DocumentId {raw:?}: expected '<table_hex>/<id_hex>'"
@@ -500,12 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn document_id_parser_round_trips() {
+    fn aster_wire_form_round_trips() {
         // Sanity: encoded form survives through the parser back to
         // the same bytes we'd send to Postgres.
-        let key =
-            DocumentId::new("0123456789abcdef0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let (table_id, doc_id) = parse_document_id(&key).expect("parse");
+        let raw = "0123456789abcdef0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (table_id, doc_id) = parse_aster_document_id(raw).expect("parse");
         assert_eq!(table_id.len(), 16);
         assert_eq!(doc_id.len(), 16);
         assert_eq!(encode_hex(&table_id), "0123456789abcdef0123456789abcdef");
@@ -513,12 +594,84 @@ mod tests {
     }
 
     #[test]
-    fn document_id_parser_rejects_malformed() {
-        // No slash → no split.
-        assert!(parse_document_id(&DocumentId::new("notslashed")).is_err());
+    fn aster_wire_form_rejects_malformed_with_slash() {
         // Slash but neither half is hex.
-        assert!(parse_document_id(&DocumentId::new("zz/aa")).is_err());
+        assert!(parse_aster_document_id("zz/aa").is_err());
         // Odd-length hex.
-        assert!(parse_document_id(&DocumentId::new("abc/aaaa")).is_err());
+        assert!(parse_aster_document_id("abc/aaaa").is_err());
+    }
+
+    /// IDv6 dispatch: a string with no `/` runs through the IDv6
+    /// codec. Garbage that isn't valid IDv6 must error before any
+    /// Postgres roundtrip — operators see one consistent error
+    /// regardless of which form the caller intended.
+    #[test]
+    fn dispatch_rejects_garbage_idv6_without_postgres() {
+        // Build a store with no real Postgres behind it. `connect()`
+        // is lazy so this never opens a TCP socket.
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let key = DocumentId::new("not-a-real-idv6-string");
+        let err = store
+            .runtime
+            .block_on(store.resolve_document_id(&key))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("not a valid IDv6 string")),
+            "expected IDv6 parse error, got {err:?}"
+        );
+    }
+
+    /// IDv6 dispatch: a well-formed IDv6 with an unknown table_number
+    /// triggers a Postgres roundtrip. Without a real DB we expect
+    /// `Unavailable` — confirms the dispatch reached the resolver.
+    #[test]
+    fn dispatch_attempts_refresh_when_idv6_table_number_unknown() {
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        // Build a real IDv6 — table_number=42, internal_id=zeroes.
+        let id = aster_convex_codec::DocumentIdV6::new(42, [0u8; 16]);
+        let key = DocumentId::new(id.encode());
+        let err = store
+            .runtime
+            .block_on(store.resolve_document_id(&key))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Unavailable(_)),
+            "expected Unavailable from refresh attempt, got {err:?}"
+        );
+    }
+
+    /// Cache hit short-circuits the Postgres roundtrip — useful when
+    /// Postgres is briefly unreachable but we already cached the
+    /// mapping. Verifies we don't open a connection on the hot path.
+    #[test]
+    fn dispatch_uses_cache_when_table_number_known() {
+        use std::collections::BTreeMap;
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let mut mapping = BTreeMap::new();
+        let tablet = [0xCDu8; 16];
+        mapping.insert(10001, tablet);
+        store.table_mapping.install_for_test(mapping);
+
+        let internal = [0xEFu8; 16];
+        let id = aster_convex_codec::DocumentIdV6::new(10001, internal);
+        let key = DocumentId::new(id.encode());
+        let (table_id, doc_id) = store
+            .runtime
+            .block_on(store.resolve_document_id(&key))
+            .expect("cache hit");
+        assert_eq!(table_id, tablet.to_vec());
+        assert_eq!(doc_id, internal.to_vec());
     }
 }

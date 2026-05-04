@@ -22,6 +22,7 @@ use std::path::Path;
 
 use aster_broker::{CapsuleStore, StoreError};
 use aster_capsule::{DocumentId, Value};
+use aster_convex_codec::DocumentIdV6;
 use aster_store_postgres::{PostgresCapsuleStore, PostgresConfig};
 use tokio::runtime::Builder;
 use tokio_postgres::NoTls;
@@ -30,6 +31,10 @@ const TEST_SCHEMA: &str = "convex_dev";
 const TEST_TABLE_ID_HEX: &str = "0123456789abcdef0123456789abcdef";
 const ID_IAN_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ID_CAUE_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// `seed.sql` registers the `messages` tablet under table_number 10001.
+/// Must match the `_tables` row body. Hardcoded here so the IDv6 test
+/// can encode the same number the resolver expects to find.
+const TEST_TABLE_NUMBER: u32 = 10001;
 
 fn url() -> String {
     std::env::var("ASTER_DB_URL").expect(
@@ -183,4 +188,77 @@ fn malformed_document_id_is_backend_error_not_panic() {
         Err(StoreError::Backend(_)) => {}
         other => panic!("expected Backend(_), got {other:?}"),
     }
+}
+
+/// IDv6 → tablet UUID resolution: the cell hands the broker an IDv6
+/// string a Convex JS bundle would produce. The mapping cache reads
+/// `_tables`, finds the user table by `number=10001`, and the same
+/// SQL path returns the same row the wire-form test got.
+#[test]
+fn read_point_resolves_idv6_via_table_mapping_cache() {
+    reset_fixture(&url());
+    let store = make_store();
+
+    let mut internal = [0u8; 16];
+    for (i, byte) in internal.iter_mut().enumerate() {
+        *byte = 0xAA;
+        let _ = i;
+    }
+    let id = DocumentIdV6::new(TEST_TABLE_NUMBER, internal);
+    let key = DocumentId::new(id.encode());
+
+    let value = store.read_point(&key, 200).expect("read_point via IDv6");
+    assert_eq!(value.version, Some(100), "ian was inserted at ts=100");
+    let raw = value.document.as_ref().and_then(|d| d.get("_raw")).cloned();
+    match raw {
+        Some(Value::Text(s)) => assert!(
+            s.contains("\"name\":\"ian\""),
+            "raw bytes should round-trip, got {s:?}"
+        ),
+        other => panic!("expected _raw text, got {other:?}"),
+    }
+}
+
+/// `_tables` rows in `state="deleting"` must NOT be exposed by the
+/// cache — using a stale tablet UUID would silently return the wrong
+/// document if `number` was reused. This test asks for an IDv6
+/// pointing at the `deleting` row's number; resolution must fail
+/// rather than return the user document.
+#[test]
+fn read_point_skips_deleting_tables_in_mapping_cache() {
+    reset_fixture(&url());
+    let store = make_store();
+
+    // 9999 is the `deleting` row from seed.sql — must be invisible.
+    let id = DocumentIdV6::new(9999, [0xAA; 16]);
+    let key = DocumentId::new(id.encode());
+    match store.read_point(&key, 200) {
+        Err(StoreError::Backend(msg)) => assert!(
+            msg.contains("9999"),
+            "expected error to name the missing table_number, got {msg:?}"
+        ),
+        other => panic!("expected Backend(_) for deleting table, got {other:?}"),
+    }
+}
+
+/// Cache miss followed by hit: the second IDv6 read for the same
+/// table_number must NOT re-run the refresh. There is no clean way
+/// to count Postgres roundtrips from a black-box test, so we settle
+/// for "the second call returns the same data and stays fast".
+/// (Hot-path assertions live in the unit test
+/// `tests::dispatch_uses_cache_when_table_number_known`.)
+#[test]
+fn read_point_idv6_second_call_is_cache_hit() {
+    reset_fixture(&url());
+    let store = make_store();
+    let id = DocumentIdV6::new(TEST_TABLE_NUMBER, [0xAA; 16]);
+    let key = DocumentId::new(id.encode());
+
+    let first = store.read_point(&key, 200).expect("first");
+    let second = store.read_point(&key, 200).expect("second");
+    assert_eq!(first.version, second.version);
+    assert_eq!(
+        first.document.as_ref().and_then(|d| d.get("_raw")),
+        second.document.as_ref().and_then(|d| d.get("_raw"))
+    );
 }
