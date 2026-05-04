@@ -18,13 +18,10 @@ The story-so-far stack:
 What's still under construction (not in v0.5):
 
 - **Convex module loader** — today the v8cell runs an `async function main()`
-  defined in a single source string. The Postgres store can resolve module
-  metadata and local-FS bundle bytes, but the cell still needs ZIP loading,
+  defined in a single source string. Brokerd can resolve module metadata and
+  return local-FS bundle bytes over IPC, but the cell still needs ZIP loading,
   V8 ESM instantiation, Convex shims, and export dispatch so it can execute
   arbitrary `convex/*.ts` functions (#98).
-- **Module bundle IPC** — `PostgresCapsuleStore::load_module_bundle` exists,
-  but brokerd does not yet expose a "load bundle by module path" IPC verb to
-  cells, nor an `ASTER_MODULES_DIR` runtime env.
 - **HTTP frontend** — there is no `/api/query/<module>:<fn>` endpoint yet.
   Synapse already has a raw-JS cell-on-demand endpoint; real client traffic
   still needs a Convex-shaped request router and response codec.

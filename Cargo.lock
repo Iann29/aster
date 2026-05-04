@@ -76,6 +76,7 @@ dependencies = [
  "aster-capsule",
  "aster-store-postgres",
  "aster-v8cell",
+ "base64",
  "serde",
  "serde_json",
 ]

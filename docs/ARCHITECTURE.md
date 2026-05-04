@@ -88,10 +88,11 @@ JS frame continue.
 4. one request per connection.
 5. typed success or `WireBrokerError { code, message }`.
 
-Implemented requests are `InitialCapsule`, `HydratePoint`, and `Shutdown`.
-The next module-loader slice needs a separate module-bundle request. Keep
-capsule hydration and module loading conceptually separate; loading JS bytes is
-not a document read trap.
+Implemented requests are `InitialCapsule`, `HydratePoint`, `LoadModuleBundle`,
+and `Shutdown`. `LoadModuleBundle` deliberately requires a sealed capsule and
+seal context, so the broker reuses the existing capsule authority before
+serving JS bytes. Keep capsule hydration and module loading conceptually
+separate; loading JS bytes is not a document read trap.
 
 ## Synapse boundary
 
@@ -119,13 +120,14 @@ Current Synapse docs live in
 - ConvexValue wire-shape parsing/encoding is tested.
 - Module metadata and local module bundle bytes can be resolved inside the
   Postgres store.
+- Brokerd exposes module bundle bytes over IPC when `ASTER_STORE=postgres`
+  and `ASTER_MODULES_DIR` points at Convex's modules storage directory.
 - Synapse can create/delete a `kind=aster` deployment and invoke raw JS through
   a one-shot v8cell.
 
 ## What does not work yet
 
 - Running an `npx convex deploy` bundled module directly in the cell.
-- Loading a module bundle over broker IPC.
 - Unzipping bundle bytes and instantiating V8 ESM modules with Convex shims
   such as `convex/server`, `convex/values`, and `_generated/api`.
 - Routing `module:function(args)` to the correct export.

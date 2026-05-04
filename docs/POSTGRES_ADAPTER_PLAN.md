@@ -40,17 +40,17 @@ also landed:
 - ConvexValue JSON codec ([PR #13](https://github.com/Iann29/aster/pull/13)).
 - Module metadata index over `_modules` and `_source_packages` ([PR #15](https://github.com/Iann29/aster/pull/15)).
 - Local-FS module bundle adapter (`load_module_bundle`) ([PR #17](https://github.com/Iann29/aster/pull/17)).
+- Brokerd module-bundle IPC plus `ASTER_MODULES_DIR` wiring into
+  `PostgresConfig.modules_dir`.
 - Synapse raw-JS cell-on-demand spawn:
   `POST /v1/deployments/{name}/aster/invoke` (tracked in
   [`docs/ASTER_INTEGRATION.md`](https://github.com/Iann29/convex-synapse/blob/main/docs/ASTER_INTEGRATION.md)).
 
 The remaining "real Convex app through Aster" work is now narrower:
 
-1. Brokerd must expose module bundle bytes over IPC and read an
-   `ASTER_MODULES_DIR` env into `PostgresConfig.modules_dir`.
-2. The cell must load bundled modules: unzip, instantiate V8 ESM, provide
+1. The cell must load bundled modules: unzip, instantiate V8 ESM, provide
    Convex shims, and route `module.<funcName>.invokeQuery(args)`.
-3. Synapse must mount the Convex modules directory into brokerd and add the
+2. Synapse must mount the Convex modules directory into brokerd and add the
    Convex-shaped HTTP frontend (`/api/query/<module>:<fn>`).
 
 ## Decisions locked in

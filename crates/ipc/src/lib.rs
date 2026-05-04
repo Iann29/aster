@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use aster_broker::{BrokerError, CapsuleBrokerClient};
 use aster_capsule::{DeploymentId, DocumentId, SealContext, SealedCapsule, TenantId};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// Maximum accepted frame size for prototype IPC.
@@ -38,6 +39,11 @@ pub enum IpcRequest {
         capsule: SealedCapsule,
         key: DocumentId,
     },
+    LoadModuleBundle {
+        context: SealContext,
+        capsule: SealedCapsule,
+        path: String,
+    },
     Shutdown,
 }
 
@@ -45,8 +51,30 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     InitialCapsule(Result<SealedCapsule, WireBrokerError>),
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
+    LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
     ShutdownAck,
     Error(WireBrokerError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModuleBundle {
+    pub path: String,
+    pub bytes_base64: String,
+}
+
+impl ModuleBundle {
+    pub fn from_bytes(path: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            path: path.into(),
+            bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    pub fn decode_bytes(&self) -> IpcResult<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD
+            .decode(self.bytes_base64.as_bytes())
+            .map_err(|err| IpcError::Protocol(format!("module bundle base64 decode: {err}")))
+    }
 }
 
 /// Serializable broker error for the JSON wire.
@@ -187,6 +215,29 @@ impl UdsCapsuleBrokerClient {
         self.call(request)
     }
 
+    pub fn load_module_bundle(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        path: impl Into<String>,
+    ) -> IpcResult<Option<Vec<u8>>> {
+        match self.call(IpcRequest::LoadModuleBundle {
+            context: context.clone(),
+            capsule,
+            path: path.into(),
+        })? {
+            IpcResponse::LoadModuleBundle(Ok(Some(bundle))) => Ok(Some(bundle.decode_bytes()?)),
+            IpcResponse::LoadModuleBundle(Ok(None)) => Ok(None),
+            IpcResponse::LoadModuleBundle(Err(error)) | IpcResponse::Error(error) => {
+                Err(IpcError::Protocol(format!(
+                    "broker rejected module load: {}: {}",
+                    error.code, error.message
+                )))
+            }
+            _ => Err(IpcError::UnexpectedResponse("LoadModuleBundle")),
+        }
+    }
+
     fn call(&self, request: IpcRequest) -> IpcResult<IpcResponse> {
         let mut stream = UnixStream::connect(&self.socket_path)?;
         write_frame(&mut stream, &request)?;
@@ -255,5 +306,13 @@ mod tests {
         write_frame(&mut left, &request).expect("write");
         let decoded: IpcRequest = read_frame(&mut right).expect("read");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn module_bundle_base64_round_trips() {
+        let raw = b"zip bytes \x00\xff";
+        let bundle = ModuleBundle::from_bytes("messages.js", raw);
+        assert_eq!(bundle.path, "messages.js");
+        assert_eq!(bundle.decode_bytes().expect("decode"), raw);
     }
 }
