@@ -22,7 +22,7 @@ use std::path::Path;
 
 use aster_broker::{CapsuleStore, StoreError};
 use aster_capsule::{DocumentId, Value};
-use aster_convex_codec::DocumentIdV6;
+use aster_convex_codec::{ConvexValue, DocumentIdV6};
 use aster_store_postgres::{PostgresCapsuleStore, PostgresConfig};
 use tokio::runtime::Builder;
 use tokio_postgres::NoTls;
@@ -35,6 +35,27 @@ const ID_CAUE_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// Must match the `_tables` row body. Hardcoded here so the IDv6 test
 /// can encode the same number the resolver expects to find.
 const TEST_TABLE_NUMBER: u32 = 10001;
+
+/// `_source_packages` tablet UUID + table_number from seed.sql.
+/// The fixture rows we insert below live in this tablet.
+const SOURCE_PACKAGES_TABLET_HEX: &str = "bbbb2222bbbb2222bbbb2222bbbb2222";
+const SOURCE_PACKAGES_TABLE_NUMBER: u32 = 8001;
+/// `_modules` tablet UUID from seed.sql.
+const MODULES_TABLET_HEX: &str = "aaaa1111aaaa1111aaaa1111aaaa1111";
+
+/// Internal id of the test source-package row. Becomes the bytes part
+/// of the IDv6 string `_modules.sourcePackageId` references.
+const SOURCE_PACKAGE_INTERNAL_ID: [u8; 16] = [
+    0xee, 0xee, 0x55, 0x55, 0xee, 0xee, 0x55, 0x55, 0xee, 0xee, 0x55, 0x55, 0xee, 0xee, 0x55, 0x55,
+];
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
 
 fn url() -> String {
     std::env::var("ASTER_DB_URL").expect(
@@ -261,4 +282,147 @@ fn read_point_idv6_second_call_is_cache_hit() {
         first.document.as_ref().and_then(|d| d.get("_raw")),
         second.document.as_ref().and_then(|d| d.get("_raw"))
     );
+}
+
+/// Insert the body rows for `_modules` + `_source_packages`. Done in
+/// Rust (not seed.sql) because the IDv6 string the module row carries
+/// is computed by the codec, not handwritten.
+async fn seed_module_fixtures(client: &tokio_postgres::Client) {
+    let sp_value = ConvexValue::object([
+        (
+            "storageKey",
+            ConvexValue::String("modules/test-bundle".into()),
+        ),
+        (
+            "sha256",
+            ConvexValue::Bytes(b"test-sha256-32-bytes-padding-zzz".to_vec()),
+        ),
+        ("externalPackageId", ConvexValue::Null),
+        (
+            "packageSize",
+            ConvexValue::object([
+                ("zippedSizeBytes", ConvexValue::Int64(1024)),
+                ("unzippedSizeBytes", ConvexValue::Int64(4096)),
+            ]),
+        ),
+        ("nodeVersion", ConvexValue::Null),
+    ]);
+    let sp_body = sp_value.to_json().to_string();
+    let sp_id_hex = hex_lower(&SOURCE_PACKAGE_INTERNAL_ID);
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {TEST_SCHEMA}.documents (id, ts, table_id, json_value, deleted, prev_ts) \
+                 VALUES (decode($1, 'hex'), 70, decode($2, 'hex'), convert_to($3, 'UTF8'), false, NULL)"
+            ),
+            &[&sp_id_hex, &SOURCE_PACKAGES_TABLET_HEX, &sp_body],
+        )
+        .await
+        .expect("insert source package");
+
+    // Module row's `sourcePackageId` is the IDv6 form of the source
+    // package's internal_id wrapped with `_source_packages`'s table
+    // number — exactly what Convex's runtime would emit.
+    let id = DocumentIdV6::new(SOURCE_PACKAGES_TABLE_NUMBER, SOURCE_PACKAGE_INTERNAL_ID);
+    let module_body = serde_json::json!({
+        "path": "messages.js",
+        "sourcePackageId": id.encode(),
+        "environment": "isolate",
+        "analyzeResult": null,
+        "sha256": "module-sha256-base64",
+    })
+    .to_string();
+    let module_id_hex = "ffff7777ffff7777ffff7777ffff7777".to_string();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {TEST_SCHEMA}.documents (id, ts, table_id, json_value, deleted, prev_ts) \
+                 VALUES (decode($1, 'hex'), 70, decode($2, 'hex'), convert_to($3, 'UTF8'), false, NULL)"
+            ),
+            &[&module_id_hex, &MODULES_TABLET_HEX, &module_body],
+        )
+        .await
+        .expect("insert module");
+}
+
+/// Same shape as `reset_fixture` but additionally seeds the module-
+/// index rows. Tests that exercise `find_module` call this; the
+/// older tests stay on the lighter `reset_fixture`.
+fn reset_fixture_with_modules(url: &str) {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("ad-hoc runtime for module fixture reset");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(url, NoTls)
+            .await
+            .expect("connect for module fixture reset");
+        let handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(&format!("DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE"))
+            .await
+            .expect("drop schema");
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let schema_sql = std::fs::read_to_string(here.join("tests/fixtures/schema.sql"))
+            .expect("read schema.sql");
+        let seed_sql =
+            std::fs::read_to_string(here.join("tests/fixtures/seed.sql")).expect("read seed.sql");
+        client
+            .batch_execute(&schema_sql)
+            .await
+            .expect("apply schema");
+        client.batch_execute(&seed_sql).await.expect("apply seed");
+        seed_module_fixtures(&client).await;
+        drop(client);
+        handle.abort();
+    });
+}
+
+/// End-to-end: with `_modules` + `_source_packages` seeded, the
+/// `find_module` API resolves a path to a fully-populated descriptor.
+/// Locks the IDv6-driven IDjoin (#98 fatia 1) against a real Postgres.
+#[test]
+fn find_module_resolves_path_to_descriptor() {
+    reset_fixture_with_modules(&url());
+    let store = make_store();
+
+    let descriptor = store
+        .find_module("messages.js")
+        .expect("Postgres reachable")
+        .expect("module is in the seed");
+    assert_eq!(descriptor.path, "messages.js");
+    assert_eq!(descriptor.storage_key, "modules/test-bundle");
+    assert_eq!(descriptor.environment, "isolate");
+    assert_eq!(descriptor.module_sha256_base64, "module-sha256-base64");
+    assert_eq!(
+        descriptor.source_package_internal_id,
+        SOURCE_PACKAGE_INTERNAL_ID
+    );
+    assert_eq!(
+        descriptor.source_package_sha256,
+        b"test-sha256-32-bytes-padding-zzz".to_vec()
+    );
+    assert_eq!(descriptor.source_package_unzipped_size, Some(4096));
+}
+
+#[test]
+fn find_module_returns_none_for_unknown_path() {
+    reset_fixture_with_modules(&url());
+    let store = make_store();
+    let result = store.find_module("does-not-exist.js").expect("query ran");
+    assert!(result.is_none());
+}
+
+/// `list_modules` returns every active module — used by future
+/// "list deployed functions" telemetry. The seed installs exactly
+/// one (`messages.js`).
+#[test]
+fn list_modules_returns_all_active() {
+    reset_fixture_with_modules(&url());
+    let store = make_store();
+    let mods = store.list_modules().expect("query ran");
+    assert_eq!(mods.len(), 1);
+    assert_eq!(mods[0].path, "messages.js");
 }

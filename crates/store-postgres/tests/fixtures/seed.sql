@@ -90,3 +90,34 @@ VALUES (
     false,
     NULL
 );
+
+-- ---------------------------------------------------------------------
+-- Module-index fixture (#98 fatia 1): two more `_tables` rows so the
+-- `lookup_by_name` path can resolve the system tablets `_modules` and
+-- `_source_packages`. The actual `_modules` / `_source_packages` body
+-- rows live alongside the user docs above and get inserted by the
+-- integration test itself (the IDv6 string for `sourcePackageId`
+-- needs to be computed in Rust, not handwritten in SQL).
+INSERT INTO convex_dev.documents (id, ts, table_id, json_value, deleted, prev_ts)
+VALUES (
+    decode('aaaa1111aaaa1111aaaa1111aaaa1111', 'hex'),  -- `_modules` tablet UUID
+    60,
+    decode('cccccccccccccccccccccccccccccccc', 'hex'),  -- `_tables` tablet UUID
+    convert_to(
+        '{"name":"_modules","number":8002,"state":"active"}',
+        'UTF8'
+    ),
+    false,
+    NULL
+),
+(
+    decode('bbbb2222bbbb2222bbbb2222bbbb2222', 'hex'),  -- `_source_packages` tablet UUID
+    60,
+    decode('cccccccccccccccccccccccccccccccc', 'hex'),  -- `_tables` tablet UUID
+    convert_to(
+        '{"name":"_source_packages","number":8001,"state":"active"}',
+        'UTF8'
+    ),
+    false,
+    NULL
+);

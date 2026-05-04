@@ -54,7 +54,10 @@
 //! and a checked-in offline-query-data file. We hand-write the SQL
 //! against the Convex reference doc instead.
 
+mod module_index;
 mod table_mapping;
+
+pub use module_index::ModuleDescriptor;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +73,7 @@ use deadpool_postgres::{
 use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Config as PgConfig, NoTls};
 
+use crate::module_index::ModuleIndex;
 use crate::table_mapping::TableMappingCache;
 
 /// Connection / pool tunables for `PostgresCapsuleStore::connect`.
@@ -126,6 +130,12 @@ pub struct PostgresCapsuleStore {
     /// IDv6-shaped lookup, refreshed on miss. Wrapped in Arc so it can
     /// be cloned cheaply into the per-call async closures.
     table_mapping: Arc<TableMappingCache>,
+    /// Lazy `module_path → ModuleDescriptor` resolver. Refreshed on
+    /// `find_module` miss. Together with the table-mapping cache this
+    /// is the full `_modules` ↔ `_source_packages` indirection — the
+    /// storage adapter (next slice) takes a `ModuleDescriptor` and
+    /// returns bundle bytes.
+    module_index: Arc<ModuleIndex>,
 }
 
 impl PostgresCapsuleStore {
@@ -170,6 +180,7 @@ impl PostgresCapsuleStore {
             pool,
             schema: config.schema,
             table_mapping: Arc::new(TableMappingCache::new()),
+            module_index: Arc::new(ModuleIndex::new()),
         })
     }
 
@@ -458,6 +469,48 @@ impl PostgresCapsuleStore {
         self.table_mapping.refresh(&client, &self.schema).await?;
         Ok(self.table_mapping.lookup(table_number))
     }
+
+    /// Resolve a Convex module path (e.g. `"messages.js"`,
+    /// `"_generated/api.js"`) to the descriptor the storage adapter
+    /// will use to fetch bundle bytes. Cache miss triggers one
+    /// refresh + retry (which also reloads the table-mapping cache,
+    /// since the module index is keyed off `_modules` /
+    /// `_source_packages` tablet UUIDs).
+    ///
+    /// Returns `None` if the path genuinely doesn't exist after
+    /// refresh — distinct from a `Backend(_)` error which means a
+    /// row was malformed or Postgres was unreachable.
+    pub fn find_module(&self, path: &str) -> Result<Option<ModuleDescriptor>, StoreError> {
+        if let Some(d) = self.module_index.find(path) {
+            return Ok(Some(d));
+        }
+        self.block_on(async {
+            let client = self.checkout().await?;
+            self.table_mapping.refresh(&client, &self.schema).await?;
+            self.module_index
+                .refresh(&client, &self.schema, &self.table_mapping)
+                .await?;
+            Ok(self.module_index.find(path))
+        })
+    }
+
+    /// All known modules, sorted by path. Triggers a refresh if the
+    /// index has never been populated. Useful for "list deployed
+    /// functions" telemetry; the hot path goes through `find_module`.
+    pub fn list_modules(&self) -> Result<Vec<ModuleDescriptor>, StoreError> {
+        let cached = self.module_index.list();
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+        self.block_on(async {
+            let client = self.checkout().await?;
+            self.table_mapping.refresh(&client, &self.schema).await?;
+            self.module_index
+                .refresh(&client, &self.schema, &self.table_mapping)
+                .await?;
+            Ok(self.module_index.list())
+        })
+    }
 }
 
 /// Parse the Aster wire form `"<table_hex>/<id_hex>"` into raw bytes.
@@ -673,5 +726,53 @@ mod tests {
             .expect("cache hit");
         assert_eq!(table_id, tablet.to_vec());
         assert_eq!(doc_id, internal.to_vec());
+    }
+
+    /// Module index hot path: pre-installed descriptor returns
+    /// without opening a Postgres connection. `find_module` short-
+    /// circuits the refresh when the index already has the entry —
+    /// matches the `dispatch_uses_cache_when_table_number_known`
+    /// pattern, but on the module-loader cache.
+    #[test]
+    fn find_module_uses_cache_when_path_known() {
+        use std::collections::BTreeMap;
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+
+        // Pre-warm both caches so neither needs Postgres.
+        let mut by_number = BTreeMap::new();
+        by_number.insert(10001, [0xAA; 16]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("_modules".to_string(), [0xBB; 16]);
+        by_name.insert("_source_packages".to_string(), [0xCC; 16]);
+        store
+            .table_mapping
+            .install_named_for_test(by_number, by_name);
+
+        let descriptor = ModuleDescriptor {
+            path: "messages.js".into(),
+            source_package_internal_id: [0xDD; 16],
+            storage_key: "modules/abc".into(),
+            environment: "isolate".into(),
+            module_sha256_base64: "deadbeef".into(),
+            source_package_sha256: vec![1, 2, 3, 4],
+            source_package_unzipped_size: Some(1024),
+        };
+        store
+            .module_index
+            .install_for_test(vec![descriptor.clone()]);
+
+        let found = store
+            .find_module("messages.js")
+            .expect("Postgres-free lookup")
+            .expect("module present");
+        assert_eq!(found, descriptor);
+
+        // list_modules also short-circuits when the cache is non-empty.
+        let listed = store.list_modules().expect("list");
+        assert_eq!(listed, vec![descriptor]);
     }
 }

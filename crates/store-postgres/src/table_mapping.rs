@@ -61,6 +61,10 @@ struct TableMappingState {
     /// Active user + system tables only. Hidden / Deleting entries are
     /// dropped so a reused number can't shadow a deleted tablet.
     by_number: BTreeMap<u32, TabletUuid>,
+    /// Same data, indexed by table name. Lets the module-loader path
+    /// resolve `_modules` / `_source_packages` (system tablets whose
+    /// numbers vary by instance bootstrap order) without scanning.
+    by_name: BTreeMap<String, TabletUuid>,
 }
 
 impl TableMappingCache {
@@ -78,6 +82,15 @@ impl TableMappingCache {
         guard.by_number.get(&table_number).copied()
     }
 
+    /// Look up the tablet UUID for a table by name (e.g. `_modules`,
+    /// `_source_packages`). Used by the module loader path; system
+    /// tablets are reserved to numbers under 10_000 but the *exact*
+    /// number is instance-specific, so the loader resolves by name.
+    pub(crate) fn lookup_by_name(&self, name: &str) -> Option<TabletUuid> {
+        let guard = self.inner.read().expect("table mapping rwlock poisoned");
+        guard.by_name.get(name).copied()
+    }
+
     /// Refresh the cache from Postgres. Acquires the write lock for
     /// the duration of the SQL — short by design (two queries, one
     /// indexed lookup, one full-tablet scan).
@@ -88,10 +101,11 @@ impl TableMappingCache {
     /// non-`active` states are skipped via the JSON body.
     pub(crate) async fn refresh(&self, client: &PgClient, schema: &str) -> Result<(), StoreError> {
         let tablet_id = load_tables_tablet_id(client, schema).await?;
-        let by_number = load_active_tables(client, schema, &tablet_id).await?;
+        let (by_number, by_name) = load_active_tables(client, schema, &tablet_id).await?;
         let mut guard = self.inner.write().expect("table mapping rwlock poisoned");
         guard.tables_tablet_id = Some(tablet_id);
         guard.by_number = by_number;
+        guard.by_name = by_name;
         Ok(())
     }
 
@@ -104,6 +118,20 @@ impl TableMappingCache {
         guard.by_number = mapping;
         // Doesn't matter for lookup; set a stub so anyone reading
         // notices the cache "feels" loaded.
+        guard.tables_tablet_id = Some([0u8; 16]);
+    }
+
+    /// Test helper that installs both indexes so module-loader tests
+    /// can exercise `lookup_by_name` paths without a real Postgres.
+    #[cfg(test)]
+    pub(crate) fn install_named_for_test(
+        &self,
+        by_number: BTreeMap<u32, TabletUuid>,
+        by_name: BTreeMap<String, TabletUuid>,
+    ) {
+        let mut guard = self.inner.write().expect("rwlock poisoned");
+        guard.by_number = by_number;
+        guard.by_name = by_name;
         guard.tables_tablet_id = Some([0u8; 16]);
     }
 }
@@ -164,7 +192,7 @@ async fn load_active_tables(
     client: &PgClient,
     schema: &str,
     tables_tablet_id: &TabletUuid,
-) -> Result<BTreeMap<u32, TabletUuid>, StoreError> {
+) -> Result<(BTreeMap<u32, TabletUuid>, BTreeMap<String, TabletUuid>), StoreError> {
     // Latest revision per row in the `_tables` tablet. Snapshot semantics
     // don't matter here — we want the freshest mapping the database
     // knows about. `DISTINCT ON (id) ORDER BY id, ts DESC` collapses
@@ -183,7 +211,8 @@ async fn load_active_tables(
         .await
         .map_err(|err| StoreError::Backend(format!("table mapping fetch: {err}")))?;
 
-    let mut out = BTreeMap::new();
+    let mut by_number = BTreeMap::new();
+    let mut by_name = BTreeMap::new();
     for row in rows {
         let id_bytes: Vec<u8> = row.get(0);
         let json_bytes: Vec<u8> = row.get(1);
@@ -198,25 +227,37 @@ async fn load_active_tables(
             ))
         })?;
         let parsed = parse_table_metadata(&json_bytes)?;
-        let TableRow { number, state } = parsed;
+        let TableRow {
+            number,
+            name,
+            state,
+        } = parsed;
         if state != "active" {
             continue;
         }
-        out.insert(number, tablet_uuid);
+        by_number.insert(number, tablet_uuid);
+        // System tablets like `_modules` / `_source_packages` are
+        // resolved by name, not number — the exact number is bootstrap-
+        // order specific. Aster v0.5 targets the global namespace only,
+        // so a single name → tablet entry suffices; if/when component
+        // namespaces matter the cache grows a `(namespace, name)` key.
+        by_name.insert(name, tablet_uuid);
     }
-    Ok(out)
+    Ok((by_number, by_name))
 }
 
 #[derive(Debug)]
 struct TableRow {
     number: u32,
+    name: String,
     state: String,
 }
 
 /// Parse the `_tables` body JSON. The shape is
 /// `{ "name": "...", "number": <i64>, "state": "active"|"hidden"|"deleting", "namespace": <obj?> }`
 /// per `crates/common/src/bootstrap_model/tables.rs::SerializedTableMetadata`.
-/// We only care about `number` + `state` here.
+/// We extract `number`, `name`, and `state`; `namespace` is ignored
+/// for v0.5 (global-namespace only).
 fn parse_table_metadata(bytes: &[u8]) -> Result<TableRow, StoreError> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| {
         StoreError::Backend(format!("table mapping row: json parse failed: {err}"))
@@ -232,6 +273,13 @@ fn parse_table_metadata(bytes: &[u8]) -> Result<TableRow, StoreError> {
             "table mapping row: 'number' {number_raw} out of u32 range"
         )));
     }
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            StoreError::Backend("table mapping row: missing or non-string 'name'".into())
+        })?
+        .to_string();
     let state = value
         .get("state")
         .and_then(|v| v.as_str())
@@ -241,6 +289,7 @@ fn parse_table_metadata(bytes: &[u8]) -> Result<TableRow, StoreError> {
         .to_string();
     Ok(TableRow {
         number: number_raw as u32,
+        name,
         state,
     })
 }
