@@ -1,4 +1,4 @@
-# Aster v0.3 — multi-stage Docker build for the two production binaries.
+# Aster multi-stage Docker build for the two production binaries.
 #
 # `aster_brokerd` is the read-authority side: holds the seal key and the
 # (eventually real) database handle. Long-lived service, listens on a
@@ -100,8 +100,10 @@ RUN chmod 0755 /usr/local/bin/aster_v8cell
 
 USER aster:aster
 
-# Conventional defaults — operators override via env.
+# Conventional defaults. Do not set ASTER_JS here: Synapse invokes cells
+# through ASTER_JS_INLINE, and an image-level ASTER_JS default makes the
+# binary reject the mutually-exclusive sources. File-based smokes pass
+# ASTER_JS explicitly.
 ENV ASTER_BROKER_SOCK=/run/aster/broker.sock
-ENV ASTER_JS=/tenant/main.js
 
 ENTRYPOINT ["/usr/local/bin/aster_v8cell"]

@@ -1,4 +1,4 @@
-# Smoke harness for the Aster v0.3 IPC: brokerd as a long-lived service,
+# Smoke harness for the Aster IPC: brokerd as a long-lived service,
 # v8cell as a one-shot job that opens the shared socket, runs main.js,
 # and exits with a JSON line on stdout.
 #
@@ -11,7 +11,7 @@
 
 services:
   brokerd:
-    image: aster-brokerd:0.3
+    image: aster-brokerd:0.4
     container_name: aster-smoke-brokerd
     environment:
       ASTER_BROKER_SOCK: /run/aster/broker.sock
@@ -29,7 +29,7 @@ services:
     restart: "no"
 
   v8cell:
-    image: aster-v8cell:0.3
+    image: aster-v8cell:0.4
     container_name: aster-smoke-v8cell
     environment:
       ASTER_BROKER_SOCK: /run/aster/broker.sock

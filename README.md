@@ -62,12 +62,16 @@ Dockerfile:
 
 ```bash
 # Build
-docker build --target=runtime-broker -t aster-brokerd:0.3 -f docker/Dockerfile .
-docker build --target=runtime-v8cell -t aster-v8cell:0.3 -f docker/Dockerfile .
+docker build --target=runtime-broker -t aster-brokerd:0.4 -f docker/Dockerfile .
+docker build --target=runtime-v8cell -t aster-v8cell:0.4 -f docker/Dockerfile .
 
 # End-to-end smoke (assertions inside the script)
-./docker/smoke.sh 0.3
+./docker/smoke.sh 0.4
 ```
+
+The repo does not publish these images to a registry yet. For VPS smoke,
+build locally and ship them with `docker save | scp | docker load` unless
+a release workflow has been added since this note.
 
 The `docker/smoke.sh` script runs `aster-brokerd` as a long-lived service
 behind a per-deployment Docker volume, then runs `aster-v8cell` as a
@@ -102,11 +106,11 @@ holds.
 
 ## What this lets you demo today
 
-- Spawn `aster-brokerd:0.3` against a real Convex Postgres deployment
+- Spawn `aster-brokerd:0.4` against a real Convex Postgres deployment
   (point it at the same DB the upstream backend writes to). The broker
   reads `documents` rows directly — `snapshot_ts`, `read_point`, and
   `read_prefix` are wired and tested.
-- Spawn `aster-v8cell:0.3` against the broker's socket. The cell can run
+- Spawn `aster-v8cell:0.4` against the broker's socket. The cell can run
   hand-written JS that calls `await Convex.asyncSyscall("1.0/get",
   JSON.stringify({id: "<idv6_or_table_hex>/<id_hex>"}))` and gets the
   document bytes back as a JSON string.

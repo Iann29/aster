@@ -81,7 +81,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: runtime-broker
-          tags: aster-brokerd:0.3
+          tags: aster-brokerd:0.4
           load: true
           cache-from: type=gha,scope=brokerd
           cache-to: type=gha,scope=brokerd,mode=max
@@ -92,13 +92,13 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: runtime-v8cell
-          tags: aster-v8cell:0.3
+          tags: aster-v8cell:0.4
           load: true
           cache-from: type=gha,scope=v8cell
           cache-to: type=gha,scope=v8cell,mode=max
 
       - name: docker/smoke.sh — brokerd + v8cell over UDS
-        run: ./docker/smoke.sh 0.3
+        run: ./docker/smoke.sh 0.4
 
   postgres-it:
     name: aster-store-postgres integration tests
