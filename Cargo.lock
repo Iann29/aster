@@ -53,6 +53,10 @@ dependencies = [
 [[package]]
 name = "aster-convex-codec"
 version = "0.5.0"
+dependencies = [
+ "base64",
+ "serde_json",
+]
 
 [[package]]
 name = "aster-host"

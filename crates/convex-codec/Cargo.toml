@@ -7,5 +7,17 @@ rust-version.workspace = true
 description = "Convex IDv6 + Crockford base32 codec, ported verbatim from get-convex/convex-backend so Aster can decode IDs that Convex apps emit."
 
 [dependencies]
-# Pure Rust port — no convex-backend types, no thiserror. The whole
-# crate is std-only so it stays cell-safe (no transitive surprises).
+# Pure Rust port — no convex-backend types, no thiserror. Beyond
+# `serde_json` and `base64` (both pure-Rust, no syscalls / IO) the
+# crate stays std-only, so cells can link it without dragging in
+# transitive surprises.
+
+# Wire shape for ConvexValue is JSON with discriminator wrappers
+# (`{"$integer": "<base64>"}`, `{"$float": ...}`, `{"$bytes": ...}`),
+# so the codec serialises through serde_json::Value. Keeping the dep
+# here means callers never need to think about it.
+serde_json = "1"
+# Standard base64 (with padding) for the `$integer` / `$float` /
+# `$bytes` payloads. Different from the Crockford lowercase used by
+# IDv6 — that lives in `base32.rs` and stays std-only.
+base64 = "0.22"
