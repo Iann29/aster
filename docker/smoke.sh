@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Black-box smoke for the Aster v0.3 Docker images.
+# Black-box smoke for the Aster Docker images.
 #
 # Boots `aster-brokerd` + `aster-v8cell` from the published image tags,
 # wires them through a shared volume containing a Unix-domain socket,
@@ -14,12 +14,12 @@
 # Usage:
 #   docker/smoke.sh [tag]
 #
-#   tag defaults to "0.3" — must match what `docker build --target=...`
+#   tag defaults to "0.4" — must match what `docker build --target=...`
 #   tagged the broker/v8cell images as.
 
 set -euo pipefail
 
-TAG="${1:-0.3}"
+TAG="${1:-0.4}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BROKERD_IMAGE="${ASTER_BROKERD_IMAGE:-aster-brokerd:${TAG}}"
 V8CELL_IMAGE="${ASTER_V8CELL_IMAGE:-aster-v8cell:${TAG}}"

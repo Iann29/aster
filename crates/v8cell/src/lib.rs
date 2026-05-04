@@ -1,4 +1,4 @@
-//! V8-backed read-trap continuation proof of concept for Aster v0.2.
+//! V8-backed read-trap continuation runtime for Aster.
 //!
 //! This crate answers the load-bearing v0.1 question: can a tenant JavaScript
 //! function suspend on a missing capsule read, let the host hydrate data, and
@@ -6,12 +6,12 @@
 //!
 //! The answer demonstrated here is "yes, if the continuation boundary is an
 //! `await` over a host-created Promise". We do not attempt to capture arbitrary
-//! synchronous JS stacks. The host API `Aster.read(key, field)` returns a value
-//! immediately for warm capsule entries and returns a pending Promise for a
-//! missing read. V8 preserves the async continuation. The Rust host receives a
-//! typed [`V8ReadTrap`], hydrates the capsule through its broker, resolves the
-//! promise, runs a microtask checkpoint, and the same JS async function returns
-//! the final value.
+//! synchronous JS stacks. The legacy host API `Aster.read(key, field)` and the
+//! Convex-shaped `Convex.asyncSyscall("1.0/get", argsJson)` shim both return
+//! values immediately for warm capsule entries and pending Promises for missing
+//! reads. V8 preserves the async continuation. The Rust host receives a typed
+//! trap, hydrates the capsule through its broker, resolves the promise, runs a
+//! microtask checkpoint, and the same JS async function returns the final value.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -138,9 +138,11 @@ impl From<BrokerError> for V8CellError {
 
 /// A tenant/deployment pinned V8 cell.
 ///
-/// The prototype keeps the broker in-process, but the isolate itself is real.
-/// The cell global object intentionally exposes only `Aster.read`; no `fetch`,
-/// no timers, no filesystem, and no database handle are installed.
+/// The isolate is real and the broker may be in-process (unit tests) or a
+/// UDS-backed process (`aster_v8cell`). The cell global object intentionally
+/// exposes only the narrow read surfaces (`Aster.read` legacy plus
+/// `Convex.asyncSyscall("1.0/get")`); no `fetch`, no timers, no filesystem,
+/// and no database handle are installed.
 pub struct V8SandboxCell {
     tenant: TenantId,
     deployment: DeploymentId,
@@ -589,8 +591,8 @@ fn convex_async_syscall_callback(
 
 /// Extract `id` from a `Convex.asyncSyscall("1.0/get", argsJson)` payload.
 /// Convex's JS shim sends this as `JSON.stringify({ id, isSystem, ...})`;
-/// we only care about `id`. The `id` is the encoded `<table_hex>/<id_hex>`
-/// Aster DocumentId — the IDv6 ↔ Aster mapping is the next slice's job.
+/// we only care about `id`. The broker accepts either Aster's
+/// `<table_hex>/<id_hex>` wire form or a Convex IDv6 string.
 fn parse_get_id(args_json: &str) -> Result<String, V8CellError> {
     let v: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|err| V8CellError::Run(format!("convex 1.0/get bad JSON args: {err}")))?;

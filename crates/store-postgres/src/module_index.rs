@@ -24,15 +24,14 @@
 //!   -> storage_key
 //! ```
 //!
-//! That `storage_key` is what the storage adapter (next slice)
-//! resolves to a `<dir>/modules/<key>.blob` path or an S3 GET.
+//! That `storage_key` is what the local-FS storage adapter resolves to a
+//! `<dir>/modules/<key>.blob` path. S3 remains a future adapter.
 //!
 //! ## Scope
 //!
-//! This module owns ONLY the indirection — no bundle bytes are read
-//! here. The storage adapter is intentionally absent so this slice
-//! lands testable + reviewable on its own. The output type
-//! (`ModuleDescriptor`) carries everything the next slice will need.
+//! This module owns ONLY the indirection — no bundle bytes are read here.
+//! `modules_storage.rs` consumes the output type (`ModuleDescriptor`) and
+//! fetches the actual ZIP bytes.
 //!
 //! ## Cache strategy
 //!
@@ -53,8 +52,8 @@ use crate::table_mapping::{TableMappingCache, TabletUuid};
 
 /// Joined view of `_modules` + `_source_packages` for a single module
 /// path. The storage adapter takes one of these and returns bundle
-/// bytes; until that lands, callers can read the path / storage_key /
-/// sha256 directly to validate the wiring.
+/// bytes; callers can also read the path / storage_key / sha256 directly
+/// to validate the wiring.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleDescriptor {
     /// Module path as the JS bundler emitted it — typically

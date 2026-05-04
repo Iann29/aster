@@ -23,13 +23,14 @@
 //! - `read_point()` — direct `documents` query with `DISTINCT ON (id)`,
 //!   `ORDER BY ts DESC LIMIT 1`. Skips the by_id index for now (gotcha
 //!   #5 in the reference doc) — adequate for the v0.5 read-only read
-//!   path and the integration tests, will move through the index when
-//!   the broker grows the table-mapping cache.
+//!   path and the integration tests. The IDv6 table-mapping cache exists;
+//!   moving point reads through the by_id index is a later performance and
+//!   retention-correctness slice.
 //! - `read_prefix()` — bounded `DISTINCT ON (id)` table scan.
 //! - Document body is currently passed through as raw JSON bytes under
-//!   a `_raw` field. Decoding the actual `ConvexValue` blob lands when
-//!   the cell's JS runtime grows the `Convex.asyncSyscall("1.0/get")`
-//!   path that consumes it.
+//!   a `_raw` field. The ConvexValue codec exists for metadata and future
+//!   typed value handling; the current v8cell `1.0/get` shim intentionally
+//!   returns the raw JSON string.
 //!
 //! ## DocumentId formats
 //!
@@ -145,9 +146,8 @@ pub struct PostgresCapsuleStore {
     table_mapping: Arc<TableMappingCache>,
     /// Lazy `module_path → ModuleDescriptor` resolver. Refreshed on
     /// `find_module` miss. Together with the table-mapping cache this
-    /// is the full `_modules` ↔ `_source_packages` indirection — the
-    /// storage adapter (next slice) takes a `ModuleDescriptor` and
-    /// returns bundle bytes.
+    /// is the full `_modules` ↔ `_source_packages` indirection; the
+    /// optional modules_storage field turns descriptors into bundle bytes.
     module_index: Arc<ModuleIndex>,
     /// Optional bundle-bytes adapter. `None` when `modules_dir`
     /// wasn't configured; `load_module_bundle` returns a typed

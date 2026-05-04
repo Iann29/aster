@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-TAG="${1:-0.3}"
+TAG="${1:-0.4}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BROKERD_IMAGE="${ASTER_BROKERD_IMAGE:-aster-brokerd:${TAG}}"
 V8CELL_IMAGE="${ASTER_V8CELL_IMAGE:-aster-v8cell:${TAG}}"

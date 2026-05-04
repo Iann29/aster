@@ -18,15 +18,16 @@ The story-so-far stack:
 What's still under construction (not in v0.5):
 
 - **Convex module loader** — today the v8cell runs an `async function main()`
-  defined in a single source string. Reading `_modules` + `_source_packages`
-  + the modules-storage layer (S3 / local FS) so the cell can execute
-  arbitrary `convex/*.ts` exports is the next-largest piece (#98).
+  defined in a single source string. The Postgres store can resolve module
+  metadata and local-FS bundle bytes, but the cell still needs ZIP loading,
+  V8 ESM instantiation, Convex shims, and export dispatch so it can execute
+  arbitrary `convex/*.ts` functions (#98).
+- **Module bundle IPC** — `PostgresCapsuleStore::load_module_bundle` exists,
+  but brokerd does not yet expose a "load bundle by module path" IPC verb to
+  cells, nor an `ASTER_MODULES_DIR` runtime env.
 - **HTTP frontend** — there is no `/api/query/<module>:<fn>` endpoint yet.
-  Driving cells from real client traffic needs a Synapse-side cell-on-demand
-  spawn (#100) and a request router (#101).
-- **Cell-on-demand spawn** from the operator side (lives in
-  [`Iann29/convex-synapse`](https://github.com/Iann29/convex-synapse) — see
-  [`docs/ASTER_INTEGRATION.md`](https://github.com/Iann29/convex-synapse/blob/main/docs/ASTER_INTEGRATION.md)).
+  Synapse already has a raw-JS cell-on-demand endpoint; real client traffic
+  still needs a Convex-shaped request router and response codec.
 
 ## Run
 
@@ -62,12 +63,16 @@ Dockerfile:
 
 ```bash
 # Build
-docker build --target=runtime-broker -t aster-brokerd:0.3 -f docker/Dockerfile .
-docker build --target=runtime-v8cell -t aster-v8cell:0.3 -f docker/Dockerfile .
+docker build --target=runtime-broker -t aster-brokerd:0.4 -f docker/Dockerfile .
+docker build --target=runtime-v8cell -t aster-v8cell:0.4 -f docker/Dockerfile .
 
 # End-to-end smoke (assertions inside the script)
-./docker/smoke.sh 0.3
+./docker/smoke.sh 0.4
 ```
+
+The repo does not publish these images to a registry yet. For VPS smoke,
+build locally and ship them with `docker save | scp | docker load` unless
+a release workflow has been added since this note.
 
 The `docker/smoke.sh` script runs `aster-brokerd` as a long-lived service
 behind a per-deployment Docker volume, then runs `aster-v8cell` as a
@@ -90,8 +95,8 @@ holds.
 
 ## Important docs
 
-- `docs/ARCHITECTURE.md` — current architecture (v0.3 + v0.4 deltas)
-- `docs/POSTGRES_ADAPTER_PLAN.md` — five-commit plan, all done as of v0.4
+- `docs/ARCHITECTURE.md` — current v0.5 architecture and Synapse boundary
+- `docs/POSTGRES_ADAPTER_PLAN.md` — historical five-commit plan, plus follow-up status
 - `docs/CONVEX_POSTGRES_REFERENCE.md` — DDL, read SQL templates, 12 gotchas, verbatim from `get-convex/convex-backend`
 - `docs/V8_QUESTION.md` — V8 experiment memo
 - `docs/THEORY_REGISTER.md` — research theories
@@ -102,11 +107,11 @@ holds.
 
 ## What this lets you demo today
 
-- Spawn `aster-brokerd:0.3` against a real Convex Postgres deployment
+- Spawn `aster-brokerd:0.4` against a real Convex Postgres deployment
   (point it at the same DB the upstream backend writes to). The broker
   reads `documents` rows directly — `snapshot_ts`, `read_point`, and
   `read_prefix` are wired and tested.
-- Spawn `aster-v8cell:0.3` against the broker's socket. The cell can run
+- Spawn `aster-v8cell:0.4` against the broker's socket. The cell can run
   hand-written JS that calls `await Convex.asyncSyscall("1.0/get",
   JSON.stringify({id: "<idv6_or_table_hex>/<id_hex>"}))` and gets the
   document bytes back as a JSON string.
@@ -124,8 +129,8 @@ holds.
 
 - Running an `npx convex deploy`-bundled module. The cell only knows
   about an `async function main()` in a single source string; the
-  module loader (#98) needs to read `_modules` + `_source_packages`
-  and pull bundles from the modules-storage layer.
+  module loader (#98) needs broker IPC for bundle bytes, ZIP loading,
+  V8 ESM instantiation, Convex shims, and export dispatch.
 - HTTP requests against a running deployment. There is no
   `/api/query/<module>:<fn>` frontend yet; cells today are spawned
   directly via `aster_v8cell` with hand-written JS over IPC.
