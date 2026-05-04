@@ -23,5 +23,7 @@
 
 pub mod base32;
 pub mod idv6;
+pub mod value;
 
 pub use idv6::{DocumentIdV6, IdDecodeError};
+pub use value::{ConvexValue, ValueDecodeError};
