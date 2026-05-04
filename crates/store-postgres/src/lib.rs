@@ -55,10 +55,12 @@
 //! against the Convex reference doc instead.
 
 mod module_index;
+mod modules_storage;
 mod table_mapping;
 
 pub use module_index::ModuleDescriptor;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +76,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Config as PgConfig, NoTls};
 
 use crate::module_index::ModuleIndex;
+use crate::modules_storage::{LocalDirModulesStorage, ModulesStorage};
 use crate::table_mapping::TableMappingCache;
 
 /// Connection / pool tunables for `PostgresCapsuleStore::connect`.
@@ -89,6 +92,15 @@ pub struct PostgresConfig {
     /// Applied to every checked-out connection via
     /// `SET search_path = $1, public`.
     pub schema: String,
+
+    /// Local-FS path where Convex's `_source_packages` storage layer
+    /// writes module bundles. Maps to upstream's
+    /// `<storage_dir>/modules/`. Empty disables module loading
+    /// entirely — `find_module` still works (it's pure SQL) but
+    /// `load_module_bundle` returns `Backend(_)` saying the
+    /// adapter is unconfigured. Set this when the brokerd has
+    /// access to Convex's module storage on disk.
+    pub modules_dir: Option<PathBuf>,
 
     /// Hard cap on connections. Each in-flight cell hydrate may take
     /// one. Default 16 — sized against the `ASTER_MAX_CONNECTIONS=1024`
@@ -110,6 +122,7 @@ impl Default for PostgresConfig {
         Self {
             url: String::new(),
             schema: "public".into(),
+            modules_dir: None,
             pool_max_size: 16,
             statement_timeout: Duration::from_secs(30),
             runtime_worker_threads: 2,
@@ -136,6 +149,10 @@ pub struct PostgresCapsuleStore {
     /// storage adapter (next slice) takes a `ModuleDescriptor` and
     /// returns bundle bytes.
     module_index: Arc<ModuleIndex>,
+    /// Optional bundle-bytes adapter. `None` when `modules_dir`
+    /// wasn't configured; `load_module_bundle` returns a typed
+    /// "modules dir not configured" error in that case.
+    modules_storage: Option<Arc<dyn ModulesStorage>>,
 }
 
 impl PostgresCapsuleStore {
@@ -175,12 +192,18 @@ impl PostgresCapsuleStore {
             .build()
             .map_err(|err| StoreError::Backend(format!("pool builder: {err}")))?;
 
+        let modules_storage: Option<Arc<dyn ModulesStorage>> = config
+            .modules_dir
+            .clone()
+            .map(|dir| Arc::new(LocalDirModulesStorage::new(dir)) as Arc<dyn ModulesStorage>);
+
         Ok(Self {
             runtime,
             pool,
             schema: config.schema,
             table_mapping: Arc::new(TableMappingCache::new()),
             module_index: Arc::new(ModuleIndex::new()),
+            modules_storage,
         })
     }
 
@@ -510,6 +533,46 @@ impl PostgresCapsuleStore {
                 .await?;
             Ok(self.module_index.list())
         })
+    }
+
+    /// Resolve a module path AND fetch its bundle bytes — the join
+    /// of `find_module` + the storage adapter. Returns the raw ZIP
+    /// bytes the upstream bundler emitted (still zipped; unzip lives
+    /// in the cell-side loader, next slice). The storage adapter
+    /// hash-checks the bytes against `_source_packages.sha256`
+    /// before returning.
+    ///
+    /// Errors:
+    ///   - `Backend("modules dir not configured")` — operator didn't
+    ///     set `modules_dir` on the `PostgresConfig`. Module loading
+    ///     is opt-in for v0.5; brokerds that only do `db.get`-style
+    ///     reads don't need it.
+    ///   - `Backend(_)` from `find_module` — Postgres failure or a
+    ///     malformed `_modules` / `_source_packages` row.
+    ///   - `Backend(_)` from the storage adapter — file missing
+    ///     (mount misconfiguration), I/O error, or sha256 mismatch.
+    ///   - `Ok(None)` — module path resolved cleanly but isn't
+    ///     present in `_modules`. Caller chooses 404 vs 500.
+    pub fn load_module_bundle(&self, path: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let storage = self.modules_storage.as_ref().ok_or_else(|| {
+            StoreError::Backend(
+                "modules storage not configured — set PostgresConfig.modules_dir \
+                 (typically ASTER_MODULES_DIR pointing at convex's <storage>/modules)"
+                    .into(),
+            )
+        })?;
+
+        let descriptor = match self.find_module(path)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        // The storage adapter is sync; we're already inside the
+        // `block_on` if `find_module` triggered a refresh, but
+        // because find_module returns BEFORE we call `fetch`, we're
+        // back on the caller's thread here. That's fine — the FS
+        // read doesn't need tokio.
+        let bytes = storage.fetch(&descriptor)?;
+        Ok(Some(bytes))
     }
 }
 
