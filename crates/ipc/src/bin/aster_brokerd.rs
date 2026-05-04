@@ -8,7 +8,7 @@ use aster_capsule::{
     CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, SealContext, SealedCapsule,
     TenantId, Value,
 };
-use aster_ipc::{read_frame, write_frame, IpcRequest, IpcResponse, WireBrokerError};
+use aster_ipc::{read_frame, write_frame, IpcRequest, IpcResponse, ModuleBundle, WireBrokerError};
 
 fn main() {
     if let Err(error) = run() {
@@ -64,6 +64,10 @@ struct BrokerConfig {
     /// defaults to `public` when ASTER_DB_SCHEMA is unset, which matches a
     /// vanilla self-hosted Convex install.
     db_schema: String,
+    /// Local-FS modules directory mounted into brokerd. Only meaningful for
+    /// `ASTER_STORE=postgres`; memory-store brokerds report module loading as
+    /// unavailable even when this is set.
+    modules_dir: Option<PathBuf>,
 }
 
 impl BrokerConfig {
@@ -83,6 +87,7 @@ impl BrokerConfig {
         };
         let db_schema =
             env_optional_string("ASTER_DB_SCHEMA")?.unwrap_or_else(|| "public".to_string());
+        let modules_dir = env_optional_string("ASTER_MODULES_DIR")?.map(PathBuf::from);
         Ok(Self {
             socket_path,
             tenant,
@@ -94,7 +99,29 @@ impl BrokerConfig {
             store_kind,
             db_url,
             db_schema,
+            modules_dir,
         })
+    }
+}
+
+trait ModuleBundleSource: Send + Sync {
+    fn load_module_bundle(&self, path: &str) -> Result<Option<Vec<u8>>, BrokerError>;
+}
+
+struct NoModuleBundleSource {
+    reason: &'static str,
+}
+
+impl ModuleBundleSource for NoModuleBundleSource {
+    fn load_module_bundle(&self, _path: &str) -> Result<Option<Vec<u8>>, BrokerError> {
+        Err(BrokerError::Remote(self.reason.to_string()))
+    }
+}
+
+impl ModuleBundleSource for aster_store_postgres::PostgresCapsuleStore {
+    fn load_module_bundle(&self, path: &str) -> Result<Option<Vec<u8>>, BrokerError> {
+        aster_store_postgres::PostgresCapsuleStore::load_module_bundle(self, path)
+            .map_err(BrokerError::from)
     }
 }
 
@@ -127,13 +154,21 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // (e.g. ASTER_STORE=mock for fuzz harnesses) only touches this
     // match.
     let configured_ts = config.snapshot_ts;
-    let store: Arc<dyn CapsuleStore + Send + Sync> = match config.store_kind {
+    let (store, module_source): (
+        Arc<dyn CapsuleStore + Send + Sync>,
+        Arc<dyn ModuleBundleSource + Send + Sync>,
+    ) = match config.store_kind {
         StoreKind::Memory => {
             let mvcc = MvccStore::new();
             for (key, document) in config.seeds {
                 mvcc.seed(key, document);
             }
-            Arc::new(mvcc)
+            (
+                Arc::new(mvcc),
+                Arc::new(NoModuleBundleSource {
+                    reason: "module loading requires ASTER_STORE=postgres",
+                }),
+            )
         }
         StoreKind::Postgres => {
             let url = config
@@ -143,6 +178,7 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
             let pg_cfg = aster_store_postgres::PostgresConfig {
                 url,
                 schema: config.db_schema.clone(),
+                modules_dir: config.modules_dir.clone(),
                 ..aster_store_postgres::PostgresConfig::default()
             };
             // Connect is lazy — `connect()` builds the runtime + pool but
@@ -150,9 +186,14 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
             // below is the one that actually checks if Postgres is up.
             // Failure here is a config error (bad URL, missing host),
             // worth dying at startup.
-            let store = aster_store_postgres::PostgresCapsuleStore::connect(pg_cfg)
-                .map_err(|err| format!("postgres connect: {err}"))?;
-            Arc::new(store)
+            let store = Arc::new(
+                aster_store_postgres::PostgresCapsuleStore::connect(pg_cfg)
+                    .map_err(|err| format!("postgres connect: {err}"))?,
+            );
+            (
+                store.clone() as Arc<dyn CapsuleStore + Send + Sync>,
+                store as Arc<dyn ModuleBundleSource + Send + Sync>,
+            )
         }
     };
     let snapshot_ts = if configured_ts == 0 {
@@ -172,6 +213,7 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     );
     let broker = ProcessBroker {
         store,
+        module_source,
         seal_key: config.seal_key,
         tenant: config.tenant,
         deployment: config.deployment,
@@ -243,16 +285,70 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             ),
             false,
         ),
+        IpcRequest::LoadModuleBundle {
+            context,
+            capsule,
+            path,
+        } => (
+            IpcResponse::LoadModuleBundle(
+                broker
+                    .load_module_bundle(&context, capsule, path)
+                    .map(|bundle| {
+                        bundle.map(|(path, bytes)| ModuleBundle::from_bytes(path, &bytes))
+                    })
+                    .map_err(WireBrokerError::from),
+            ),
+            false,
+        ),
         IpcRequest::Shutdown => (IpcResponse::ShutdownAck, true),
     }
 }
 
 struct ProcessBroker {
     store: Arc<dyn CapsuleStore + Send + Sync>,
+    module_source: Arc<dyn ModuleBundleSource + Send + Sync>,
     seal_key: CapsuleSealKey,
     tenant: TenantId,
     deployment: DeploymentId,
     snapshot_ts: u64,
+}
+
+impl ProcessBroker {
+    fn verify_capsule(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+    ) -> Result<(), BrokerError> {
+        let capsule = capsule.into_capsule(&self.seal_key, context)?;
+        if capsule.tenant != self.tenant {
+            return Err(BrokerError::TenantMismatch);
+        }
+        if capsule.deployment != self.deployment {
+            return Err(BrokerError::DeploymentMismatch);
+        }
+        if capsule.ts != self.snapshot_ts {
+            return Err(BrokerError::Remote(format!(
+                "capsule snapshot_ts {} is not broker snapshot {}",
+                capsule.ts, self.snapshot_ts
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_module_bundle(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        path: String,
+    ) -> Result<Option<(String, Vec<u8>)>, BrokerError> {
+        if path.trim().is_empty() {
+            return Err(BrokerError::Remote("module path is required".into()));
+        }
+        self.verify_capsule(context, capsule)?;
+        self.module_source
+            .load_module_bundle(&path)
+            .map(|bundle| bundle.map(|bytes| (path, bytes)))
+    }
 }
 
 impl CapsuleBrokerClient for ProcessBroker {
@@ -372,6 +468,7 @@ fn env_optional_usize(name: &str) -> Result<Option<usize>, Box<dyn std::error::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn parses_seed_documents() {
@@ -379,5 +476,102 @@ mod tests {
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].0, DocumentId::new("items/a"));
         assert_eq!(seeds[1].1.get("value"), Some(&Value::Int(22)));
+    }
+
+    #[test]
+    fn load_module_bundle_requires_matching_capsule_context() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(Some(b"zip".to_vec()))));
+        let context = SealContext::new("cell-a", 1);
+        let sealed = broker
+            .initial_capsule(
+                &context,
+                TenantId::new("tenant-test"),
+                DeploymentId::new("dep-test"),
+                1,
+                Vec::new(),
+            )
+            .expect("initial capsule");
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::LoadModuleBundle {
+                context: SealContext::new("cell-b", 1),
+                capsule: sealed,
+                path: "messages.js".into(),
+            },
+        )
+        .0;
+
+        match response {
+            IpcResponse::LoadModuleBundle(Err(error)) => {
+                assert!(
+                    error.message.contains("different cell") || error.code.contains("WrongCell"),
+                    "unexpected error: {error:?}"
+                );
+            }
+            other => panic!("wrong-cell module load should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_module_bundle_returns_base64_payload() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(Some(b"zip".to_vec()))));
+        let context = SealContext::new("cell-a", 1);
+        let sealed = broker
+            .initial_capsule(
+                &context,
+                TenantId::new("tenant-test"),
+                DeploymentId::new("dep-test"),
+                1,
+                Vec::new(),
+            )
+            .expect("initial capsule");
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::LoadModuleBundle {
+                context,
+                capsule: sealed,
+                path: "messages.js".into(),
+            },
+        )
+        .0;
+
+        match response {
+            IpcResponse::LoadModuleBundle(Ok(Some(bundle))) => {
+                assert_eq!(bundle.path, "messages.js");
+                assert_eq!(bundle.decode_bytes().expect("decode"), b"zip");
+            }
+            other => panic!("module load should return bytes, got {other:?}"),
+        }
+    }
+
+    fn test_broker(module_source: Arc<dyn ModuleBundleSource + Send + Sync>) -> ProcessBroker {
+        ProcessBroker {
+            store: Arc::new(MvccStore::new()),
+            module_source,
+            seal_key: CapsuleSealKey::derive_for_tests(b"test-seed"),
+            tenant: TenantId::new("tenant-test"),
+            deployment: DeploymentId::new("dep-test"),
+            snapshot_ts: 1,
+        }
+    }
+
+    struct FakeModuleSource {
+        bytes: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl FakeModuleSource {
+        fn new(bytes: Option<Vec<u8>>) -> Self {
+            Self {
+                bytes: Mutex::new(bytes),
+            }
+        }
+    }
+
+    impl ModuleBundleSource for FakeModuleSource {
+        fn load_module_bundle(&self, _path: &str) -> Result<Option<Vec<u8>>, BrokerError> {
+            Ok(self.bytes.lock().expect("module source mutex").clone())
+        }
     }
 }

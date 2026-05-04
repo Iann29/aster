@@ -9,6 +9,7 @@ rust-version.workspace = true
 aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
 aster-v8cell = { path = "../v8cell" }
+base64 = "0.22"
 # aster-store-postgres is linked unconditionally — the binary picks at
 # runtime based on ASTER_STORE. This drags tokio-postgres into the cell
 # binary too (which never uses it), but the alternative (cargo features)
