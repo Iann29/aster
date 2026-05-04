@@ -1,64 +1,70 @@
-# Postgres adapter plan (v0.4)
+# Postgres adapter plan (v0.4) — DONE
 
-The v0.3 broker reads from an in-memory `MvccStore`. This document is the
-implementation plan for replacing that with a real Postgres adapter so the
-broker can serve the same database the Convex backend writes to.
+The v0.3 broker read from an in-memory `MvccStore`. This document captured
+the five-commit plan to replace that with a real Postgres adapter so the
+broker could serve the same database the Convex backend writes to. **All
+five commits are now merged on `main`.**
 
-The plan is staged into five commits, each independently
-`cargo test --workspace`-able so CI stays green at every step.
+## What landed (5/5)
 
-## What's already done
-
-- **Commit 1** — `CapsuleStore` trait + `StoreError` in
-  `crates/broker/src/store.rs`. `LocalCapsuleBroker` generic over `S:
-  CapsuleStore`. Blanket impls cover `&MvccStore`, `MvccStore`, `Arc<S>`.
-- **Commit 2** — `aster_brokerd` uses `Arc<dyn CapsuleStore + Send + Sync>`.
-  Same behaviour, narrower type — the Postgres impl plugs in here.
-- **Commit 3** — `crates/store-postgres/` scaffold with `tokio-postgres` +
+- **Commit 1** ([PR #2](https://github.com/Iann29/aster/pull/2)) —
+  `CapsuleStore` trait + `StoreError` in `crates/broker/src/store.rs`.
+  `LocalCapsuleBroker` generic over `S: CapsuleStore`. Blanket impls
+  cover `&MvccStore`, `MvccStore`, `Arc<S>`. No behaviour change.
+- **Commit 2** ([PR #3](https://github.com/Iann29/aster/pull/3)) —
+  `aster_brokerd` uses `Arc<dyn CapsuleStore + Send + Sync>`. Same
+  behaviour, narrower type — the Postgres impl plugs in here.
+- **Commit 3** ([PR #4](https://github.com/Iann29/aster/pull/4)) —
+  `crates/store-postgres/` scaffold with `tokio-postgres` +
   `deadpool-postgres`, sync API + internal tokio runtime, stub queries.
-- **Commit 4** — real SQL: `snapshot_ts` queries `documents` + the
-  `max_repeatable_ts` fence; `read_point` does a direct `DISTINCT ON (id)`
-  on `documents`; `read_prefix` is a bounded variant. Integration tests
-  against `postgres:16` cover snapshot_ts, point reads at multiple ts
-  values, prefix scans honouring limit + ts, malformed-id classification,
-  and unreachable-server handling.
-- **Commit 5** — CI lane with `postgres:16` service container running the
-  gated `postgres-it` tests.
+- **Commit 4** ([PR #7](https://github.com/Iann29/aster/pull/7)) —
+  real SQL: `snapshot_ts` queries `documents` + the `max_repeatable_ts`
+  fence; `read_point` does a direct `DISTINCT ON (id)` on `documents`;
+  `read_prefix` is a bounded variant. **8 integration tests** against
+  `postgres:16` cover snapshot_ts, point reads at multiple ts values,
+  prefix scans honouring limit + ts, malformed-id classification, and
+  unreachable-server handling.
+- **Commit 5** ([PR #6](https://github.com/Iann29/aster/pull/6)) — CI
+  lane with `postgres:16` service container running the gated
+  `postgres-it` tests with `--test-threads=1`.
 
-## Remaining work
+## What's still NOT wired (the open work)
 
-### Commit 2 — push trait through brokerd
-- `crates/ipc/src/bin/aster_brokerd.rs`: `ProcessBroker.store: MvccStore` →
-  `store: Arc<dyn CapsuleStore + Send + Sync>` (or generic `S: CapsuleStore`).
-- Construction path stays in-memory — only the type narrows.
-- CI green: same store, just behind `dyn`.
+The plan was about getting the **store** to read from real Postgres.
+That's done. To get a **Convex app actually executing through Aster**,
+three more pieces have to land:
 
-### Commit 3 — new crate `crates/store-postgres/`
-- Workspace member with `tokio-postgres`, `deadpool-postgres`,
-  `tokio` (`rt-multi-thread`).
-- `PostgresCapsuleStore`: owns a `tokio::runtime::Runtime` + a
-  `deadpool_postgres::Pool`, exposes a sync `impl CapsuleStore` that
-  `block_on`s internally. Sync broker, async island.
-- Schema queries are stubs returning `StoreError::Backend("not implemented")`
-  until Commit 4. Convex schema reference is in
-  `docs/CONVEX_POSTGRES_REFERENCE.md`.
-- Tests gated behind feature `postgres-it` so default CI without a DB
-  still passes.
+1. **`ASTER_STORE` dispatch in `aster_brokerd`.** Today `aster_brokerd`
+   constructs `Arc<dyn CapsuleStore>` hardcoded to `Arc::new(MvccStore::new())`.
+   Adding an env-driven dispatch (`ASTER_STORE=memory|postgres`,
+   `ASTER_DB_URL_FILE > ASTER_DB_URL > error`) is one small commit; the
+   `PostgresCapsuleStore::connect` plus the existing `Arc<dyn>` slot
+   means the brokerd binary just needs to choose at startup. **The
+   `ASTER_DB_URL` env is already what the postgres-it lane uses, so the
+   plumbing is half-there.**
+2. **IDv6 ↔ Aster `DocumentId` mapping.** `Convex.asyncSyscall("1.0/get")`
+   ([PR #8](https://github.com/Iann29/aster/pull/8)) accepts `id` as a
+   string and feeds it to `read_point` verbatim. The real Convex CLI
+   hands a base32-encoded `IDv6` (table-number prefix + 16-byte
+   InternalId). The broker needs:
+   - A port of `crates/value/src/id_v6.rs` (base32 codec).
+   - A table-mapping cache (`_tables` system tablet read on startup,
+     refresh on schema-change events) so it can translate
+     `(table_number, internal_id)` ↔ `(table_id, id)` for the SQL.
+3. **Convex module loader.** Today the v8cell runs an `async function
+   main()` defined in a single source string. A real Convex module is
+   `npx convex deploy`-bundled with `_generated/server.ts`, schema,
+   multiple exports. The cell needs to drive
+   `module.<funcName>.invokeQuery(JSON.stringify(args))` the way
+   Convex's own runner does (see upstream
+   `crates/isolate/src/environment/udf/mod.rs:818-940`). The
+   ["Convex JS runtime" research memo from PR #8's trail](https://github.com/Iann29/aster/pull/8#issue-comment)
+   names this as the largest remaining piece.
 
-### Commit 4 — wire dispatch in brokerd
-- Add `ASTER_STORE` env (`memory` | `postgres`, default `memory`).
-- Add URL discovery: `ASTER_DB_URL_FILE` > `ASTER_DB_URL`. Hard error if
-  `ASTER_STORE=postgres` but neither is set.
-- Implement the actual SQL from `docs/CONVEX_POSTGRES_REFERENCE.md`:
-  `read_point` is an index point lookup via `by_id`,
-  `read_prefix` is a bounded `INDEX_QUERIES` range scan,
-  `snapshot_ts` is `max(documents.ts, persistence_globals['max_repeatable_ts'])`.
-- Default `memory` keeps `compose.smoke.yml` and `process_boundary.rs` green.
-
-### Commit 5 — CI lane
-- Add `postgres-it` job to `.github/workflows/ci.yml` that spins up
-  `postgres:16` as a service container and runs
-  `cargo test -p aster-store-postgres --features postgres-it`.
+The Synapse-side pair (cell-on-demand spawn) is tracked in the Synapse
+repo's [`docs/ASTER_INTEGRATION.md`](https://github.com/Iann29/convex-synapse/blob/main/docs/ASTER_INTEGRATION.md);
+it's the operator-facing endpoint that hands a JS source + args to the
+cell when an HTTP request arrives.
 
 ## Decisions locked in
 
