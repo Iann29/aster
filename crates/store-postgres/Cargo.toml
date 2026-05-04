@@ -38,3 +38,9 @@ postgres-it = []
 # tokio with `rt`+macros so the integration tests can use #[tokio::test]
 # and drive the fixture reset without us hand-rolling a runtime.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# sha2 for the modules-storage integration test — the test writes a
+# fake bundle, hashes it, and seeds the `_source_packages` row with
+# the matching digest so the storage adapter's verify-pass flow runs
+# end-to-end. Production code uses an inline SHA-256 to keep the
+# main dep graph small; tests get the well-vetted crate for free.
+sha2 = "0.10"
