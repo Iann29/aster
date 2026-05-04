@@ -4,7 +4,7 @@ version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Convex IDv6 + Crockford base32 codec, ported verbatim from get-convex/convex-backend so Aster can decode IDs that Convex apps emit."
+description = "Convex wire codecs (IDv6, Crockford base32, ConvexValue $integer/$float/$bytes JSON wrappers), ported verbatim from get-convex/convex-backend so Aster can decode the strings + values Convex apps emit."
 
 [dependencies]
 # Pure Rust port — no convex-backend types, no thiserror. Beyond

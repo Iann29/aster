@@ -1,4 +1,4 @@
-# Aster Runner v0.4
+# Aster Runner v0.5
 
 Aster Runner is a research prototype for **capability-narrowed Convex function
 execution**: tenant JavaScript runs in a V8 cell that holds zero database
@@ -13,16 +13,17 @@ The story-so-far stack:
 | v0.2 | Real V8 isolate suspend/resume on missing reads via `await Aster.read(...)`. Cryptographic capsule seals (BLAKE3 keyed MAC + cell binding). |
 | v0.3 | Broker and cell run as **separate OS processes** over a Unix-domain socket. Cell can never reach the broker's address space. |
 | v0.4 | Broker reads from **real Postgres** (the same database a Convex backend writes to). Cell exposes the upstream **`Convex.asyncSyscall("1.0/get")`** wire shape — a Convex-compiled function calling `await ctx.db.get(id)` resolves end-to-end against the cell's hydrated capsule. |
+| v0.5 | **Convex IDv6 codec** (Crockford base32 + VInt + Fletcher16). **Table-mapping cache** reads the `_tables` system tablet so an IDv6 string a JS bundle hands to `db.get(id)` resolves to the right tablet UUID without a tablet-aware caller. **ConvexValue codec** locks the `$integer`/`$float`/`$bytes` JSON wire shape so the cell can round-trip user values losslessly. |
 
-What's still under construction (not in v0.4):
+What's still under construction (not in v0.5):
 
-- **IDv6 ↔ Aster `DocumentId` mapping** in the broker — today the v8cell
-  accepts `<table_hex>/<id_hex>` directly; the upstream `crates/value/src/id_v6.rs`
-  base32 codec needs a port + the `_tables` system tablet read.
 - **Convex module loader** — today the v8cell runs an `async function main()`
-  defined in a single source string. Driving the same
-  `module.<funcName>.invokeQuery(...)` shape Convex's own runner uses is
-  the next-largest piece.
+  defined in a single source string. Reading `_modules` + `_source_packages`
+  + the modules-storage layer (S3 / local FS) so the cell can execute
+  arbitrary `convex/*.ts` exports is the next-largest piece (#98).
+- **HTTP frontend** — there is no `/api/query/<module>:<fn>` endpoint yet.
+  Driving cells from real client traffic needs a Synapse-side cell-on-demand
+  spawn (#100) and a request router (#101).
 - **Cell-on-demand spawn** from the operator side (lives in
   [`Iann29/convex-synapse`](https://github.com/Iann29/convex-synapse) — see
   [`docs/ASTER_INTEGRATION.md`](https://github.com/Iann29/convex-synapse/blob/main/docs/ASTER_INTEGRATION.md)).
@@ -80,7 +81,8 @@ holds.
 |---|---|
 | `crates/capsule/` | MVCC store, snapshot capsules, BLAKE3 keyed seals, OCC committer |
 | `crates/broker/` | `CapsuleBrokerClient` (cell-facing trait) + `CapsuleStore` (storage backend trait) + `LocalCapsuleBroker` |
-| `crates/store-postgres/` (v0.4) | `PostgresCapsuleStore` — real Convex `documents` reads via `tokio-postgres` + `deadpool-postgres`, sync API + async island |
+| `crates/store-postgres/` (v0.4 SQL, v0.5 mapping cache) | `PostgresCapsuleStore` — real Convex `documents` reads via `tokio-postgres` + `deadpool-postgres`, sync API + async island. v0.5 adds the `_tables`-backed mapping cache so `read_point` accepts both `<table_hex>/<id_hex>` (Aster wire form) and IDv6 strings. |
+| `crates/convex-codec/` (v0.5) | Std-only port of `convex-backend@main:crates/value/src/{base32,id_v6,json}`. `DocumentIdV6` (encode/decode) + Crockford lowercase base32 + `ConvexValue` (`$integer`/`$float`/`$bytes` JSON wrappers). |
 | `crates/runner/` | Tenant-pinned sandbox cells, in-process toy program runner |
 | `crates/v8cell/` | Real V8 isolate. Exposes `Aster.read` (legacy) **and** `Convex.asyncSyscall("1.0/get")` (v0.4) |
 | `crates/ipc/` | Length-prefixed JSON over UDS. `aster_brokerd` + `aster_v8cell` binaries + the cross-process E2E test |
@@ -106,17 +108,27 @@ holds.
   `read_prefix` are wired and tested.
 - Spawn `aster-v8cell:0.3` against the broker's socket. The cell can run
   hand-written JS that calls `await Convex.asyncSyscall("1.0/get",
-  JSON.stringify({id: "<table_hex>/<id_hex>"}))` and gets the document
-  bytes back as a JSON string.
+  JSON.stringify({id: "<idv6_or_table_hex>/<id_hex>"}))` and gets the
+  document bytes back as a JSON string.
+- Hand the broker an IDv6 string (the same string `db.get(id)` would
+  produce in a Convex JS bundle). The `_tables`-backed mapping cache
+  resolves `table_number → tablet_uuid` on the broker side; the cell
+  never sees the table mapping.
+- Round-trip a typed Convex value (`Int64`, `Float64`, `Bytes`,
+  arrays, sorted objects) through the JSON wire shape.
+  `aster_convex_codec::ConvexValue::{from_json,to_json}` is the entry
+  point; tests in `crates/convex-codec/src/value.rs` lock the shape
+  bit-for-bit against `convex-backend@main:crates/value/src/json/`.
 
 ## What this does NOT let you demo today
 
 - Running an `npx convex deploy`-bundled module. The cell only knows
   about an `async function main()` in a single source string; the
-  module loader is the next slice.
-- IDv6-encoded `db.get(id)` from real Convex code. The id encoding is
-  `<table_hex>/<id_hex>` today; the upstream `id_v6.rs` codec needs a
-  port + table-mapping cache.
+  module loader (#98) needs to read `_modules` + `_source_packages`
+  and pull bundles from the modules-storage layer.
+- HTTP requests against a running deployment. There is no
+  `/api/query/<module>:<fn>` frontend yet; cells today are spawned
+  directly via `aster_v8cell` with hand-written JS over IPC.
 - Hostile multi-tenant isolation. The cell container runs as a
   non-root UID but doesn't yet have cgroups / seccomp / read-only
   rootfs / per-tenant UID separation.
