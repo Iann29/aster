@@ -1,25 +1,31 @@
-//! Convex IDv6 + Crockford-base32 codec, ported from
-//! `get-convex/convex-backend` (`crates/value/src/{id_v6.rs,base32.rs}`)
-//! so Aster can decode an ID a Convex-compiled function emits when it
-//! calls `await ctx.db.get(id)`.
+//! Convex wire codecs, ported from `get-convex/convex-backend@main`
+//! (`crates/value/src/{id_v6,base32,json}.rs`) so Aster can decode the
+//! strings and values a Convex-compiled function emits at the
+//! `await ctx.db.get(id)` / `await ctx.db.query(...).collect()` boundary.
 //!
-//! The wire format (verbatim from upstream's docstring):
+//! ## Modules
 //!
-//! ```text
-//! document_id = [ VInt(table_number) ] [ internal ID (16 bytes) ] [ footer (2 bytes) ]
-//! footer      = fletcher16( [VInt(table_number)] [internal ID] ) ^ version
-//! ```
+//! - [`base32`]: Crockford lowercase base32 (no padding, no permissive
+//!   decoder). Backs `idv6` but is exposed for tests.
+//! - [`idv6`]: `DocumentIdV6` — `(table_number, internal_id)` pairs
+//!   encoded as `[ VInt(table_number) ] [ internal_id (16 bytes) ]
+//!   [ footer (2 bytes) ]` with `footer = fletcher16(rest) ^ version`,
+//!   then base32-encoded with the alphabet above. `aster-store-postgres`
+//!   uses this + the `_tables`-backed mapping cache (#96) to turn the
+//!   string a JS bundle hands to `db.get(id)` into the on-disk
+//!   `(table_id, id)` byte pair.
+//! - [`value`]: `ConvexValue` — the discriminated JSON wire shape Convex
+//!   uses to ferry typed values through JSON without precision loss
+//!   (`{"$integer": "..."}`, `{"$float": "..."}`, `{"$bytes": "..."}`).
+//!   Round-trips cleanly through `from_json` / `to_json`.
 //!
-//! Then the binary is base32-encoded with Crockford's lowercase alphabet
-//! (`0123456789abcdefghjkmnpqrstvwxyz`).
+//! ## What's NOT here
 //!
-//! Aster's `aster-store-postgres` adapter takes a `DocumentId` of the
-//! form `<table_hex>/<id_hex>` (16-byte tablet UUID + 16-byte InternalId
-//! both hex-encoded). This crate gives us the bridge: decode an IDv6
-//! string to `(table_number, internal_id_16)`, look the table_number up
-//! in a table-mapping cache (commit #96, separate slice), produce the
-//! `<tablet_hex>/<id_hex>` string the store wants. Encoding is
-//! symmetric — useful for tests.
+//! - The Convex `Storage` / `_modules` / `_source_packages` layer.
+//!   Loading a real `convex/_generated/server.ts` bundle is a separate
+//!   piece (#98) and lives in `aster-store-postgres` once it lands —
+//!   it pulls the bundle bytes from local FS or S3 by `storage_key`,
+//!   not from the `documents` table.
 
 pub mod base32;
 pub mod idv6;
