@@ -66,6 +66,7 @@ version = "0.3.0"
 dependencies = [
  "aster-broker",
  "aster-capsule",
+ "aster-store-postgres",
  "aster-v8cell",
  "serde",
  "serde_json",

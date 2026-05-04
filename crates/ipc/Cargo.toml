@@ -9,5 +9,11 @@ rust-version.workspace = true
 aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
 aster-v8cell = { path = "../v8cell" }
+# aster-store-postgres is linked unconditionally — the binary picks at
+# runtime based on ASTER_STORE. This drags tokio-postgres into the cell
+# binary too (which never uses it), but the alternative (cargo features)
+# would force per-target builds and double the docker/smoke surface.
+# Dead-code elim removes the unused symbols from aster_v8cell at link.
+aster-store-postgres = { path = "../store-postgres" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
