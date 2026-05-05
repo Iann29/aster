@@ -9,6 +9,8 @@
 //! no seal key. Broker binaries own those authorities and use the same wire
 //! structs from the other side of the socket.
 
+pub mod bundle;
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
