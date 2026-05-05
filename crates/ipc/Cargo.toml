@@ -18,3 +18,9 @@ base64 = "0.22"
 aster-store-postgres = { path = "../store-postgres" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Convex emits per-source-package bundles as ZIP archives (one entry
+# per module path plus its source map). The v8cell binary unpacks one
+# named entry on the way into V8. Reader-only path with deflate cover
+# Convex's emitted compression; we explicitly disable other features
+# to keep the crate's dep surface narrow.
+zip = { version = "2", default-features = false, features = ["deflate"] }
