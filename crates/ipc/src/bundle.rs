@@ -109,14 +109,34 @@ pub fn extract_module_source(zip_bytes: &[u8], module_path: &str) -> Result<Stri
     })
 }
 
-/// What we will look up inside the ZIP, in priority order. Kept as a
-/// free function so the unit tests can lock the exact suffix policy
-/// without exercising a live archive.
+/// What we will look up inside the ZIP, in priority order.
+///
+/// The on-disk shape Convex's source-package uploader writes (see
+/// `crates/model/src/source_packages/upload_download.rs::write_package`
+/// upstream) is a ZIP whose entries are prefixed `modules/`:
+///
+/// ```text
+/// modules/<canonical_module_path>.js
+/// modules/<canonical_module_path>.js.map
+/// metadata.json
+/// ```
+///
+/// Cells call us with the canonical module path WITHOUT that prefix
+/// (e.g. `"messages"` or `"messages.js"`). We generate up to four
+/// candidates, real-Convex layout first, bare-name fallbacks last
+/// for hand-crafted test fixtures or future bundlers that skip the
+/// prefix.
 fn candidate_names(module_path: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(2);
-    out.push(module_path.to_string());
-    if !module_path.ends_with(".js") {
-        out.push(format!("{module_path}.js"));
+    let with_js = if module_path.ends_with(".js") {
+        module_path.to_string()
+    } else {
+        format!("{module_path}.js")
+    };
+    let mut out = vec![format!("modules/{with_js}"), with_js.clone()];
+    // Bare unsuffixed name — only useful for tests that store the
+    // entry under exactly the path the caller passed in.
+    if !out.contains(&module_path.to_string()) {
+        out.push(module_path.to_string());
     }
     out
 }
@@ -146,10 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn candidate_names_appends_js_when_missing() {
+    fn candidate_names_prioritises_upstream_modules_prefix() {
+        // Real Convex bundles lay every entry out under `modules/`;
+        // try that first, then walk back through bare-name fallbacks.
         assert_eq!(
             candidate_names("messages"),
-            vec!["messages".to_string(), "messages.js".to_string()]
+            vec![
+                "modules/messages.js".to_string(),
+                "messages.js".to_string(),
+                "messages".to_string(),
+            ]
         );
     }
 
@@ -159,7 +185,7 @@ mod tests {
         // double-`.js.js` candidate.
         assert_eq!(
             candidate_names("messages.js"),
-            vec!["messages.js".to_string()]
+            vec!["modules/messages.js".to_string(), "messages.js".to_string(),]
         );
     }
 
@@ -171,6 +197,36 @@ mod tests {
         ]);
         let source = extract_module_source(&bundle, "messages").expect("extract");
         assert!(source.contains("globalThis.main"));
+    }
+
+    /// Real Convex bundles lay entries out under `modules/<path>.js` —
+    /// see upstream `source_packages/upload_download.rs::write_package`
+    /// (entries prefixed with `modules/`). The cell passes a bare path,
+    /// so we resolve through the prefixed candidate first.
+    #[test]
+    fn extract_finds_real_convex_layout_with_modules_prefix() {
+        let bundle = build_bundle(&[
+            ("metadata.json", br#"{"version":1}"#),
+            ("modules/messages.js", b"export const seedIan = () => 1;"),
+            ("modules/messages.js.map", b"{}"),
+        ]);
+        let source = extract_module_source(&bundle, "messages").expect("extract");
+        assert!(source.contains("seedIan"));
+    }
+
+    /// Bundle has BOTH a bare entry and a `modules/`-prefixed entry —
+    /// real Convex layout wins. Locks the priority order against drift.
+    #[test]
+    fn extract_prefers_modules_prefix_when_both_exist() {
+        let bundle = build_bundle(&[
+            ("messages.js", b"// bare entry"),
+            ("modules/messages.js", b"// upstream layout"),
+        ]);
+        let source = extract_module_source(&bundle, "messages").expect("extract");
+        assert!(
+            source.contains("upstream layout"),
+            "candidate priority must prefer modules/<path>.js, got {source:?}"
+        );
     }
 
     /// Caller already gave the explicit `.js` name — don't double-suffix.
@@ -187,7 +243,14 @@ mod tests {
         let err = extract_module_source(&bundle, "missing").unwrap_err();
         match err {
             BundleError::EntryNotFound { tried, available } => {
-                assert_eq!(tried, vec!["missing".to_string(), "missing.js".to_string()]);
+                assert_eq!(
+                    tried,
+                    vec![
+                        "modules/missing.js".to_string(),
+                        "missing.js".to_string(),
+                        "missing".to_string(),
+                    ]
+                );
                 // Operator can spot the right name in `available`.
                 assert!(available.contains(&"messages.js".to_string()));
                 assert!(available.contains(&"schema.js".to_string()));
