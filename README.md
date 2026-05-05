@@ -1,4 +1,4 @@
-# Aster Runner v0.5
+# Aster Runner v0.6
 
 Aster Runner is a research prototype for **capability-narrowed Convex function
 execution**: tenant JavaScript runs in a V8 cell that holds zero database
@@ -14,17 +14,25 @@ The story-so-far stack:
 | v0.3 | Broker and cell run as **separate OS processes** over a Unix-domain socket. Cell can never reach the broker's address space. |
 | v0.4 | Broker reads from **real Postgres** (the same database a Convex backend writes to). Cell exposes the upstream **`Convex.asyncSyscall("1.0/get")`** wire shape — a Convex-compiled function calling `await ctx.db.get(id)` resolves end-to-end against the cell's hydrated capsule. |
 | v0.5 | **Convex IDv6 codec** (Crockford base32 + VInt + Fletcher16). **Table-mapping cache** reads the `_tables` system tablet so an IDv6 string a JS bundle hands to `db.get(id)` resolves to the right tablet UUID without a tablet-aware caller. **ConvexValue codec** locks the `$integer`/`$float`/`$bytes` JSON wire shape so the cell can round-trip user values losslessly. |
+| v0.6 | **Real Convex bundle execution end-to-end.** `_modules` × `_source_packages` join (#15), local-FS bundle storage adapter (#17), `LoadModuleBundle` IPC capsule-gated by the broker (#19), cell-side ZIP unzip + `modules/<path>.js` resolution (#20, #21), **V8 ESM compile + `<export>.invokeQuery(args)` dispatch with `Convex.{syscall,asyncSyscall}` globals** (#22), v8cell binary wired with `ASTER_FUNCTION_NAME`+`ASTER_ARGS_JSON` envs (#23), and a `docker/smoke-bundle.sh` end-to-end harness (#24) that runs a real `npx convex deploy` ZIP through the binaries against real Postgres. **The cell now executes real Convex queries.** |
 
-What's still under construction (not in v0.5):
+The proof point lives at two layers, both in CI:
 
-- **Convex module loader** — today the v8cell runs an `async function main()`
-  defined in a single source string. Brokerd can resolve module metadata and
-  return local-FS bundle bytes over IPC, but the cell still needs ZIP loading,
-  V8 ESM instantiation, Convex shims, and export dispatch so it can execute
-  arbitrary `convex/*.ts` functions (#98).
-- **HTTP frontend** — there is no `/api/query/<module>:<fn>` endpoint yet.
-  Synapse already has a raw-JS cell-on-demand endpoint; real client traffic
-  still needs a Convex-shaped request router and response codec.
+- **Library:** `crates/v8cell/tests/module_loader.rs::module_get_by_id_through_fake_broker_returns_doc` runs the byte-for-byte 58 KB `npx convex deploy` output of `aster-e2e-fixture/convex/messages.ts` through `V8SandboxCell::execute_module_query_with_broker`, asserts the seeded document round-trips with `name`, `body`, `_id` intact and exactly **1** `db.get` syscall trap drained.
+- **Binary + Postgres:** `docker/smoke-bundle.sh 0.4-modulequery` boots `postgres:16`, stages a real ZIP at `<modules_dir>/<storage_key>.blob`, runs `aster-brokerd` and `aster-v8cell` containers, and asserts `output:"{\"_id\":\"messages|...\",\"name\":\"ian\"}"` comes back through `Convex.asyncSyscall("1.0/get") → broker → postgres`.
+
+What's still under construction (not in v0.6):
+
+- **Mutations and actions.** The cell explicitly rejects non-query exports
+  (`isMutation === true` → typed error). v0.6 is read-only on purpose; commit
+  paths land separately so the OCC story has its own review surface.
+- **Convex-shaped HTTP frontend.** Synapse already has a raw-JS `aster/invoke`
+  endpoint and now a module-mode binary, but `/api/query/<module>:<fn>` →
+  cell invocation is still on the Synapse side, not Aster's.
+- **Per-deployment source binding (Synapse).** Today
+  `SYNAPSE_ASTER_POSTGRES_URL` + `SYNAPSE_ASTER_MODULES_DIR` are
+  process-level config; production needs a durable "this Aster deployment
+  mirrors that Convex deployment" record.
 
 ## Run
 
@@ -77,17 +85,35 @@ one-shot container that opens the shared socket and prints
 `{"output":42,"traps":1,"capsule_hash":...}` if the capability boundary
 holds.
 
+For the v0.6 module-query path against real Postgres + a real
+`npx convex deploy` ZIP:
+
+```bash
+# Builds whatever tag you pass, stages a ZIP at <modules_dir>/<key>.blob,
+# spins postgres:16 + brokerd(postgres) + v8cell, asserts getById returns
+# the seeded document.
+./docker/smoke-bundle.sh 0.4-modulequery
+```
+
+Expected stdout from the cell when the smoke runs green:
+
+```
+{"capsule_hash":3703888312439000736,
+ "output":"{\"_id\":\"messages|aaaa...\",\"name\":\"ian\"}",
+ "traps":1}
+```
+
 ## Crates
 
 | Crate | What |
 |---|---|
 | `crates/capsule/` | MVCC store, snapshot capsules, BLAKE3 keyed seals, OCC committer |
 | `crates/broker/` | `CapsuleBrokerClient` (cell-facing trait) + `CapsuleStore` (storage backend trait) + `LocalCapsuleBroker` |
-| `crates/store-postgres/` (v0.4 SQL, v0.5 mapping cache) | `PostgresCapsuleStore` — real Convex `documents` reads via `tokio-postgres` + `deadpool-postgres`, sync API + async island. v0.5 adds the `_tables`-backed mapping cache so `read_point` accepts both `<table_hex>/<id_hex>` (Aster wire form) and IDv6 strings. |
+| `crates/store-postgres/` (v0.4 SQL, v0.5 mapping cache, v0.6 module index + storage adapter) | `PostgresCapsuleStore` — real Convex `documents` reads via `tokio-postgres` + `deadpool-postgres`, sync API + async island. The `_tables`-backed mapping cache makes `read_point` accept both `<table_hex>/<id_hex>` and IDv6 strings; the module index (`_modules` × `_source_packages` join) + local-FS storage adapter resolve a module path to bundle bytes via `load_module_bundle`. |
 | `crates/convex-codec/` (v0.5) | Std-only port of `convex-backend@main:crates/value/src/{base32,id_v6,json}`. `DocumentIdV6` (encode/decode) + Crockford lowercase base32 + `ConvexValue` (`$integer`/`$float`/`$bytes` JSON wrappers). |
 | `crates/runner/` | Tenant-pinned sandbox cells, in-process toy program runner |
-| `crates/v8cell/` | Real V8 isolate. Exposes `Aster.read` (legacy) **and** `Convex.asyncSyscall("1.0/get")` (v0.4) |
-| `crates/ipc/` | Length-prefixed JSON over UDS. `aster_brokerd` + `aster_v8cell` binaries + the cross-process E2E test |
+| `crates/v8cell/` (v0.6 module loader) | Real V8 isolate. Exposes `Aster.read` (legacy), `Convex.asyncSyscall("1.0/get")` (v0.4), AND `execute_module_query_with_broker` — compiles a real Convex bundle as ESM, calls `<export>.invokeQuery(args)`, drives the `Convex.asyncSyscall` trap loop. Locked by `tests/module_loader.rs` against the byte-for-byte `npx convex deploy` output of `aster-e2e-fixture/messages.ts`. |
+| `crates/ipc/` (v0.6 bundle IPC) | Length-prefixed JSON over UDS. `aster_brokerd` + `aster_v8cell` binaries + the cross-process E2E test. v0.6 adds `LoadModuleBundle` (capsule-gated bundle bytes) and `bundle::extract_module_source` (ZIP unzip with `modules/<path>.js` priority). |
 | `crates/host/` | In-process facade + benchmark binary + the `e2e.rs` + `crypto_and_v8.rs` smoke harnesses |
 
 ## Important docs
@@ -104,14 +130,15 @@ holds.
 
 ## What this lets you demo today
 
+- **Run a real `npx convex deploy` bundle inside an Aster cell** —
+  `docker/smoke-bundle.sh` spins postgres:16, stages a real ZIP at
+  `<modules_dir>/<storage_key>.blob`, runs the binaries, and the cell
+  prints the seeded document JSON in response to `getById({id})`.
+  Same proof at the library level via `cargo test -p aster-v8cell --test module_loader`.
 - Spawn `aster-brokerd:0.4` against a real Convex Postgres deployment
   (point it at the same DB the upstream backend writes to). The broker
   reads `documents` rows directly — `snapshot_ts`, `read_point`, and
   `read_prefix` are wired and tested.
-- Spawn `aster-v8cell:0.4` against the broker's socket. The cell can run
-  hand-written JS that calls `await Convex.asyncSyscall("1.0/get",
-  JSON.stringify({id: "<idv6_or_table_hex>/<id_hex>"}))` and gets the
-  document bytes back as a JSON string.
 - Hand the broker an IDv6 string (the same string `db.get(id)` would
   produce in a Convex JS bundle). The `_tables`-backed mapping cache
   resolves `table_number → tablet_uuid` on the broker side; the cell
@@ -124,13 +151,17 @@ holds.
 
 ## What this does NOT let you demo today
 
-- Running an `npx convex deploy`-bundled module. The cell only knows
-  about an `async function main()` in a single source string; the
-  module loader (#98) needs broker IPC for bundle bytes, ZIP loading,
-  V8 ESM instantiation, Convex shims, and export dispatch.
-- HTTP requests against a running deployment. There is no
-  `/api/query/<module>:<fn>` frontend yet; cells today are spawned
-  directly via `aster_v8cell` with hand-written JS over IPC.
-- Hostile multi-tenant isolation. The cell container runs as a
+- **Mutations / actions.** The cell explicitly rejects `isMutation` and
+  `isAction` exports (typed error). v0.6 is read-only on purpose; the
+  commit / OCC story will land separately so its review surface stays
+  isolated from the read path.
+- **Convex-shaped HTTP frontend.** Synapse has a raw-JS
+  `POST /v1/deployments/{name}/aster/invoke` endpoint and now a
+  module-mode binary, but `/api/query/<module>:<fn>` → cell invocation
+  routing still has to land on the Synapse side.
+- **Real-VPS smoke through Synapse.** Today's `smoke-bundle.sh` uses
+  raw `docker run`, not Synapse's `provisionAster` + `aster/invoke`
+  flow. The Synapse path was VPS-smoked earlier with raw-JS only.
+- **Hostile multi-tenant isolation.** The cell container runs as a
   non-root UID but doesn't yet have cgroups / seccomp / read-only
   rootfs / per-tenant UID separation.
