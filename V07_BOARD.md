@@ -88,12 +88,25 @@ confinado a callers nativos) documentados no paper §8 + docs de código.
 fence**. Suítes: workspace 23 ok, v8cell 18, postgres-it 33+25+16, ipc
 gated 31.
 
-**v0.7 COMPLETO — 13/13 fatias + 4 rounds de review adversarial.** Próximo
-passo é DO IAN: colar `paper/rereferee-v07-prompt.md` no GPT Pro (re-referee
-externo da implementação + paper — o xeque-mate combinado). Depois do
-veredito: aplicar achados → LaTeX/BibTeX (venue/ano das citações ainda por
-confirmar, ver CLAIMS) → arXiv. Obrigação C-CHANNEL #1 (launch token no
-mint) segue future work documentado.
+**v0.7 COMPLETO — 13/13 fatias + 4 rounds de review adversarial.**
+
+**Round 5 — RE-REFEREE EXTERNO (GPT Pro) RECEBIDO 16/07 tarde: REJECT do
+paper-como-sistema, teorema INTACTO** ("The theorem is not the reason").
+Report verbatim: `paper/sources/rereferee-round2-report.md`. §5 dele aprova o
+núcleo (seal v3, fence local, épocas, F2 scan, floor post-check no plano
+Aster, fronteira da Variante B). 18 achados F1–F18, quase todos com
+replacement sentence pronta. Fatal: **F1 duas histórias** (read plane Convex
+vs `aster.log` — o F9 que cortamos cobra o preço no abstract). Triagem:
+~10 linguagem (F1-claims/F2/F3/F5/F6/F12/F13/F14/F15/F16/F18), 5 código
+barato (F4 consume-antes-do-fence + wart lease-at-boot sem modo read-only;
+F7 collation SQL-vs-Rust + rejeitar alias no broker — o mais sério; F10
+mutante no-fence no TLA; F11 invariante R0 + startup check; F17 ledger
+15-vs-16 + pins), 3 builds = v0.8 (integração committer F1, policy fina F2,
+launch token F3 + deployment A12 F12). F18 tem ERRO FACTUAL de datas
+(AgentCore: Sonrai 04/09/2025 + Unit42 07/04/2026, não "fev/2026"; Supabase
+= cenário demonstrado, não breach). F9: report formal ctt prova o v2
+prehash, não o v3 — round 3 do GPT = reemitir o report. Fork A (preprint
+honesto agora) vs B (v0.8 primeiro) — decisão do Ian.
 
 **Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
 Iterações de cron: NADA a construir — reportar status em uma linha e
