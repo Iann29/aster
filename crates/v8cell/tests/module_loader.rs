@@ -28,7 +28,7 @@ const BUNDLE: &str = include_str!("fixtures/messages.bundled.js");
 /// Build a document the way the Postgres adapter does in production —
 /// with a `_raw` field carrying the upstream Convex JSON envelope. The
 /// cell's `1.0/get` handler reads `_raw` verbatim
-/// (see `aster_v8cell::doc_raw_as_json`) and hands it back to JS as the
+/// (see `aster_v8cell::consume_doc_raw_as_json`) and hands it back to JS as the
 /// `Convex.asyncSyscall` resolved string.
 fn doc_with_raw_json(raw_json: &str) -> Document {
     let mut doc = Document::new();
@@ -110,6 +110,14 @@ fn module_get_by_id_through_fake_broker_returns_doc() {
     assert_eq!(
         result.traps, 1,
         "exactly one Convex.asyncSyscall trap expected for db.get"
+    );
+
+    // Variante B consumption ledger (referee F7): the module path records
+    // the same observation the commit verb will declare.
+    assert_eq!(
+        result.consumed_reads,
+        vec![DocumentId::new(id_str)],
+        "db.get(id) must land in the consumption ledger"
     );
 }
 
