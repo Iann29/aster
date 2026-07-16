@@ -1406,8 +1406,19 @@ mod tests {
     use super::*;
     use aster_capsule::doc_with_i64;
 
+    /// V8 isolates on parallel test-harness threads segfault intermittently
+    /// (SIGSEGV, roughly 1 in 3 full-suite runs). Production runs a single
+    /// isolate per cell process, so serializing is a harness-only concern.
+    fn v8_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static V8_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        V8_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn v8_async_function_resumes_through_broker_without_store_handle() {
+        let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-v8-broker");
         let deployment = DeploymentId::new("dep-v8-broker");
         let store = MvccStore::new();
@@ -1446,6 +1457,7 @@ mod tests {
 
     #[test]
     fn v8_async_function_resumes_after_read_trap() {
+        let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-v8");
         let deployment = DeploymentId::new("dep-v8");
         let store = MvccStore::new();
@@ -1478,6 +1490,7 @@ mod tests {
 
     #[test]
     fn v8_convex_async_syscall_get_returns_doc_raw_as_json() {
+        let _v8 = v8_test_guard();
         // Build a doc whose `_raw` field carries a JSON blob the way
         // PostgresCapsuleStore would after reading from convex.documents.
         // The JS function fires `Convex.asyncSyscall("1.0/get", ...)`,
@@ -1526,6 +1539,7 @@ mod tests {
     /// the old behavior dies with `TooManyTraps` long before finishing.
     #[test]
     fn v8_convex_repeated_get_same_key_traps_once() {
+        let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-warm");
         let deployment = DeploymentId::new("dep-warm");
         let store = MvccStore::new();
@@ -1587,6 +1601,7 @@ mod tests {
     /// JS saw, not what crossed the broker boundary.
     #[test]
     fn v8_convex_prewarmed_get_zero_traps_and_ledgered() {
+        let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-prewarm");
         let deployment = DeploymentId::new("dep-prewarm");
         let store = MvccStore::new();
@@ -1638,6 +1653,7 @@ mod tests {
     /// two reads of the missing key cost one trap.
     #[test]
     fn v8_consumption_ledger_tracks_observed_keys_including_absence() {
+        let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-ledger");
         let deployment = DeploymentId::new("dep-ledger");
         let store = MvccStore::new();
@@ -1702,6 +1718,7 @@ mod tests {
     /// the absence observation is ledgered.
     #[test]
     fn v8_convex_tombstone_prewarm_is_warm_and_ledgered() {
+        let _v8 = v8_test_guard();
         use aster_capsule::{ReadSet, WriteSet};
 
         let tenant = TenantId::new("tenant-tomb");
@@ -1736,6 +1753,7 @@ mod tests {
 
     #[test]
     fn v8_convex_async_syscall_unsupported_name_rejects_promise() {
+        let _v8 = v8_test_guard();
         // Anything other than the v0.5-supported syscall names becomes a
         // typed JS rejection. The cell scheduler still completes
         // (V8 propagates the rejection to top-level main) — we observe

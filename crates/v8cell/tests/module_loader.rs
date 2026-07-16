@@ -25,6 +25,16 @@ use aster_v8cell::{V8CellError, V8SandboxCell};
 
 const BUNDLE: &str = include_str!("fixtures/messages.bundled.js");
 
+/// V8 isolates on parallel test-harness threads segfault intermittently
+/// (SIGSEGV, roughly 1 in 3 full-suite runs). Production runs a single
+/// isolate per cell process, so serializing is a harness-only concern.
+fn v8_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static V8_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    V8_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Build a document the way the Postgres adapter does in production —
 /// with a `_raw` field carrying the upstream Convex JSON envelope. The
 /// cell's `1.0/get` handler reads `_raw` verbatim
@@ -38,6 +48,7 @@ fn doc_with_raw_json(raw_json: &str) -> Document {
 
 #[test]
 fn module_get_by_id_through_fake_broker_returns_doc() {
+    let _v8 = v8_test_guard();
     let tenant = TenantId::new("tenant-bundle-e2e");
     let deployment = DeploymentId::new("dep-bundle-e2e");
 
@@ -123,6 +134,7 @@ fn module_get_by_id_through_fake_broker_returns_doc() {
 
 #[test]
 fn module_rejects_seed_ian_as_mutation() {
+    let _v8 = v8_test_guard();
     // Same bundle, but ask for the mutation. Aster v0.5 cells don't
     // have DB write capability so we reject up front rather than
     // half-execute through `invokeMutation` and surface a downstream
@@ -169,6 +181,7 @@ fn module_rejects_seed_ian_as_mutation() {
 
 #[test]
 fn module_missing_export_lists_available() {
+    let _v8 = v8_test_guard();
     // Typo'd export name should produce a typed error that surfaces
     // the actually-available exports, so an operator can spot the
     // mismatch without round-tripping the cell.
