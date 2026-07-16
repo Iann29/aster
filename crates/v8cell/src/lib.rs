@@ -12,8 +12,15 @@
 //! reads. V8 preserves the async continuation. The Rust host receives a typed
 //! trap, hydrates the capsule through its broker, resolves the promise, runs a
 //! microtask checkpoint, and the same JS async function returns the final value.
+//!
+//! v0.7 makes the cell an honest Variante B runtime (Capsule Transaction
+//! Theorem + referee finding F7): every key the JS actually observes — warm
+//! hit, post-trap read, or absence read — lands in a deduped, deterministic
+//! consumption ledger surfaced as `V8ExecutionResult::consumed_reads`, the
+//! declared dependency set the commit verb submits. Traps count broker round
+//! trips; consumption counts observations. The two are no longer conflated.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Mutex, Once};
 
@@ -75,6 +82,12 @@ impl PendingTrap {
 struct V8CellState {
     capsule: Option<SnapshotCapsule>,
     traps: VecDeque<PendingTrap>,
+    /// Variante B consumption ledger (referee finding F7): every key the JS
+    /// actually observed through a get — warm hits, post-trap reads, and
+    /// absence reads all count; prewarm the function never touched does not.
+    /// This set (not the trap log) is the declared dependency set `S` the
+    /// commit verb submits.
+    consumed: BTreeSet<DocumentId>,
 }
 
 impl V8CellState {
@@ -84,6 +97,35 @@ impl V8CellState {
         let document = versioned.document.as_ref()?;
         document.get(field).cloned()
     }
+
+    /// True when the capsule holds *any* entry for `key`. A live document, a
+    /// tombstone, and a hydrated-absent entry are all warm — each pins the
+    /// version (or absence) at the snapshot, so serving it locally observes
+    /// exactly what a broker trap would. Only a key with no entry traps.
+    fn holds(&self, key: &DocumentId) -> bool {
+        self.capsule
+            .as_ref()
+            .is_some_and(|capsule| capsule.contains(key))
+    }
+
+    /// Serve a `1.0/get` out of the capsule AND record the key in the
+    /// consumption ledger. Missing/tombstoned documents serve as `"null"` —
+    /// that absence is still a recorded read: an absence flip must conflict
+    /// at commit time, so the theorem obliges the ledger to carry it.
+    fn consume_get_raw_json(&mut self, key: &DocumentId) -> String {
+        self.consumed.insert(key.clone());
+        let raw = self
+            .capsule
+            .as_ref()
+            .and_then(|capsule| capsule.get(key))
+            .and_then(|versioned| versioned.document.as_ref())
+            .and_then(|doc| doc.get("_raw"))
+            .cloned();
+        match raw {
+            Some(Value::Text(s)) => s,
+            _ => "null".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +133,12 @@ pub struct V8ExecutionResult {
     pub output: Value,
     pub traps: usize,
     pub capsule_hash: u64,
+    /// The declared dependency set `S` of the Capsule Transaction Theorem's
+    /// Variante B: the deduped, deterministically ordered (BTreeSet order)
+    /// keys the JS actually observed — warm hits, post-trap reads, and
+    /// absence reads. Unconsumed prewarm is absent by design; the commit
+    /// verb submits exactly this set.
+    pub consumed_reads: Vec<DocumentId>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -204,6 +252,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial.capsule().clone()),
             traps: VecDeque::new(),
+            consumed: BTreeSet::new(),
         }));
         let state_ptr: *mut Mutex<V8CellState> = Box::into_raw(boxed_state);
 
@@ -221,6 +270,7 @@ impl V8SandboxCell {
                     .map(|capsule| capsule.root_hash)
                     .unwrap_or_default();
                 output.capsule_hash = hash;
+                output.consumed_reads = state.consumed.iter().cloned().collect();
                 Ok(output)
             }
             Err(error) => Err(error),
@@ -247,6 +297,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial_capsule),
             traps: VecDeque::new(),
+            consumed: BTreeSet::new(),
         }));
         let state_ptr: *mut Mutex<V8CellState> = Box::into_raw(boxed_state);
 
@@ -265,6 +316,7 @@ impl V8SandboxCell {
                     .map(|capsule| capsule.root_hash)
                     .unwrap_or_default();
                 output.capsule_hash = hash;
+                output.consumed_reads = state.consumed.iter().cloned().collect();
                 Ok(output)
             }
             Err(error) => Err(error),
@@ -328,6 +380,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial.capsule().clone()),
             traps: VecDeque::new(),
+            consumed: BTreeSet::new(),
         }));
         let state_ptr: *mut Mutex<V8CellState> = Box::into_raw(boxed_state);
 
@@ -353,6 +406,7 @@ impl V8SandboxCell {
                     .map(|capsule| capsule.root_hash)
                     .unwrap_or_default();
                 output.capsule_hash = hash;
+                output.consumed_reads = state.consumed.iter().cloned().collect();
                 Ok(output)
             }
             Err(error) => Err(error),
@@ -510,6 +564,7 @@ impl V8SandboxCell {
                         output,
                         traps,
                         capsule_hash: 0,
+                        consumed_reads: Vec::new(),
                     });
                 }
                 v8::PromiseState::Rejected => {
@@ -549,7 +604,8 @@ impl V8SandboxCell {
                             hydrate(key)?;
                             let value = {
                                 let state = &*state_ptr;
-                                let state = state.lock().expect("v8 state mutex poisoned");
+                                let mut state = state.lock().expect("v8 state mutex poisoned");
+                                state.consumed.insert(key.clone());
                                 state.read_field(key, field).unwrap_or(Value::Null)
                             };
                             let js_value = capsule_value_to_v8(scope, &value);
@@ -563,7 +619,7 @@ impl V8SandboxCell {
                             let id_str = parse_get_id(args_json)?;
                             let key = DocumentId::new(id_str);
                             hydrate(&key)?;
-                            let json_str = doc_raw_as_json(state_ptr, &key);
+                            let json_str = consume_doc_raw_as_json(state_ptr, &key);
                             let js_str = v8::String::new(scope, &json_str)
                                 .unwrap_or_else(|| v8::String::empty(scope));
                             resolver.resolve(scope, js_str.into()).ok_or_else(|| {
@@ -928,6 +984,7 @@ impl V8SandboxCell {
             output: Value::Text(result_str),
             traps,
             capsule_hash: 0,
+            consumed_reads: Vec::new(),
         })
     }
 }
@@ -1005,7 +1062,8 @@ unsafe fn run_trap_pump_loop(
                         hydrate(key)?;
                         let value = {
                             let state = &*state_ptr;
-                            let state = state.lock().expect("v8 state mutex poisoned");
+                            let mut state = state.lock().expect("v8 state mutex poisoned");
+                            state.consumed.insert(key.clone());
                             state.read_field(key, field).unwrap_or(Value::Null)
                         };
                         let js_value = capsule_value_to_v8(scope, &value);
@@ -1019,7 +1077,7 @@ unsafe fn run_trap_pump_loop(
                         let id_str = parse_get_id(args_json)?;
                         let key = DocumentId::new(id_str);
                         hydrate(&key)?;
-                        let json_str = doc_raw_as_json(state_ptr, &key);
+                        let json_str = consume_doc_raw_as_json(state_ptr, &key);
                         let js_str = v8::String::new(scope, &json_str)
                             .unwrap_or_else(|| v8::String::empty(scope));
                         resolver.resolve(scope, js_str.into()).ok_or_else(|| {
@@ -1097,11 +1155,17 @@ fn aster_read_callback(
     let key = DocumentId::new(key);
 
     let state = unsafe { &*state_ptr };
-    if let Some(value) = state
-        .lock()
-        .expect("v8 state mutex poisoned")
-        .read_field(&key, &field)
-    {
+    let warm_value = {
+        let mut state = state.lock().expect("v8 state mutex poisoned");
+        let value = state.read_field(&key, &field);
+        // Warm hits are consumption too — the ledger tracks what the JS
+        // observed, not what trapped.
+        if value.is_some() {
+            state.consumed.insert(key.clone());
+        }
+        value
+    };
+    if let Some(value) = warm_value {
         let value = capsule_value_to_v8(scope, &value);
         rv.set(value);
         return;
@@ -1134,6 +1198,11 @@ fn aster_read_callback(
 /// today; anything else surfaces as a typed JS rejection. The JS side
 /// receives the resolved JSON string via `await`, then parses it
 /// (Convex's `jsonToConvex` runs JS-side; Aster's host doesn't need to).
+///
+/// A `1.0/get` whose key the capsule already holds resolves right here —
+/// no `PendingTrap`, no broker round trip — with the observation recorded
+/// in the consumption ledger. Repeated reads of one id therefore cost one
+/// trap total, and prewarmed ids cost zero.
 fn convex_async_syscall_callback(
     scope: &mut v8::HandleScope,
     args: v8::FunctionCallbackArguments,
@@ -1170,13 +1239,45 @@ fn convex_async_syscall_callback(
         }
     };
 
+    let state = unsafe { &*state_ptr };
+
+    // Warm hit (bench 2026-07-15 bug (b) + referee F7): if the capsule
+    // already holds the key — live doc, tombstone, or hydrated-absent —
+    // serve `1.0/get` from the sealed capsule without a broker trap,
+    // returning an already-resolved Promise so the async contract is
+    // unchanged. A malformed `id` payload falls through to the trap
+    // dispatcher, which reports the same typed error as before.
+    if name == "1.0/get" {
+        if let Ok(id) = parse_get_id(&args_json) {
+            let key = DocumentId::new(id);
+            let warm_json = {
+                let mut state = state.lock().expect("v8 state mutex poisoned");
+                state.holds(&key).then(|| state.consume_get_raw_json(&key))
+            };
+            if let Some(json_str) = warm_json {
+                let Some(resolver) = v8::PromiseResolver::new(scope) else {
+                    throw(scope, "failed to allocate V8 PromiseResolver");
+                    return;
+                };
+                let promise = resolver.get_promise(scope);
+                let js_str =
+                    v8::String::new(scope, &json_str).unwrap_or_else(|| v8::String::empty(scope));
+                if resolver.resolve(scope, js_str.into()).is_none() {
+                    throw(scope, "PromiseResolver::resolve failed");
+                    return;
+                }
+                rv.set(promise.into());
+                return;
+            }
+        }
+    }
+
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw(scope, "failed to allocate V8 PromiseResolver");
         return;
     };
     let promise = resolver.get_promise(scope);
     let resolver_global = v8::Global::new(scope, resolver);
-    let state = unsafe { &*state_ptr };
     state
         .lock()
         .expect("v8 state mutex poisoned")
@@ -1231,25 +1332,17 @@ fn parse_get_id(args_json: &str) -> Result<String, V8CellError> {
     Ok(id)
 }
 
-/// Pull the document out of the cell's hydrated capsule and return it as
-/// a JSON string the JS side can `JSON.parse`. v0.5 keeps the bytes as
-/// the Postgres adapter wrote them — `_raw` carries the upstream Convex
-/// `json_value` blob untouched. Missing or tombstoned docs become
-/// `"null"` so JS sees `await Convex.asyncSyscall("1.0/get", ...) === null`.
-unsafe fn doc_raw_as_json(state_ptr: *mut Mutex<V8CellState>, key: &DocumentId) -> String {
+/// Pull the document out of the cell's hydrated capsule, record the key in
+/// the consumption ledger, and return it as a JSON string the JS side can
+/// `JSON.parse`. v0.5 keeps the bytes as the Postgres adapter wrote them —
+/// `_raw` carries the upstream Convex `json_value` blob untouched. Missing
+/// or tombstoned docs become `"null"` so JS sees
+/// `await Convex.asyncSyscall("1.0/get", ...) === null` — and that absence
+/// read is deliberately still ledgered.
+unsafe fn consume_doc_raw_as_json(state_ptr: *mut Mutex<V8CellState>, key: &DocumentId) -> String {
     let state = &*state_ptr;
-    let state = state.lock().expect("v8 state mutex poisoned");
-    let raw = state
-        .capsule
-        .as_ref()
-        .and_then(|capsule| capsule.get(key))
-        .and_then(|versioned| versioned.document.as_ref())
-        .and_then(|doc| doc.get("_raw"))
-        .cloned();
-    match raw {
-        Some(Value::Text(s)) => s,
-        _ => "null".to_string(),
-    }
+    let mut state = state.lock().expect("v8 state mutex poisoned");
+    state.consume_get_raw_json(key)
 }
 
 fn throw(scope: &mut v8::HandleScope, message: &str) {
@@ -1419,6 +1512,226 @@ mod tests {
             .expect("Convex.asyncSyscall(1.0/get) should complete");
         assert_eq!(result.output, Value::Text("ian".to_string()));
         assert_eq!(result.traps, 1, "exactly one async syscall trap");
+        assert_eq!(
+            result.consumed_reads,
+            vec![doc_id],
+            "the post-trap read must land in the consumption ledger"
+        );
+    }
+
+    /// Bench 2026-07-15 bug (b): 200 reads of the same id measured 200 broker
+    /// traps because the real Convex syscall path had no warm check. With the
+    /// warm hit, the first get traps and hydrates; the other 199 serve from
+    /// the sealed capsule. `max_traps: 8` makes the assertion structural —
+    /// the old behavior dies with `TooManyTraps` long before finishing.
+    #[test]
+    fn v8_convex_repeated_get_same_key_traps_once() {
+        let tenant = TenantId::new("tenant-warm");
+        let deployment = DeploymentId::new("dep-warm");
+        let store = MvccStore::new();
+        let key = DocumentId::new("docs/hot");
+        let mut doc = aster_capsule::Document::new();
+        doc.insert(
+            "_raw".to_string(),
+            Value::Text(r#"{"n":7,"_id":"docs/hot"}"#.to_string()),
+        );
+        store.seed(key.clone(), doc);
+        let ts = store.snapshot_ts();
+        let broker = aster_broker::LocalCapsuleBroker::new(
+            &store,
+            aster_capsule::CapsuleSealKey::derive_for_tests(b"v8-warm-test"),
+        );
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              let sum = 0;
+              for (let i = 0; i < 200; i++) {
+                const json = await Convex.asyncSyscall(
+                  "1.0/get",
+                  JSON.stringify({ id: "docs/hot", isSystem: false })
+                );
+                const doc = JSON.parse(json);
+                if (doc.n !== 7) throw new Error("read " + i + " saw " + json);
+                sum += doc.n;
+              }
+              return sum;
+            }
+        "#;
+        let result = cell
+            .execute_async_main_with_broker(
+                &broker,
+                "cell-warm",
+                1,
+                tenant,
+                deployment,
+                ts,
+                vec![],
+                source,
+            )
+            .expect("200 warm reads of one key should complete");
+        assert_eq!(result.output, Value::Int(200 * 7));
+        assert_eq!(
+            result.traps, 1,
+            "only the first get may trap; the rest are warm hits"
+        );
+        assert_eq!(
+            result.consumed_reads,
+            vec![key],
+            "200 reads of one id are one consumed dependency"
+        );
+    }
+
+    /// A prewarmed key never traps — the dream-capsule enabler. The
+    /// observation still lands in the ledger: consumption tracks what the
+    /// JS saw, not what crossed the broker boundary.
+    #[test]
+    fn v8_convex_prewarmed_get_zero_traps_and_ledgered() {
+        let tenant = TenantId::new("tenant-prewarm");
+        let deployment = DeploymentId::new("dep-prewarm");
+        let store = MvccStore::new();
+        let key = DocumentId::new("docs/pre");
+        let mut doc = aster_capsule::Document::new();
+        doc.insert(
+            "_raw".to_string(),
+            Value::Text(r#"{"n":3,"_id":"docs/pre"}"#.to_string()),
+        );
+        store.seed(key.clone(), doc);
+        let ts = store.snapshot_ts();
+        let broker = aster_broker::LocalCapsuleBroker::new(
+            &store,
+            aster_capsule::CapsuleSealKey::derive_for_tests(b"v8-prewarm-test"),
+        );
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              const doc = JSON.parse(await Convex.asyncSyscall(
+                "1.0/get",
+                JSON.stringify({ id: "docs/pre" })
+              ));
+              return doc.n;
+            }
+        "#;
+        let result = cell
+            .execute_async_main_with_broker(
+                &broker,
+                "cell-prewarm",
+                1,
+                tenant,
+                deployment,
+                ts,
+                vec![key.clone()],
+                source,
+            )
+            .expect("prewarmed get should complete");
+        assert_eq!(result.output, Value::Int(3));
+        assert_eq!(result.traps, 0, "prewarmed key must not trap");
+        assert_eq!(result.consumed_reads, vec![key]);
+    }
+
+    /// The ledger is exactly the distinct keys the JS observed, in
+    /// deterministic (BTreeSet) order: a live doc read twice, an absent key
+    /// read twice (the absence read is a theorem obligation — an absence
+    /// flip must conflict at commit), and NOT the untouched prewarm entry.
+    /// The second absent read also proves hydrated-absent entries are warm:
+    /// two reads of the missing key cost one trap.
+    #[test]
+    fn v8_consumption_ledger_tracks_observed_keys_including_absence() {
+        let tenant = TenantId::new("tenant-ledger");
+        let deployment = DeploymentId::new("dep-ledger");
+        let store = MvccStore::new();
+        let key_a = DocumentId::new("docs/a");
+        let key_absent = DocumentId::new("docs/b-absent");
+        let key_prewarm = DocumentId::new("docs/c-prewarm");
+        let mut doc = aster_capsule::Document::new();
+        doc.insert(
+            "_raw".to_string(),
+            Value::Text(r#"{"n":21,"_id":"docs/a"}"#.to_string()),
+        );
+        store.seed(key_a.clone(), doc);
+        store.seed(key_prewarm.clone(), doc_with_i64("value", 9));
+        let ts = store.snapshot_ts();
+        let broker = aster_broker::LocalCapsuleBroker::new(
+            &store,
+            aster_capsule::CapsuleSealKey::derive_for_tests(b"v8-ledger-test"),
+        );
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              const get = (id) =>
+                Convex.asyncSyscall("1.0/get", JSON.stringify({ id }));
+              const a1 = JSON.parse(await get("docs/a"));
+              const missing1 = JSON.parse(await get("docs/b-absent"));
+              const missing2 = JSON.parse(await get("docs/b-absent"));
+              const a2 = JSON.parse(await get("docs/a"));
+              if (missing1 !== null || missing2 !== null) {
+                throw new Error("absent key must read null");
+              }
+              if (a1.n !== a2.n) throw new Error("warm re-read changed the value");
+              return a1.n + a2.n;
+            }
+        "#;
+        let result = cell
+            .execute_async_main_with_broker(
+                &broker,
+                "cell-ledger",
+                1,
+                tenant,
+                deployment,
+                ts,
+                vec![key_prewarm],
+                source,
+            )
+            .expect("ledger scenario should complete");
+        assert_eq!(result.output, Value::Int(42));
+        assert_eq!(
+            result.traps, 2,
+            "one trap per distinct cold key; re-reads (present AND absent) are warm"
+        );
+        assert_eq!(
+            result.consumed_reads,
+            vec![key_a, key_absent],
+            "ledger = distinct observed keys incl. the absence read, minus unused prewarm"
+        );
+    }
+
+    /// A tombstone is a warm entry too: it pins "deleted as of the snapshot",
+    /// which is exactly what a broker trap would re-answer. Zero traps, and
+    /// the absence observation is ledgered.
+    #[test]
+    fn v8_convex_tombstone_prewarm_is_warm_and_ledgered() {
+        use aster_capsule::{ReadSet, WriteSet};
+
+        let tenant = TenantId::new("tenant-tomb");
+        let deployment = DeploymentId::new("dep-tomb");
+        let store = MvccStore::new();
+        let key = DocumentId::new("docs/dead");
+        store.seed(key.clone(), doc_with_i64("value", 1));
+        let mut deletes = WriteSet::default();
+        deletes.delete(key.clone());
+        store
+            .commit(store.snapshot_ts(), &ReadSet::default(), &deletes)
+            .expect("delete commit");
+        let ts = store.snapshot_ts();
+
+        let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+        let source = r#"
+            async function main() {
+              const doc = JSON.parse(await Convex.asyncSyscall(
+                "1.0/get",
+                JSON.stringify({ id: "docs/dead" })
+              ));
+              return doc === null;
+            }
+        "#;
+        let result = cell
+            .execute_async_main(&store, tenant, deployment, ts, vec![key.clone()], source)
+            .expect("tombstone get should complete");
+        assert_eq!(result.output, Value::Bool(true));
+        assert_eq!(result.traps, 0, "tombstoned prewarm entry must not trap");
+        assert_eq!(result.consumed_reads, vec![key]);
     }
 
     #[test]
