@@ -5,8 +5,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aster_broker::{BrokerError, CapsuleBrokerClient};
-use aster_capsule::{DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId};
-use aster_ipc::{write_frame, IpcRequest, IpcResponse, UdsCapsuleBrokerClient};
+use aster_capsule::{
+    doc_with_i64, DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId, Value,
+};
+use aster_ipc::{write_frame, IpcRequest, IpcResponse, UdsCapsuleBrokerClient, WireCommitOutcome};
+use aster_v8cell::V8SandboxCell;
 
 #[test]
 fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
@@ -52,6 +55,13 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"output\":42"), "stdout={stdout}");
     assert!(stdout.contains("\"traps\":1"), "stdout={stdout}");
+    // R4: the envelope carries the runtime's consumption ledger
+    // (BTreeSet-ordered) so a harness can drive the Commit verb's
+    // declared_reads from the real observations.
+    assert!(
+        stdout.contains("\"consumed_reads\":[\"counters/a\",\"counters/b\"]"),
+        "stdout={stdout}"
+    );
 
     // Attack simulation from the host test: get a capsule legitimately for
     // cell-a, then present it under cell-b over the real socket — on
@@ -270,6 +280,273 @@ fn prefix_hydrate_over_uds_carries_certificate() {
     assert!(broker.wait().expect("broker wait").success());
 }
 
+/// S9a closes the loop over the real socket: initial → hydrate → commit
+/// through the in-memory fence. The commit CLOSES the session (one
+/// session = one transaction attempt), the identical replayed request
+/// dies at the session gate, a second reader whose declared absence-read
+/// was hit by the first commit gets a structured Conflict, and Abort is
+/// the no-commit close.
+#[test]
+fn commit_verb_closes_the_loop_and_the_session() {
+    let temp = TempDir::new("aster-ipc-commit");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let context = SealContext::new("cell-commit", 7);
+    let tenant = TenantId::new("tenant-proc");
+    let deployment = DeploymentId::new("dep-proc");
+
+    // Reader-writer: observe counters/a (prewarm) + counters/b (trap),
+    // then commit a write declaring both reads (Variante B subset —
+    // here, the full observation set).
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let sealed = client
+        .initial_capsule(
+            &context,
+            tenant.clone(),
+            deployment.clone(),
+            2,
+            vec![DocumentId::new("counters/a")],
+        )
+        .expect("initial capsule");
+    let session = client.session().expect("session held");
+    let sealed = client
+        .hydrate_point(&context, sealed, DocumentId::new("counters/b"))
+        .expect("hydrate counters/b");
+    let replay_capsule = sealed.clone();
+    let outcome = client
+        .commit(
+            sealed,
+            vec![DocumentId::new("counters/a"), DocumentId::new("counters/b")],
+            vec![(
+                DocumentId::new("counters/total"),
+                Some(doc_with_i64("value", 42)),
+            )],
+        )
+        .expect("commit over UDS");
+    assert_eq!(outcome, WireCommitOutcome::Committed { ts: 3 });
+    assert!(
+        client.session().is_none(),
+        "client drops the session the broker closed"
+    );
+
+    // Session end-of-life: the same bytes replayed on the closed session
+    // die at the session gate. CE2.1: replay of the ISSUED capsule is
+    // inevitable under bearer semantics — session EOL is what bounds it.
+    let response = client
+        .raw_call(IpcRequest::Commit {
+            session: Some(session),
+            capsule: replay_capsule.clone(),
+            declared_reads: vec![DocumentId::new("counters/a")],
+            writes: vec![(
+                DocumentId::new("counters/total"),
+                Some(doc_with_i64("value", 43)),
+            )],
+        })
+        .expect("raw replay response");
+    match response {
+        IpcResponse::Commit(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("replay after close should fail, got {other:?}"),
+    }
+    // ... and so does any hydrate on the closed session.
+    let response = client
+        .raw_call(IpcRequest::HydratePoint {
+            context: context.clone(),
+            session: Some(session),
+            capsule: replay_capsule,
+            key: DocumentId::new("counters/b"),
+        })
+        .expect("raw post-commit hydrate response");
+    match response {
+        IpcResponse::HydratePoint(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("post-commit hydrate should fail, got {other:?}"),
+    }
+
+    // A second reader still snapshotted at s=2 observes counters/total as
+    // ABSENT, declares that read, and must conflict: the first commit
+    // wrote it at ts 3 ∈ (2, h] (the absence-flip case, through the wire).
+    let sealed = client
+        .initial_capsule(&context, tenant.clone(), deployment.clone(), 2, Vec::new())
+        .expect("second initial capsule");
+    let sealed = client
+        .hydrate_point(&context, sealed, DocumentId::new("counters/total"))
+        .expect("hydrate counters/total");
+    let outcome = client
+        .commit(
+            sealed,
+            vec![DocumentId::new("counters/total")],
+            vec![(
+                DocumentId::new("counters/other"),
+                Some(doc_with_i64("value", 1)),
+            )],
+        )
+        .expect("conflicting commit over UDS");
+    assert_eq!(
+        outcome,
+        WireCommitOutcome::Conflict {
+            key: DocumentId::new("counters/total")
+        }
+    );
+
+    // Abort: the no-commit close. Double-close surfaces as unknown.
+    let _sealed = client
+        .initial_capsule(&context, tenant, deployment, 2, Vec::new())
+        .expect("third initial capsule");
+    let session = client.session().expect("session held");
+    client.abort().expect("abort over UDS");
+    assert!(client.session().is_none(), "abort drops the held session");
+    let response = client
+        .raw_call(IpcRequest::Abort { session })
+        .expect("raw double-abort response");
+    match response {
+        IpcResponse::Abort(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("double abort should fail, got {other:?}"),
+    }
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+/// S9b closes the FULL theorem loop with the write set born in the cell:
+/// a Convex-shaped mutation module (the real bundle contract — isMutation
+/// + invokeMutation → Promise<string>) runs inside a V8 cell, reads via
+/// `1.0/get` (hydrated over the real socket, consumed) and writes via
+/// `1.0/insert` + `1.0/shallowMerge` (accumulated in-cell, never on the
+/// wire). The harness then drives the S9a Commit verb over UDS with
+/// exactly the transaction bundle the execution produced —
+/// (sealed_capsule, consumed_reads, write_set) — and the fence commits it.
+/// A SECOND cell interleaved at the same snapshot, whose declared absence
+/// read was hit by the first commit, gets a structured Conflict: the
+/// absence flip, end to end from JS.
+///
+/// NOTE: this is the only test in this binary that runs V8 IN-PROCESS
+/// (the others spawn the cell as a subprocess). V8 isolates on parallel
+/// test threads segfault intermittently — if another in-process V8 test
+/// lands here, both must take a shared guard like v8cell's
+/// `v8_test_guard`.
+#[test]
+fn v8_mutation_write_set_commits_over_uds_and_interleaved_conflict_aborts() {
+    const CLAIM_MODULE: &str = r#"
+        const syscall = async (name, args) =>
+          JSON.parse(await Convex.asyncSyscall(name, JSON.stringify(args)));
+
+        export const claimIfFree = {
+          isMutation: true,
+          isPublic: true,
+          invokeMutation: async (argsJson) => {
+            const [{ readId, insertId, n }] = JSON.parse(argsJson);
+            const holder = await syscall("1.0/get", { id: readId });
+            if (holder !== null) return JSON.stringify({ claimed: null });
+            await syscall("1.0/insert", {
+              table: "docs",
+              value: { _id: insertId, n },
+            });
+            await syscall("1.0/shallowMerge", { id: insertId, value: { claimed: true } });
+            return JSON.stringify({ claimed: insertId });
+          },
+        };
+    "#;
+
+    let temp = TempDir::new("aster-ipc-s9b");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let tenant = TenantId::new("tenant-proc");
+    let deployment = DeploymentId::new("dep-proc");
+    let spec = DocumentId::new("docs/spec");
+
+    // Two independent clients = two live sessions: both transactions are
+    // issued from the same pinned snapshot BEFORE either commits — a real
+    // interleaving, not a sequential retry.
+    let client_a = UdsCapsuleBrokerClient::new(socket.clone());
+    let client_b = UdsCapsuleBrokerClient::new(socket.clone());
+    let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+
+    let run_a = cell
+        .execute_module_mutation_with_broker(
+            &client_a,
+            "cell-s9b-a",
+            7,
+            tenant.clone(),
+            deployment.clone(),
+            2,
+            vec![],
+            CLAIM_MODULE,
+            "claimIfFree",
+            r#"[{"readId":"docs/spec","insertId":"docs/spec","n":1}]"#,
+        )
+        .expect("cell A runs the mutation module");
+    let run_b = cell
+        .execute_module_mutation_with_broker(
+            &client_b,
+            "cell-s9b-b",
+            7,
+            tenant.clone(),
+            deployment,
+            2,
+            vec![],
+            CLAIM_MODULE,
+            "claimIfFree",
+            r#"[{"readId":"docs/spec","insertId":"docs/other","n":2}]"#,
+        )
+        .expect("cell B runs the mutation module");
+
+    // Both cells observed docs/spec ABSENT at the snapshot — one broker
+    // round trip each (insert + patch stayed in-cell) — and each produced
+    // one put: A claims docs/spec itself, B claims docs/other.
+    assert_eq!(
+        run_a.output,
+        Value::Text(r#"{"claimed":"docs/spec"}"#.to_string())
+    );
+    assert_eq!(
+        run_b.output,
+        Value::Text(r#"{"claimed":"docs/other"}"#.to_string())
+    );
+    assert_eq!(run_a.traps, 1, "A: only the get hydrates");
+    assert_eq!(run_b.traps, 1, "B: only the get hydrates");
+    assert_eq!(run_a.consumed_reads, vec![spec.clone()]);
+    assert_eq!(run_b.consumed_reads, vec![spec.clone()]);
+    assert_eq!(run_a.write_set.len(), 1);
+    assert_eq!(run_a.write_set[0].0, spec);
+    assert!(run_a.write_set[0].1.is_some(), "A's claim is a put");
+    assert_eq!(run_b.write_set.len(), 1);
+    assert_eq!(run_b.write_set[0].0, DocumentId::new("docs/other"));
+
+    // Commit A: the theorem's happy path with the JS-born bundle.
+    let sealed_a = run_a
+        .sealed_capsule
+        .expect("broker execution carries the final sealed capsule");
+    let outcome = client_a
+        .commit(sealed_a, run_a.consumed_reads, run_a.write_set)
+        .expect("commit A over UDS");
+    assert_eq!(outcome, WireCommitOutcome::Committed { ts: 3 });
+    assert!(
+        client_a.session().is_none(),
+        "commit closes A's session (one session = one transaction attempt)"
+    );
+
+    // Commit B: its declared absence read of docs/spec was flipped by A's
+    // ts-3 write — the fence answers Conflict, not a landed write.
+    let sealed_b = run_b
+        .sealed_capsule
+        .expect("broker execution carries the final sealed capsule");
+    let outcome = client_b
+        .commit(sealed_b, run_b.consumed_reads, run_b.write_set)
+        .expect("commit B over UDS");
+    assert_eq!(outcome, WireCommitOutcome::Conflict { key: spec });
+
+    client_a.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
 #[test]
 fn broker_outlives_many_sequential_connections() {
     let temp = TempDir::new("aster-ipc-manyconn");
@@ -447,6 +724,10 @@ fn spawn_broker_with_seed(socket: &Path, seed: &str) -> Child {
         .env("ASTER_DEPLOYMENT", "dep-proc")
         .env("ASTER_SEED_I64", seed)
         .env("ASTER_SEAL_SEED", "process-boundary-test-key")
+        // Memory-mode lease stand-in (S9a): the broker only mints sessions
+        // for contexts claiming ITS epoch, so this must match the epoch 7
+        // every context in this file claims.
+        .env("ASTER_LEASE_EPOCH", "7")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

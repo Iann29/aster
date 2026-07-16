@@ -344,6 +344,17 @@ if ! docker logs "${BROKER}" 2>&1 | grep -q "store=postgres"; then
     exit 1
 fi
 
+# S9a: a postgres-mode brokerd acquires its epoch from the storage lease
+# authority at boot (ASTER_LEASE_EPOCH is ignored) and refuses to mint
+# sessions for any other epoch — the cell must claim the logged value.
+LEASE_EPOCH="$(docker logs "${BROKER}" 2>&1 | sed -n 's/.*lease epoch=\([0-9][0-9]*\).*/\1/p' | head -1)"
+if [[ -z "${LEASE_EPOCH}" ]]; then
+    echo "ERROR: broker did not log its lease epoch"
+    docker logs "${BROKER}" 2>&1 | sed 's/^/  /'
+    exit 1
+fi
+echo "==> broker lease epoch: ${LEASE_EPOCH}"
+
 # ---------------------------------------------------------------------
 # Run v8cell against the bundle.
 #
@@ -362,7 +373,7 @@ output="$(docker run --rm \
     -e ASTER_DEPLOYMENT=dep-bundle-smoke \
     -e ASTER_SNAPSHOT_TS=200 \
     -e ASTER_CELL_ID=cell-bundle-smoke-1 \
-    -e ASTER_LEASE_EPOCH=11 \
+    -e ASTER_LEASE_EPOCH="${LEASE_EPOCH}" \
     -e ASTER_PREWARM= \
     -e ASTER_MAX_TRAPS=8 \
     -e ASTER_MODULE_PATH=messages.js \

@@ -689,6 +689,124 @@ fn fence_input_types_are_send_sync_and_window_matches_boundary() {
     assert!(!window.contains(&DocumentId::new("docs/b")));
 }
 
+/// Semantic-parity pin for the two `CommitFence` impls: ONE scenario,
+/// driven through the trait, must yield IDENTICAL outcomes on the real
+/// Postgres `WritePlane` and on the in-memory `MemoryFence` the default
+/// (database-free) suite exercises the wire loop with. Both are also
+/// pinned to an expected literal vector so they cannot drift together
+/// silently. RetentionViolated is the one outcome not covered here: the
+/// in-memory store never GCs, so its watermark is pinned at 0 by
+/// construction (see `MemoryFence`).
+#[test]
+fn memory_fence_matches_write_plane_outcomes() {
+    use aster_broker::{CommitFence, MemoryFence};
+    use aster_capsule::MvccStore;
+
+    fn drive(fence: &dyn CommitFence, tenant: &str, deployment: &str) -> Vec<CommitOutcome> {
+        let epoch = fence
+            .acquire_lease(tenant, deployment, "parity")
+            .expect("acquire");
+        assert_eq!(epoch, 1, "fresh authority must start at epoch 1");
+        let window = RangeCertificate {
+            interval: KeyInterval::Prefix("docs/".into()),
+            direction: ScanDirection::Ascending,
+            limit: 10,
+            keys: vec![DocumentId::new("docs/x")],
+            stop: ScanStop::Exhausted,
+        }
+        .window();
+        let commit =
+            |committer: u64,
+             context: u64,
+             snapshot: u64,
+             points: &[DocumentId],
+             windows: &[ObservedWindow],
+             writes: &[(DocumentId, Option<aster_capsule::Document>)]| {
+                fence
+                    .commit(&FenceInput {
+                        tenant,
+                        deployment,
+                        committer_epoch: committer,
+                        context_epoch: context,
+                        snapshot,
+                        read_points: points,
+                        read_windows: windows,
+                        writes,
+                    })
+                    .expect("commit")
+            };
+        let mut outcomes = Vec::new();
+        // 1. Blind write docs/x at s=0 → Committed{1}.
+        outcomes.push(commit(epoch, epoch, 0, &[], &[], &[put("docs/x", 1)]));
+        // 2. Same stale snapshot declaring docs/x → Conflict{docs/x}.
+        outcomes.push(commit(
+            epoch,
+            epoch,
+            0,
+            &[DocumentId::new("docs/x")],
+            &[],
+            &[put("docs/y", 1)],
+        ));
+        // 3. Fresh snapshot, same declaration → Committed{2}.
+        outcomes.push(commit(
+            epoch,
+            epoch,
+            1,
+            &[DocumentId::new("docs/x")],
+            &[],
+            &[put("docs/y", 1)],
+        ));
+        // 4. Exhausted docs/ window at s=1: docs/y landed at 2 → Conflict.
+        outcomes.push(commit(
+            epoch,
+            epoch,
+            1,
+            &[],
+            std::slice::from_ref(&window),
+            &[put("docs/z", 1)],
+        ));
+        // 5. Empty write set never enters the log.
+        outcomes.push(commit(epoch, epoch, 2, &[], &[], &[]));
+        // 6. Snapshot past the tip → SnapshotBeyondHorizon{2}.
+        outcomes.push(commit(epoch, epoch, 99, &[], &[], &[put("docs/z", 1)]));
+        // 7. Failover: a new holder acquires; the old epoch is fenced.
+        let epoch_b = fence
+            .acquire_lease(tenant, deployment, "parity-b")
+            .expect("failover acquire");
+        assert_eq!(epoch_b, epoch + 1);
+        outcomes.push(commit(epoch, epoch, 2, &[], &[], &[put("docs/z", 1)]));
+        outcomes
+    }
+
+    let expected = vec![
+        CommitOutcome::Committed { ts: 1 },
+        CommitOutcome::Conflict {
+            key: DocumentId::new("docs/x"),
+        },
+        CommitOutcome::Committed { ts: 2 },
+        CommitOutcome::Conflict {
+            key: DocumentId::new("docs/y"),
+        },
+        CommitOutcome::EmptyWriteSet,
+        CommitOutcome::SnapshotBeyondHorizon { horizon: 2 },
+        CommitOutcome::StaleEpoch { lease_epoch: 2 },
+    ];
+
+    let plane = fresh_plane();
+    let pg_outcomes = drive(&plane, TENANT, DEPLOYMENT);
+    assert_eq!(
+        pg_outcomes, expected,
+        "write plane drifted off the pinned scenario"
+    );
+
+    let memory = MemoryFence::new(Arc::new(MvccStore::new()));
+    let memory_outcomes = drive(&memory, TENANT, DEPLOYMENT);
+    assert_eq!(
+        memory_outcomes, expected,
+        "memory fence drifted off the write plane's admission semantics"
+    );
+}
+
 #[test]
 fn retention_watermark_clamps_to_log_tip() {
     let plane = fresh_plane();

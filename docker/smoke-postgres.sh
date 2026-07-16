@@ -91,6 +91,18 @@ if ! docker logs "${BROKER}" 2>&1 | grep -q "store=postgres"; then
     exit 1
 fi
 
+# S9a: a postgres-mode brokerd acquires its epoch from the storage lease
+# authority at boot (ASTER_LEASE_EPOCH is ignored) and refuses to mint
+# sessions for any other epoch — so the cell must claim exactly the epoch
+# the broker logged.
+LEASE_EPOCH="$(docker logs "${BROKER}" 2>&1 | sed -n 's/.*lease epoch=\([0-9][0-9]*\).*/\1/p' | head -1)"
+if [[ -z "${LEASE_EPOCH}" ]]; then
+    echo "ERROR: broker did not log its lease epoch"
+    docker logs "${BROKER}" 2>&1 | sed 's/^/  /'
+    exit 1
+fi
+echo "==> broker lease epoch: ${LEASE_EPOCH}"
+
 TENANT_DIR="$(mktemp -d /tmp/aster-pg-smoke-tenant.XXXXXX)"
 # mktemp -d defaults to 0700, which the v8cell UID inside the container
 # can't read. Loosen so the bind-mount actually serves the JS file.
@@ -117,7 +129,7 @@ output="$(docker run --rm \
     -e ASTER_DEPLOYMENT=dep-pg-smoke \
     -e ASTER_SNAPSHOT_TS=200 \
     -e ASTER_CELL_ID=cell-pg-smoke-1 \
-    -e ASTER_LEASE_EPOCH=7 \
+    -e ASTER_LEASE_EPOCH="${LEASE_EPOCH}" \
     -e ASTER_PREWARM= \
     -e ASTER_MAX_TRAPS=8 \
     -e ASTER_JS=/tenant/main.js \

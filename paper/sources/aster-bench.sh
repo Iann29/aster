@@ -63,6 +63,12 @@ for i in $(seq 1 100); do
     sleep 0.1
 done
 
+# S9a: postgres-mode brokerd takes its epoch from the lease authority at
+# boot; cells must claim exactly that epoch.
+LEASE_EPOCH="$(docker logs "${BROKER}" 2>&1 | sed -n 's/.*lease epoch=\([0-9][0-9]*\).*/\1/p' | head -1)"
+[[ -z "${LEASE_EPOCH}" ]] && { echo "broker did not log its lease epoch"; docker logs "${BROKER}"; exit 1; }
+echo "==> broker lease epoch: ${LEASE_EPOCH}"
+
 TENANT_DIR="$(mktemp -d /tmp/aster-bench-tenant.XXXXXX)"
 chmod 0755 "${TENANT_DIR}"
 
@@ -92,7 +98,7 @@ run_cell() { # $1 = js file
         -e ASTER_BROKER_SOCK=/run/aster/broker.sock \
         -e ASTER_TENANT=tenant-bench -e ASTER_DEPLOYMENT=dep-bench \
         -e ASTER_SNAPSHOT_TS=200 -e ASTER_CELL_ID=cell-bench \
-        -e ASTER_LEASE_EPOCH=7 -e ASTER_PREWARM= \
+        -e ASTER_LEASE_EPOCH="${LEASE_EPOCH}" -e ASTER_PREWARM= \
         -e ASTER_MAX_TRAPS=512 -e "ASTER_JS=/tenant/$1" \
         "aster-v8cell:${TAG}" 2>>"${TENANT_DIR}/cell-err.log"
 }
