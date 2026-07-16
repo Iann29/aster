@@ -26,7 +26,9 @@
 //!   path and the integration tests. The IDv6 table-mapping cache exists;
 //!   moving point reads through the by_id index is a later performance and
 //!   retention-correctness slice.
-//! - `read_prefix()` — bounded `DISTINCT ON (id)` table scan.
+//! - `scan_prefix()` — certified bounded live scan (`DISTINCT ON (id)`
+//!   visibility subquery, tombstones filtered outside it so they never
+//!   consume limit slots) returning the `RangeCertificate` evidence.
 //! - Document body is currently passed through as raw JSON bytes under
 //!   a `_raw` field. The ConvexValue codec exists for metadata and future
 //!   typed value handling; the current v8cell `1.0/get` shim intentionally
@@ -34,7 +36,7 @@
 //!
 //! ## DocumentId formats
 //!
-//! The adapter accepts two forms on the `read_point` / `read_prefix`
+//! The adapter accepts two forms on the `read_point` / `scan_prefix`
 //! interfaces, dispatched at parse time:
 //!
 //! 1. **Aster wire form** — `"<table_hex>/<id_hex>"` (32 hex + slash +
@@ -69,7 +71,8 @@ use std::time::Duration;
 
 use aster_broker::{CapsuleStore, StoreError};
 use aster_capsule::{
-    DeploymentId, DocumentId, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
+    DeploymentId, DocumentId, KeyInterval, RangeCertificate, RangeCertificateError, ScanDirection,
+    ScanStop, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
 };
 use aster_convex_codec::DocumentIdV6;
 use deadpool_postgres::{
@@ -334,77 +337,97 @@ impl CapsuleStore for PostgresCapsuleStore {
         })
     }
 
-    fn read_prefix(
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
-        // Convex's read_prefix is normally an INDEX_QUERIES range scan;
-        // for v0.5 we accept the simpler form: prefix is "<table_hex>/"
-        // and we list every document under that table. Bounded by
-        // `limit` to keep capsule size predictable.
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
+        // Convex's prefix scan is normally an INDEX_QUERIES range scan;
+        // like the old read_prefix we accept the simpler form: prefix is
+        // "<table_hex>/" and the interval is every document under that
+        // table. Arbitrary string prefixes need index-range support.
         let table_id = match prefix.strip_suffix('/') {
             Some(s) => decode_hex(s).ok_or_else(|| {
                 StoreError::Backend(format!(
-                    "read_prefix: prefix {prefix:?} is not '<table_hex>/'"
+                    "scan_prefix: prefix {prefix:?} is not '<table_hex>/'"
                 ))
             })?,
             None => {
                 return Err(StoreError::Backend(format!(
-                    "read_prefix: prefix {prefix:?} must end with '/'"
+                    "scan_prefix: prefix {prefix:?} must end with '/'"
                 )))
             }
         };
         if limit == 0 {
-            return Ok(Vec::new());
+            // A limit-0 scan can never carry a valid certificate
+            // (Definition 1.1 requires ℓ >= 1) — same rejection the
+            // in-memory blanket impl surfaces.
+            return Err(StoreError::Backend(format!(
+                "scan_prefix: {}",
+                RangeCertificateError::ZeroLimit
+            )));
         }
 
         self.block_on(async {
             let client = self.checkout().await?;
             let ts_signed = ts as i64;
             let limit_i64 = limit.min(i64::MAX as usize) as i64;
+            // Visibility (latest revision <= ts per id) resolves in the
+            // inner DISTINCT ON; tombstones are dropped OUTSIDE it so a
+            // deleted key never consumes a limit slot — Scan_σ(I, ℓ)
+            // counts live keys only. Hex encoding is order-preserving,
+            // so `id ASC` is ascending DocumentId order.
             let rows = client
                 .query(
                     &format!(
-                        "SELECT DISTINCT ON (id) id, ts, json_value, deleted \
-                         FROM {schema}.documents \
-                         WHERE table_id = $1 AND ts <= $2 \
-                         ORDER BY id ASC, ts DESC \
+                        "SELECT id, ts, json_value FROM ( \
+                             SELECT DISTINCT ON (id) id, ts, json_value, deleted \
+                             FROM {schema}.documents \
+                             WHERE table_id = $1 AND ts <= $2 \
+                             ORDER BY id ASC, ts DESC \
+                         ) latest \
+                         WHERE deleted IS DISTINCT FROM TRUE \
+                         ORDER BY id ASC \
                          LIMIT $3",
                         schema = self.schema
                     ),
                     &[&table_id, &ts_signed, &limit_i64],
                 )
                 .await
-                .map_err(|err| StoreError::Backend(format!("read_prefix: {err}")))?;
+                .map_err(|err| StoreError::Backend(format!("scan_prefix: {err}")))?;
 
-            let mut out = Vec::with_capacity(rows.len());
+            let mut entries = Vec::with_capacity(rows.len());
             for row in rows {
                 let id_bytes: Vec<u8> = row.get(0);
                 let row_ts: i64 = row.get(1);
                 let bytes: Vec<u8> = row.get(2);
-                let deleted: Option<bool> = row.try_get(3).ok();
-
                 let doc_id = DocumentId::new(format!(
                     "{}/{}",
                     encode_hex(&table_id),
                     encode_hex(&id_bytes)
                 ));
-                let value = if deleted.unwrap_or(false) {
-                    VersionedDocument {
-                        version: Some(row_ts as u64),
-                        document: None,
-                    }
-                } else {
+                entries.push((
+                    doc_id,
                     VersionedDocument {
                         version: Some(row_ts as u64),
                         document: Some(raw_document(bytes)),
-                    }
-                };
-                out.push((doc_id, value));
+                    },
+                ));
             }
-            Ok(out)
+            let stop = if entries.len() == limit {
+                ScanStop::Boundary
+            } else {
+                ScanStop::Exhausted
+            };
+            let certificate = RangeCertificate {
+                interval: KeyInterval::Prefix(prefix.to_string()),
+                direction: ScanDirection::Ascending,
+                limit: limit as u64,
+                keys: entries.iter().map(|(key, _)| key.clone()).collect(),
+                stop,
+            };
+            Ok((certificate, entries))
         })
     }
 
@@ -578,7 +601,7 @@ impl PostgresCapsuleStore {
 }
 
 /// Parse the Aster wire form `"<table_hex>/<id_hex>"` into raw bytes.
-/// Standalone so callers in `read_prefix` can reuse it without
+/// Standalone so callers in `scan_prefix` can reuse it without
 /// borrowing `&self` (no Postgres roundtrip needed for this form).
 fn parse_aster_document_id(raw: &str) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
     let (t, i) = raw.split_once('/').ok_or_else(|| {

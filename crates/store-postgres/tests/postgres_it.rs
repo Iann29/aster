@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aster_broker::{CapsuleStore, StoreError};
-use aster_capsule::{DocumentId, Value};
+use aster_capsule::{DocumentId, KeyInterval, ScanDirection, ScanStop, Value};
 use aster_convex_codec::{ConvexValue, DocumentIdV6};
 use aster_store_postgres::{PostgresCapsuleStore, PostgresConfig};
 use sha2::{Digest, Sha256};
@@ -225,42 +225,122 @@ fn read_point_for_unknown_id_is_missing_not_error() {
 }
 
 #[test]
-fn read_prefix_returns_every_doc_in_table() {
+fn scan_prefix_returns_every_live_doc_with_exhausted_certificate() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
 
-    let rows = store.read_prefix(&prefix, 100, 200).expect("read_prefix");
-    assert_eq!(rows.len(), 2, "expected both seeded docs, got {rows:?}");
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 200).expect("scan_prefix");
+    assert_eq!(entries.len(), 2, "expected both seeded docs, got {entries:?}");
+    cert.validate().expect("valid certificate");
+    assert_eq!(cert.interval, KeyInterval::Prefix(prefix.clone()));
+    assert_eq!(cert.direction, ScanDirection::Ascending);
+    assert_eq!(cert.limit, 100);
+    assert_eq!(cert.stop, ScanStop::Exhausted, "2 live < limit 100");
+    assert_eq!(
+        cert.keys,
+        entries.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()
+    );
 
-    for (id, value) in &rows {
-        assert!(id.0.starts_with(&format!("{TEST_TABLE_ID_HEX}/")));
+    for (id, value) in &entries {
+        assert!(id.0.starts_with(&prefix));
         assert!(value.version.is_some());
         assert!(value.document.is_some());
     }
 
-    let ids: Vec<&str> = rows.iter().map(|(d, _)| d.0.as_str()).collect();
+    let ids: Vec<&str> = entries.iter().map(|(d, _)| d.0.as_str()).collect();
     assert!(ids.iter().any(|id| id.contains(ID_IAN_HEX)));
     assert!(ids.iter().any(|id| id.contains(ID_CAUE_HEX)));
 }
 
 #[test]
-fn read_prefix_honours_limit() {
+fn scan_prefix_limit_hit_is_boundary() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
-    let rows = store.read_prefix(&prefix, 1, 200).expect("read_prefix");
-    assert_eq!(rows.len(), 1, "limit=1 should clip to a single row");
+    let (cert, entries) = store.scan_prefix(&prefix, 1, 200).expect("scan_prefix");
+    assert_eq!(entries.len(), 1, "limit=1 should clip to a single row");
+    cert.validate().expect("valid certificate");
+    assert_eq!(cert.stop, ScanStop::Boundary);
+    assert!(cert.keys[0].0.contains(ID_IAN_HEX), "ascending id order");
 }
 
 #[test]
-fn read_prefix_at_old_ts_only_sees_first_insert() {
+fn scan_prefix_at_old_ts_only_sees_first_insert() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
-    let rows = store.read_prefix(&prefix, 100, 150).expect("read_prefix");
-    assert_eq!(rows.len(), 1, "ts=150 should only see the first insert");
-    assert!(rows[0].0 .0.contains(ID_IAN_HEX));
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 150).expect("scan_prefix");
+    assert_eq!(entries.len(), 1, "ts=150 should only see the first insert");
+    assert!(entries[0].0 .0.contains(ID_IAN_HEX));
+    // caue exists in the key space but not at ts=150 — the certificate
+    // still proves interval exhaustion at that snapshot.
+    assert_eq!(cert.stop, ScanStop::Exhausted);
+    cert.validate().expect("valid certificate");
+}
+
+/// Tombstones must be skipped WITHOUT consuming limit slots — the exact
+/// bug class the old read_prefix had (its LIMIT applied before the
+/// deleted filter, so a tombstone displaced a live key from the answer).
+#[test]
+fn scan_prefix_skips_tombstones_without_consuming_limit() {
+    reset_fixture(&url());
+    // Tombstone ian at ts=300: at snapshots >= 300 the only live doc is caue.
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("ad-hoc runtime for tombstone insert");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&url(), NoTls)
+            .await
+            .expect("connect for tombstone insert");
+        let handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {TEST_SCHEMA}.documents (id, ts, table_id, json_value, deleted, prev_ts) \
+                     VALUES (decode($1, 'hex'), 300, decode($2, 'hex'), convert_to('null', 'UTF8'), true, 100)"
+                ),
+                &[&ID_IAN_HEX, &TEST_TABLE_ID_HEX],
+            )
+            .await
+            .expect("insert tombstone");
+        drop(client);
+        handle.abort();
+    });
+
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    // limit=1 at ts=300: ian (smaller id) is tombstoned — the slot must go
+    // to caue, and the stop is Boundary because the limit was hit.
+    let (cert, entries) = store.scan_prefix(&prefix, 1, 300).expect("scan_prefix");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].0 .0.contains(ID_CAUE_HEX),
+        "tombstoned ian must not consume the limit slot, got {entries:?}"
+    );
+    assert_eq!(cert.stop, ScanStop::Boundary);
+
+    // The same scan at the pre-delete snapshot still sees ian first.
+    let (_, entries_before) = store.scan_prefix(&prefix, 1, 200).expect("scan_prefix");
+    assert!(entries_before[0].0 .0.contains(ID_IAN_HEX));
+}
+
+#[test]
+fn scan_prefix_rejects_zero_limit() {
+    reset_fixture(&url());
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+    match store.scan_prefix(&prefix, 0, 200) {
+        Err(StoreError::Backend(msg)) => {
+            assert!(msg.contains("limit"), "message should name the limit: {msg}")
+        }
+        other => panic!("limit=0 must be a Backend error, got {other:?}"),
+    }
 }
 
 #[test]

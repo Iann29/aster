@@ -92,6 +92,7 @@ dependencies = [
  "aster-store-postgres",
  "aster-v8cell",
  "base64",
+ "getrandom 0.4.2",
  "serde",
  "serde_json",
  "zip",

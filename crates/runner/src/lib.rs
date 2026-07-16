@@ -200,9 +200,14 @@ impl<'a> CapsuleBroker<'a> {
                 capsule.hydrate_point(key, value);
             }
             ReadTrap::Prefix { prefix, limit } => {
-                for (key, value) in self.store.prefix_at(&prefix, limit, capsule.ts) {
-                    capsule.hydrate_point(key, value);
-                }
+                // The certified scan is the only prefix implementation:
+                // resumed capsules must carry the RangeCertificate so v0.7
+                // commits can reconstruct the phantom conflict window.
+                let (certificate, entries) = self
+                    .store
+                    .scan_prefix_at(&prefix, limit, capsule.ts)
+                    .expect("prefix trap must carry a positive limit");
+                capsule.hydrate_range(certificate, entries);
             }
         }
     }
@@ -308,7 +313,38 @@ fn kind_matches(kind: &FunctionKind, program: &Program) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_capsule::doc_with_i64;
+    use aster_capsule::{doc_with_i64, ScanStop};
+
+    #[test]
+    fn prefix_trap_hydrates_certified_scan_into_capsule() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("items/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("items/b"), doc_with_i64("value", 2));
+        let ts = store.snapshot_ts();
+        let mut capsule = store.build_capsule(
+            TenantId::new("tenant-a"),
+            DeploymentId::new("dep-a"),
+            ts,
+            Vec::new(),
+        );
+
+        let broker = CapsuleBroker::new(&store);
+        broker.hydrate(
+            &mut capsule,
+            ReadTrap::Prefix {
+                prefix: "items/".to_string(),
+                limit: 8,
+            },
+        );
+
+        assert_eq!(capsule.ranges.len(), 1, "resumed capsule carries evidence");
+        assert_eq!(capsule.ranges[0].stop, ScanStop::Exhausted);
+        assert!(capsule.get(&DocumentId::new("items/a")).is_some());
+        assert!(capsule.get(&DocumentId::new("items/b")).is_some());
+        capsule
+            .validate_structure()
+            .expect("hydrated capsule cross-references live docs");
+    }
 
     #[test]
     fn query_hydrates_missing_key_with_read_trap() {

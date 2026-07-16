@@ -14,9 +14,12 @@ pub mod bundle;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use aster_broker::{BrokerError, CapsuleBrokerClient};
-use aster_capsule::{DeploymentId, DocumentId, SealContext, SealedCapsule, TenantId};
+use aster_capsule::{
+    DeploymentId, DocumentId, SealContext, SealedCapsule, SessionBinding, TenantId,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +30,14 @@ use serde::{Deserialize, Serialize};
 /// per-deployment and much lower for point-read traps.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Session ids on the wire (Repair C-CHANNEL): `InitialCapsule` mints one
+/// and returns it in the grant; every later capsule verb must present it.
+/// The broker treats the presented id purely as a lookup key into its own
+/// session table — it rebuilds the bound `SealContext` from that table and
+/// only checks the request's serialized `context` for equality, never
+/// trusting it as authority. `session: None` on a capsule verb is an
+/// explicit unbound request, which the broker rejects with a structured
+/// error rather than falling back to unbound verification.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     InitialCapsule {
@@ -38,21 +49,39 @@ pub enum IpcRequest {
     },
     HydratePoint {
         context: SealContext,
+        session: Option<SessionBinding>,
         capsule: SealedCapsule,
         key: DocumentId,
     },
+    HydratePrefix {
+        context: SealContext,
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    },
     LoadModuleBundle {
         context: SealContext,
+        session: Option<SessionBinding>,
         capsule: SealedCapsule,
         path: String,
     },
     Shutdown,
 }
 
+/// What `InitialCapsule` hands back: the sealed capsule plus the freshly
+/// minted session id the cell must present on every subsequent verb.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitialCapsuleGrant {
+    pub capsule: SealedCapsule,
+    pub session: SessionBinding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IpcResponse {
-    InitialCapsule(Result<SealedCapsule, WireBrokerError>),
+    InitialCapsule(Result<InitialCapsuleGrant, WireBrokerError>),
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
+    HydratePrefix(Result<SealedCapsule, WireBrokerError>),
     LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
     ShutdownAck,
     Error(WireBrokerError),
@@ -105,6 +134,7 @@ impl From<BrokerError> for WireBrokerError {
             BrokerError::Seal(error) => Self::new(format!("seal_{error:?}"), value.to_string()),
             BrokerError::TenantMismatch => Self::new("tenant_mismatch", value.to_string()),
             BrokerError::DeploymentMismatch => Self::new("deployment_mismatch", value.to_string()),
+            BrokerError::ZeroScanLimit => Self::new("zero_scan_limit", value.to_string()),
             BrokerError::Remote(_) => Self::new("remote", value.to_string()),
         }
     }
@@ -186,19 +216,41 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> IpcR
 
 /// UDS implementation of the v0.2 broker trait.
 ///
-/// This type intentionally contains only a socket path. It has no store handle,
-/// no seal key, and no way to read documents except by presenting a valid sealed
-/// capsule to the broker process.
+/// This type intentionally contains only a socket path plus the current
+/// session id. It has no store handle, no seal key, and no way to read
+/// documents except by presenting a valid sealed capsule to the broker
+/// process.
+///
+/// Session handling: `initial_capsule` stores the broker-minted session id
+/// and every later capsule verb presents it automatically. Internal shared
+/// state (`Arc<Mutex<..>>`, so clones share the slot) was chosen over a
+/// returned session handle because it keeps the `CapsuleBrokerClient` trait
+/// signature unchanged — the v8cell execute path drives the trait and must
+/// stay oblivious to wire-only concerns. A later `initial_capsule` on the
+/// same client replaces the held session, matching brokerd, where every
+/// InitialCapsule mints a fresh session.
 #[derive(Clone, Debug)]
 pub struct UdsCapsuleBrokerClient {
     socket_path: PathBuf,
+    session: Arc<Mutex<Option<SessionBinding>>>,
 }
 
 impl UdsCapsuleBrokerClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            session: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The session id held from the last successful `initial_capsule`, if
+    /// any. Exposed for tests and tooling that build raw wire requests.
+    pub fn session(&self) -> Option<SessionBinding> {
+        *self.session.lock().expect("session slot lock")
+    }
+
+    fn store_session(&self, session: SessionBinding) {
+        *self.session.lock().expect("session slot lock") = Some(session);
     }
 
     pub fn shutdown(&self) -> IpcResult<()> {
@@ -225,6 +277,7 @@ impl UdsCapsuleBrokerClient {
     ) -> IpcResult<Option<Vec<u8>>> {
         match self.call(IpcRequest::LoadModuleBundle {
             context: context.clone(),
+            session: self.session(),
             capsule,
             path: path.into(),
         })? {
@@ -263,9 +316,13 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
             snapshot_ts,
             prewarm,
         }) {
-            Ok(IpcResponse::InitialCapsule(result)) => {
-                result.map_err(|error| error.to_broker_error())
-            }
+            Ok(IpcResponse::InitialCapsule(result)) => match result {
+                Ok(grant) => {
+                    self.store_session(grant.session);
+                    Ok(grant.capsule)
+                }
+                Err(error) => Err(error.to_broker_error()),
+            },
             Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
             Ok(_) => Err(BrokerError::Remote(
                 IpcError::UnexpectedResponse("InitialCapsule").to_string(),
@@ -282,6 +339,7 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
     ) -> Result<SealedCapsule, BrokerError> {
         match self.call(IpcRequest::HydratePoint {
             context: context.clone(),
+            session: self.session(),
             capsule,
             key,
         }) {
@@ -291,6 +349,31 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
             Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
             Ok(_) => Err(BrokerError::Remote(
                 IpcError::UnexpectedResponse("HydratePoint").to_string(),
+            )),
+            Err(error) => Err(BrokerError::Remote(error.to_string())),
+        }
+    }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        match self.call(IpcRequest::HydratePrefix {
+            context: context.clone(),
+            session: self.session(),
+            capsule,
+            prefix,
+            limit,
+        }) {
+            Ok(IpcResponse::HydratePrefix(result)) => {
+                result.map_err(|error| error.to_broker_error())
+            }
+            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
+            Ok(_) => Err(BrokerError::Remote(
+                IpcError::UnexpectedResponse("HydratePrefix").to_string(),
             )),
             Err(error) => Err(BrokerError::Remote(error.to_string())),
         }

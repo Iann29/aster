@@ -1,14 +1,19 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aster_broker::{BrokerError, CapsuleBrokerClient, CapsuleStore};
 use aster_capsule::{
     CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, SealContext, SealedCapsule,
-    TenantId, Value,
+    SessionBinding, TenantId, Value,
 };
-use aster_ipc::{read_frame, write_frame, IpcRequest, IpcResponse, ModuleBundle, WireBrokerError};
+use aster_ipc::{
+    read_frame, write_frame, InitialCapsuleGrant, IpcRequest, IpcResponse, ModuleBundle,
+    WireBrokerError,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -215,6 +220,7 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
         tenant: config.tenant,
         deployment: config.deployment,
         snapshot_ts,
+        sessions: SessionTable::default(),
     };
 
     let listener = UnixListener::bind(&config.socket_path)?;
@@ -264,42 +270,153 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             deployment,
             snapshot_ts,
             prewarm,
-        } => (
-            IpcResponse::InitialCapsule(
-                broker
-                    .initial_capsule(&context, tenant, deployment, snapshot_ts, prewarm)
-                    .map_err(WireBrokerError::from),
-            ),
-            false,
-        ),
+        } => {
+            // Only brokerd mints session bindings — a pre-bound context in
+            // an InitialCapsule request is confused or hostile, never
+            // legitimate. The request's cell_id/lease_epoch stand in for
+            // trusted launch metadata in this prototype (a production
+            // broker reads them from the launch channel, not the payload).
+            if context.session.is_some() {
+                return (
+                    IpcResponse::InitialCapsule(Err(WireBrokerError::new(
+                        "initial_context_bound",
+                        "InitialCapsule requires an unbound context; brokerd mints the session",
+                    ))),
+                    false,
+                );
+            }
+            let session = broker.sessions.mint(&context.cell_id, context.lease_epoch);
+            let bound = SealContext::bound(context.cell_id, context.lease_epoch, session);
+            let result =
+                match broker.initial_capsule(&bound, tenant, deployment, snapshot_ts, prewarm) {
+                    Ok(capsule) => Ok(InitialCapsuleGrant { capsule, session }),
+                    Err(error) => {
+                        // A failed grant returned no session id to anyone —
+                        // drop the reservation so hostile cells can't bloat the
+                        // table with failing requests.
+                        broker.sessions.remove(&session);
+                        Err(WireBrokerError::from(error))
+                    }
+                };
+            (IpcResponse::InitialCapsule(result), false)
+        }
         IpcRequest::HydratePoint {
             context,
+            session,
             capsule,
             key,
         } => (
-            IpcResponse::HydratePoint(
-                broker
-                    .hydrate_point(&context, capsule, key)
-                    .map_err(WireBrokerError::from),
-            ),
+            IpcResponse::HydratePoint(broker.resolve_bound_context(session, &context).and_then(
+                |bound| {
+                    broker
+                        .hydrate_point(&bound, capsule, key)
+                        .map_err(WireBrokerError::from)
+                },
+            )),
+            false,
+        ),
+        IpcRequest::HydratePrefix {
+            context,
+            session,
+            capsule,
+            prefix,
+            limit,
+        } => (
+            IpcResponse::HydratePrefix(broker.resolve_bound_context(session, &context).and_then(
+                |bound| {
+                    broker
+                        .hydrate_prefix(&bound, capsule, prefix, limit)
+                        .map_err(WireBrokerError::from)
+                },
+            )),
             false,
         ),
         IpcRequest::LoadModuleBundle {
             context,
+            session,
             capsule,
             path,
         } => (
             IpcResponse::LoadModuleBundle(
                 broker
-                    .load_module_bundle(&context, capsule, path)
-                    .map(|bundle| {
-                        bundle.map(|(path, bytes)| ModuleBundle::from_bytes(path, &bytes))
-                    })
-                    .map_err(WireBrokerError::from),
+                    .resolve_bound_context(session, &context)
+                    .and_then(|bound| {
+                        broker
+                            .load_module_bundle(&bound, capsule, path)
+                            .map(|bundle| {
+                                bundle.map(|(path, bytes)| ModuleBundle::from_bytes(path, &bytes))
+                            })
+                            .map_err(WireBrokerError::from)
+                    }),
             ),
             false,
         ),
+        // Shutdown is process-lifecycle scaffolding for the prototype
+        // harnesses, not a capsule verb — it carries no capsule and grants
+        // no data authority, so it stays outside the session gate.
         IpcRequest::Shutdown => (IpcResponse::ShutdownAck, true),
+    }
+}
+
+/// Broker-side registry of live sessions: session id → the immutable
+/// context the id was minted for. This is the C-CHANNEL repair's trusted
+/// table: capsule verbs present a session id, and the broker rebuilds the
+/// expected bound `SealContext` from THIS table — the request's serialized
+/// context is only checked for equality against the record and then
+/// discarded, never used as authority.
+///
+/// Unbounded for now: sessions get no end-of-life until the S9 commit verb
+/// lands (commit/abort closes a session; lease-epoch fencing sweeps the
+/// rest). Until then a hostile cell can grow this map by hammering
+/// InitialCapsule — accepted for the prototype, tracked for S9.
+#[derive(Default)]
+struct SessionTable {
+    sessions: Mutex<HashMap<SessionBinding, SessionEntry>>,
+}
+
+#[derive(Clone)]
+struct SessionEntry {
+    cell_id: String,
+    lease_epoch: u64,
+}
+
+impl SessionTable {
+    /// Mint a fresh unguessable session id and register it. OS entropy via
+    /// `getrandom` — session ids gate whose seals verify on this channel,
+    /// so anything predictable (time, counters, constant seeds) would let
+    /// one cell impersonate another's channel. If the OS RNG fails the
+    /// broker cannot operate securely; dying is the only safe behavior.
+    fn mint(&self, cell_id: &str, lease_epoch: u64) -> SessionBinding {
+        let mut sessions = self.sessions.lock().expect("session table lock");
+        loop {
+            let mut id = [0_u8; 32];
+            getrandom::fill(&mut id).expect("OS entropy for session id");
+            // 256-bit collision is astronomically unlikely; the loop is for
+            // totality, not an expected path.
+            if let Entry::Vacant(vacant) = sessions.entry(SessionBinding::from_bytes(id)) {
+                let session = *vacant.key();
+                vacant.insert(SessionEntry {
+                    cell_id: cell_id.to_string(),
+                    lease_epoch,
+                });
+                return session;
+            }
+        }
+    }
+
+    fn remove(&self, session: &SessionBinding) {
+        self.sessions
+            .lock()
+            .expect("session table lock")
+            .remove(session);
+    }
+
+    fn lookup(&self, session: &SessionBinding) -> Option<SessionEntry> {
+        self.sessions
+            .lock()
+            .expect("session table lock")
+            .get(session)
+            .cloned()
     }
 }
 
@@ -310,6 +427,52 @@ struct ProcessBroker {
     tenant: TenantId,
     deployment: DeploymentId,
     snapshot_ts: u64,
+    sessions: SessionTable,
+}
+
+impl ProcessBroker {
+    /// Resolve the presented session id into the bound `SealContext` every
+    /// capsule verb verifies and reseals with. The claimed request context
+    /// must equal the trusted record (its own binding may be omitted or
+    /// must match) — theorem: "a serialized context in a request is either
+    /// omitted or required to equal ctx_c". The returned context is built
+    /// exclusively from the broker's own table entry.
+    fn resolve_bound_context(
+        &self,
+        session: Option<SessionBinding>,
+        claimed: &SealContext,
+    ) -> Result<SealContext, WireBrokerError> {
+        let Some(session) = session else {
+            return Err(WireBrokerError::new(
+                "session_required",
+                "capsule verbs must present the session id minted at InitialCapsule",
+            ));
+        };
+        let Some(entry) = self.sessions.lookup(&session) else {
+            return Err(WireBrokerError::new(
+                "unknown_session",
+                "session id is not registered with this broker",
+            ));
+        };
+        let claimed_binding_ok = match claimed.session {
+            None => true,
+            Some(claimed_session) => claimed_session == session,
+        };
+        if claimed.cell_id != entry.cell_id
+            || claimed.lease_epoch != entry.lease_epoch
+            || !claimed_binding_ok
+        {
+            return Err(WireBrokerError::new(
+                "session_context_mismatch",
+                "request context does not match the session's registered context",
+            ));
+        }
+        Ok(SealContext::bound(
+            entry.cell_id,
+            entry.lease_epoch,
+            session,
+        ))
+    }
 }
 
 impl ProcessBroker {
@@ -400,6 +563,37 @@ impl CapsuleBrokerClient for ProcessBroker {
         capsule.hydrate_point(key, value);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        if limit == 0 {
+            return Err(BrokerError::ZeroScanLimit);
+        }
+        let mut capsule = capsule.into_capsule(&self.seal_key, context)?;
+        if capsule.tenant != self.tenant {
+            return Err(BrokerError::TenantMismatch);
+        }
+        if capsule.deployment != self.deployment {
+            return Err(BrokerError::DeploymentMismatch);
+        }
+        if capsule.ts != self.snapshot_ts {
+            return Err(BrokerError::Remote(format!(
+                "capsule snapshot_ts {} is not broker snapshot {}",
+                capsule.ts, self.snapshot_ts
+            )));
+        }
+        // Certificates are evidence about the capsule snapshot: scan at
+        // capsule.ts (== broker snapshot after the check above), never at
+        // whatever the store head has advanced to.
+        let (certificate, entries) = self.store.scan_prefix(&prefix, limit, capsule.ts)?;
+        capsule.hydrate_range(certificate, entries);
+        Ok(SealedCapsule::new(capsule, &self.seal_key, context))
+    }
 }
 
 fn parse_seeds(raw: &str) -> Result<Vec<(DocumentId, Document)>, String> {
@@ -469,25 +663,223 @@ mod tests {
         assert_eq!(seeds[1].1.get("value"), Some(&Value::Int(22)));
     }
 
+    /// Drive the full wire path for InitialCapsule: mint + grant. Session
+    /// tests must go through `handle_request` — calling the trait method
+    /// directly would skip the layer under test.
+    fn initial_grant(broker: &ProcessBroker, context: &SealContext) -> InitialCapsuleGrant {
+        match handle_request(
+            broker,
+            IpcRequest::InitialCapsule {
+                context: context.clone(),
+                tenant: TenantId::new("tenant-test"),
+                deployment: DeploymentId::new("dep-test"),
+                snapshot_ts: 1,
+                prewarm: Vec::new(),
+            },
+        )
+        .0
+        {
+            IpcResponse::InitialCapsule(Ok(grant)) => grant,
+            other => panic!("initial capsule should succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initial_capsule_mints_session_and_seals_bound() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        // The registered entry is what future hydrates resolve against.
+        let entry = broker
+            .sessions
+            .lookup(&grant.session)
+            .expect("session registered");
+        assert_eq!(entry.cell_id, "cell-a");
+        assert_eq!(entry.lease_epoch, 1);
+
+        // The capsule is sealed for the BOUND context — an unbound verify
+        // (the pre-S4 shape) must fail.
+        let bound = SealContext::bound("cell-a", 1, grant.session);
+        grant
+            .capsule
+            .verify(&broker.seal_key, &bound)
+            .expect("bound verify");
+        assert!(grant.capsule.verify(&broker.seal_key, &context).is_err());
+    }
+
+    #[test]
+    fn initial_capsule_rejects_pre_bound_context() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::bound("cell-a", 1, SessionBinding::from_bytes([0x11; 32]));
+        let response = handle_request(
+            &broker,
+            IpcRequest::InitialCapsule {
+                context,
+                tenant: TenantId::new("tenant-test"),
+                deployment: DeploymentId::new("dep-test"),
+                snapshot_ts: 1,
+                prewarm: Vec::new(),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::InitialCapsule(Err(error)) => {
+                assert_eq!(error.code, "initial_context_bound", "got {error:?}");
+            }
+            other => panic!("pre-bound initial should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_initial_capsule_leaves_no_session_behind() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let response = handle_request(
+            &broker,
+            IpcRequest::InitialCapsule {
+                context: SealContext::new("cell-a", 1),
+                tenant: TenantId::new("tenant-other"),
+                deployment: DeploymentId::new("dep-test"),
+                snapshot_ts: 1,
+                prewarm: Vec::new(),
+            },
+        )
+        .0;
+        assert!(
+            matches!(response, IpcResponse::InitialCapsule(Err(_))),
+            "tenant mismatch must fail the grant"
+        );
+        assert!(
+            broker
+                .sessions
+                .sessions
+                .lock()
+                .expect("session table lock")
+                .is_empty(),
+            "failed grant must not leak a table entry"
+        );
+    }
+
+    #[test]
+    fn hydrate_requires_a_session() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: None,
+                capsule: grant.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "session_required", "got {error:?}");
+            }
+            other => panic!("unbound hydrate should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hydrate_rejects_unknown_session() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: Some(SessionBinding::from_bytes([0x99; 32])),
+                capsule: grant.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "unknown_session", "got {error:?}");
+            }
+            other => panic!("unknown session should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hydrate_rejects_claimed_context_that_mismatches_session() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let grant = initial_grant(&broker, &SealContext::new("cell-a", 1));
+
+        // Claimed cell-b on cell-a's session: C-CHANNEL relabeling attempt.
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context: SealContext::new("cell-b", 1),
+                session: Some(grant.session),
+                capsule: grant.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "session_context_mismatch", "got {error:?}");
+            }
+            other => panic!("relabelled hydrate should fail, got {other:?}"),
+        }
+    }
+
+    /// The theorem's re-spawned-cell scenario: two sessions minted for the
+    /// SAME cell_id and epoch. A capsule sealed under session A presented
+    /// on session B passes the table checks (identical public context) and
+    /// must die in seal verification — the session binding in the MAC is
+    /// what carries the rejection.
+    #[test]
+    fn capsule_from_another_session_fails_seal_verification() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::new("cell-a", 1);
+        let grant_a = initial_grant(&broker, &context);
+        let grant_b = initial_grant(&broker, &context);
+        assert_ne!(grant_a.session, grant_b.session, "sessions must be unique");
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: Some(grant_b.session),
+                capsule: grant_a.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert!(
+                    error.code.contains("WrongSession"),
+                    "expected seal-level wrong-session rejection, got {error:?}"
+                );
+            }
+            other => panic!("cross-session capsule should fail, got {other:?}"),
+        }
+    }
+
     #[test]
     fn load_module_bundle_requires_matching_capsule_context() {
         let broker = test_broker(Arc::new(FakeModuleSource::new(Some(b"zip".to_vec()))));
-        let context = SealContext::new("cell-a", 1);
-        let sealed = broker
-            .initial_capsule(
-                &context,
-                TenantId::new("tenant-test"),
-                DeploymentId::new("dep-test"),
-                1,
-                Vec::new(),
-            )
-            .expect("initial capsule");
+        let grant = initial_grant(&broker, &SealContext::new("cell-a", 1));
 
+        // Pre-S4 this died in seal verification (WrongCell); the session
+        // table now rejects the relabelled context before the seal is
+        // even consulted.
         let response = handle_request(
             &broker,
             IpcRequest::LoadModuleBundle {
                 context: SealContext::new("cell-b", 1),
-                capsule: sealed,
+                session: Some(grant.session),
+                capsule: grant.capsule,
                 path: "messages.js".into(),
             },
         )
@@ -495,10 +887,7 @@ mod tests {
 
         match response {
             IpcResponse::LoadModuleBundle(Err(error)) => {
-                assert!(
-                    error.message.contains("different cell") || error.code.contains("WrongCell"),
-                    "unexpected error: {error:?}"
-                );
+                assert_eq!(error.code, "session_context_mismatch", "got {error:?}");
             }
             other => panic!("wrong-cell module load should fail, got {other:?}"),
         }
@@ -508,21 +897,14 @@ mod tests {
     fn load_module_bundle_returns_base64_payload() {
         let broker = test_broker(Arc::new(FakeModuleSource::new(Some(b"zip".to_vec()))));
         let context = SealContext::new("cell-a", 1);
-        let sealed = broker
-            .initial_capsule(
-                &context,
-                TenantId::new("tenant-test"),
-                DeploymentId::new("dep-test"),
-                1,
-                Vec::new(),
-            )
-            .expect("initial capsule");
+        let grant = initial_grant(&broker, &context);
 
         let response = handle_request(
             &broker,
             IpcRequest::LoadModuleBundle {
                 context,
-                capsule: sealed,
+                session: Some(grant.session),
+                capsule: grant.capsule,
                 path: "messages.js".into(),
             },
         )
@@ -545,6 +927,7 @@ mod tests {
             tenant: TenantId::new("tenant-test"),
             deployment: DeploymentId::new("dep-test"),
             snapshot_ts: 1,
+            sessions: SessionTable::default(),
         }
     }
 
