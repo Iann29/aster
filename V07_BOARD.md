@@ -11,27 +11,34 @@ merged.
 | S1 | Seal v2 direct-MAC + comparação constant-time (mata assumption A3/K-PREHASH) | ✅ | `22e872f` |
 | S2 | Codec canônico W-CANON — decode estrito com rejeição adversarial | ✅ | `a467272` |
 | S3 | Range certificates + conflict windows phantom-safe (R-RANGE, F2) | ✅ | `24c9665` |
-| S3b | Certified prefix scan fim-a-fim (MvccStore live-scan → broker `hydrate_prefix` → verbo IPC) | 🔄 round paralelo | branch `v0.7-s3b` |
-| S4 | Session/channel binding C-CHANNEL (seal v3 + tabela de sessões no brokerd) | 🔄 round paralelo | branch `v0.7-s4` (base: s3b) |
+| S3b | Certified prefix scan fim-a-fim (MvccStore live-scan → broker `hydrate_prefix` → verbo IPC; store-postgres com scan SQL real) | ✅ | `d96961c` |
+| S4 | Session/channel binding C-CHANNEL (seal v3 `aster-blake3-keyed-v3` + tabela de sessões no brokerd, getrandom) | ✅ | `d55fd06` |
 | S5 | Lease authority — épocas estritamente crescentes, nunca reusadas (F1) | ✅ | `c615bd9` (write_plane) |
 | S6 | Commit fence transacional (1 tx Postgres: lease FOR UPDATE + tip + conflict scan + append) | ✅ | `c615bd9` + 13 testes `write_plane_it` |
-| S7 | Variante B runtime honesto: consumption tracking + warm-hit no `1.0/get` (bench bug b, F7) | 🔄 round paralelo | branch `v0.7-s7` |
+| S7 | Variante B runtime honesto: consumption tracking (`V8ExecutionResult.consumed_reads`) + warm-hit no `1.0/get` (bench bug b, F7) | ✅ | `b40b4e5` |
 | S8 | Broker não se auto-esgota (lifetime budget removido — bench bug a) | ✅ | `b8fce68` |
 | S9 | Commit verb IPC: capsule + consumo declarado + write set → fence. Fecha o loop cell→commit. Inclui época REAL vinda da lease authority no lugar da auto-declarada | ⬜ próxima (depois do merge do round) | |
 | S10 | Bench do write path — EQ3/EQ4 MEDIDOS (gate do paper de sistemas) | ⬜ depende de S9 | `paper/sources/aster-bench.sh` como base |
-| S11 | TLA+ do fence/GC/failover com TLC rodado de verdade (F8 — junta mais fraca) | 🔄 round paralelo | branch `v0.7-s11`, dir `tla/` |
-| S12 | Paper "Authenticate the Reads, Not the Code" — Ian Lucas Beé, draft completo | 🔄 round paralelo | branch `v0.7-s12`, dir `paper/` |
+| S11 | TLA+ do fence/GC/failover com TLC rodado de verdade (F8 — junta mais fraca): positivo 14,8M estados / 6 invariantes OK; negativos F1-reuse→I3 e no-pin→I2 violam como previsto | ✅ | `656bc91` + addendum `885ef9b` |
+| S12 | Paper "Authenticate the Reads, Not the Code" — Ian Lucas Beé, draft 9.588 palavras + CLAIMS.md | ✅ draft (reconciliação pós-merge no review) | `cb8c630` |
 
-## Round ultracode em andamento (16/07 ~06:40)
+## Round 1 ultracode — CONCLUÍDO (16/07 ~07:40)
 
-5 agentes paralelos em worktrees (`/tmp/aster-wt-*`), cada um commita na sua
-branch. Orquestrador (sessão principal) faz merge na ordem **s7 → s4 (traz
-s3b junto) → s11 → s12**, rodando a suíte completa entre merges, e depois um
-workflow de review adversarial no diff acumulado.
+5 agentes paralelos → 4 merges limpos (`5614d2b`..`e609625`) + 2 achados
+corrigidos na integração: flake SIGSEGV de isolates V8 em threads paralelas
+do harness (guard serial, `42950cc`) e wedge de liveness do
+`advance_retention` com watermark acima do tip (clamp + regressão + guard no
+modelo TLA e TLC re-rodado, `885ef9b`). Suítes: workspace 0 falhas, v8cell
+8/8 rodadas verdes, postgres-it 21+11 verdes. Worktrees e branches de fatia
+removidos.
 
-**Se uma iteração de cron pegar este arquivo com o round em andamento:** NÃO
-iniciar fatia nova. Checar `git branch --list 'v0.7-*'` + task notifications;
-se o workflow ainda roda, só reportar status e encerrar o turno.
+**Round 2 em andamento: review adversarial multi-lente** do diff completo
+`815ed0a..HEAD` (workflow em background). Depois: aplicar achados
+confirmados → S9 → S10.
+
+**Se uma iteração de cron pegar este arquivo com round em andamento:** NÃO
+iniciar fatia nova; checar task notifications; se workflow ainda roda, só
+reportar status e encerrar o turno.
 
 ## Operacional
 
