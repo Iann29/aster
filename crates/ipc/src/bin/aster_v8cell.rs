@@ -110,6 +110,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // actually observed (Variante B), not from prewarm guesses.
         // Additive field; existing consumers keep parsing.
         "consumed_reads": result.consumed_reads,
+        // S9b: the write set born in the cell — `[key, document|null]`
+        // pairs in deterministic BTreeMap order, serialized with exactly
+        // the serde shape of the Commit verb's `writes` field
+        // (`Vec<(DocumentId, Option<Document>)>`, documents in the
+        // capsule `Value` encoding), so a harness can deserialize and
+        // pass it through unchanged. Additive field.
+        "write_set": result.write_set,
     });
     println!("{}", serde_json::to_string(&envelope).unwrap());
     Ok(())

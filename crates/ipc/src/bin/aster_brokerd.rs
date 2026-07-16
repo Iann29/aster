@@ -2028,4 +2028,210 @@ mod pg_commit_e2e {
             }
         );
     }
+
+    /// Session-aware in-process client — the UDS client's session
+    /// discipline in miniature, over `handle_request`: InitialCapsule
+    /// mints and holds the broker session, hydrates present it. Lets a V8
+    /// cell run against the wire dispatch (so its capsules are sealed
+    /// session-BOUND, committable) without a socket.
+    struct SessionWireClient<'a> {
+        broker: &'a ProcessBroker,
+        session: Mutex<Option<SessionBinding>>,
+    }
+
+    impl<'a> SessionWireClient<'a> {
+        fn new(broker: &'a ProcessBroker) -> Self {
+            Self {
+                broker,
+                session: Mutex::new(None),
+            }
+        }
+
+        fn session(&self) -> Option<SessionBinding> {
+            *self.session.lock().expect("session slot")
+        }
+    }
+
+    impl CapsuleBrokerClient for SessionWireClient<'_> {
+        fn initial_capsule(
+            &self,
+            context: &SealContext,
+            tenant: TenantId,
+            deployment: DeploymentId,
+            snapshot_ts: u64,
+            prewarm: Vec<DocumentId>,
+        ) -> Result<SealedCapsule, BrokerError> {
+            match handle_request(
+                self.broker,
+                IpcRequest::InitialCapsule {
+                    context: context.clone(),
+                    tenant,
+                    deployment,
+                    snapshot_ts,
+                    prewarm,
+                },
+            )
+            .0
+            {
+                IpcResponse::InitialCapsule(Ok(grant)) => {
+                    *self.session.lock().expect("session slot") = Some(grant.session);
+                    Ok(grant.capsule)
+                }
+                IpcResponse::InitialCapsule(Err(error)) => {
+                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
+                }
+                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+            }
+        }
+
+        fn hydrate_point(
+            &self,
+            context: &SealContext,
+            capsule: SealedCapsule,
+            key: DocumentId,
+        ) -> Result<SealedCapsule, BrokerError> {
+            match handle_request(
+                self.broker,
+                IpcRequest::HydratePoint {
+                    context: context.clone(),
+                    session: self.session(),
+                    capsule,
+                    key,
+                },
+            )
+            .0
+            {
+                IpcResponse::HydratePoint(Ok(sealed)) => Ok(sealed),
+                IpcResponse::HydratePoint(Err(error)) => {
+                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
+                }
+                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+            }
+        }
+
+        fn hydrate_prefix(
+            &self,
+            context: &SealContext,
+            capsule: SealedCapsule,
+            prefix: String,
+            limit: usize,
+        ) -> Result<SealedCapsule, BrokerError> {
+            match handle_request(
+                self.broker,
+                IpcRequest::HydratePrefix {
+                    context: context.clone(),
+                    session: self.session(),
+                    capsule,
+                    prefix,
+                    limit,
+                },
+            )
+            .0
+            {
+                IpcResponse::HydratePrefix(Ok(sealed)) => Ok(sealed),
+                IpcResponse::HydratePrefix(Err(error)) => {
+                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
+                }
+                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+            }
+        }
+    }
+
+    /// S9b twin against the REAL fence: the write set born in a V8 cell —
+    /// JS reads `docs/spec` (absent at the snapshot, consumed) and inserts
+    /// through the syscall shim — commits through `handle_request` into
+    /// Postgres via `WritePlane`; a second interleaved cell at the same
+    /// snapshot, whose declared absence read was flipped by that commit,
+    /// gets Conflict from the real fence. Both executions finish BEFORE
+    /// either commit, on independent sessions.
+    #[test]
+    fn pg_v8_mutation_write_set_commits_and_interleaved_conflict_aborts() {
+        use aster_v8cell::V8SandboxCell;
+
+        let deployment = fresh_deployment("v8ws");
+        let (broker, plane, epoch) = pg_broker(&deployment);
+        let cell = V8SandboxCell::new(
+            TenantId::new(TENANT),
+            DeploymentId::new(deployment.clone()),
+            8,
+        );
+        let source = |insert_id: &str, n: i64| {
+            format!(
+                r#"
+                async function main() {{
+                  const syscall = async (name, args) =>
+                    JSON.parse(await Convex.asyncSyscall(name, JSON.stringify(args)));
+                  const holder = await syscall("1.0/get", {{ id: "docs/spec" }});
+                  if (holder !== null) return "occupied";
+                  await syscall("1.0/insert", {{
+                    table: "docs",
+                    value: {{ _id: "{insert_id}", n: {n} }},
+                  }});
+                  return "claimed {insert_id}";
+                }}
+            "#
+            )
+        };
+
+        let client_a = SessionWireClient::new(&broker);
+        let client_b = SessionWireClient::new(&broker);
+        let run_a = cell
+            .execute_async_main_with_broker(
+                &client_a,
+                "cell-pg-ws-a",
+                epoch,
+                TenantId::new(TENANT),
+                DeploymentId::new(deployment.clone()),
+                1,
+                Vec::new(),
+                &source("docs/spec", 1),
+            )
+            .expect("cell A runs");
+        let run_b = cell
+            .execute_async_main_with_broker(
+                &client_b,
+                "cell-pg-ws-b",
+                epoch,
+                TenantId::new(TENANT),
+                DeploymentId::new(deployment.clone()),
+                1,
+                Vec::new(),
+                &source("docs/other", 2),
+            )
+            .expect("cell B runs");
+
+        let spec = DocumentId::new("docs/spec");
+        assert_eq!(run_a.output, Value::Text("claimed docs/spec".into()));
+        assert_eq!(run_b.output, Value::Text("claimed docs/other".into()));
+        assert_eq!(run_a.consumed_reads, vec![spec.clone()]);
+        assert_eq!(run_b.consumed_reads, vec![spec.clone()]);
+        assert_eq!(run_a.write_set.len(), 1);
+        assert_eq!(run_a.write_set[0].0, spec);
+        assert_eq!(run_b.write_set[0].0, DocumentId::new("docs/other"));
+
+        let outcome = commit_request(
+            &broker,
+            client_a.session(),
+            run_a.sealed_capsule.expect("A carries the sealed capsule"),
+            run_a.consumed_reads,
+            run_a.write_set,
+        )
+        .expect("commit A through the real fence");
+        assert_eq!(outcome, WireCommitOutcome::Committed { ts: 2 });
+        // The JS-born write is durable in the Postgres log.
+        let written = plane
+            .read_point(TENANT, &deployment, &spec, 2)
+            .expect("read back A's write");
+        assert_eq!(written.version, Some(2));
+
+        let outcome = commit_request(
+            &broker,
+            client_b.session(),
+            run_b.sealed_capsule.expect("B carries the sealed capsule"),
+            run_b.consumed_reads,
+            run_b.write_set,
+        )
+        .expect("fence answers B, structured");
+        assert_eq!(outcome, WireCommitOutcome::Conflict { key: spec });
+    }
 }
