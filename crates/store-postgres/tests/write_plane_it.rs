@@ -285,6 +285,145 @@ fn gc_blocks_on_inflight_fence_and_enforces_coverage() {
     ));
 }
 
+/// Reverse direction of `gc_blocks_on_inflight_fence_and_enforces_coverage`
+/// — the FENCE side of Lemma R's pin (C7). `commit()`'s coverage check
+/// must take `FOR UPDATE` on the `aster.retention` row: a raw
+/// transaction holding that lock must block a real in-flight commit
+/// until it releases. Drop the `FOR UPDATE` from the fence's coverage
+/// SELECT and this test fails — the commit would sail through
+/// mid-"sweep" (the check-then-use race the pin exists to prevent).
+#[test]
+fn fence_blocks_on_retention_lock_holder_until_release() {
+    let plane = Arc::new(fresh_plane());
+    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/seed", 1),
+        CommitOutcome::Committed { .. }
+    ));
+    let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let done = Arc::new(AtomicBool::new(false));
+    runtime.block_on(async {
+        let (mut client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+            .await
+            .expect("raw connect");
+        tokio::spawn(connection);
+        let tx = client.transaction().await.expect("begin");
+        tx.query_one(
+            "SELECT low_watermark FROM aster.retention
+             WHERE tenant = $1 AND deployment = $2 FOR UPDATE",
+            &[&TENANT, &DEPLOYMENT],
+        )
+        .await
+        .expect("hold retention row lock");
+
+        let committer = {
+            let plane = Arc::clone(&plane);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let outcome = plane
+                    .commit(&FenceInput {
+                        tenant: TENANT,
+                        deployment: DEPLOYMENT,
+                        committer_epoch: epoch,
+                        context_epoch: epoch,
+                        snapshot: s,
+                        read_points: &[],
+                        read_windows: &[],
+                        writes: &[put("docs/pinned", 2)],
+                    })
+                    .expect("commit");
+                done.store(true, Ordering::SeqCst);
+                outcome
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "fence committed while a raw transaction held the retention row \
+             lock — the coverage SELECT lost its FOR UPDATE"
+        );
+        tx.commit().await.expect("release retention lock");
+        let outcome = committer.join().expect("join committer");
+        assert!(done.load(Ordering::SeqCst));
+        assert!(
+            matches!(outcome, CommitOutcome::Committed { .. }),
+            "expected Committed once the pin released, got {outcome:?}"
+        );
+    });
+}
+
+/// C2: a committer that stops mid-fence (SIGSTOP, partition) leaves its
+/// session idle-in-transaction while holding the lease row lock.
+/// statement_timeout never fires on an idle session, so without the
+/// idle-in-transaction bound every later acquire_lease/commit/GC blocks
+/// until TCP gives up (~2h11m; forever under SIGSTOP). The raw session
+/// below simulates that wedged committer: it is stamped with the same
+/// sub-second `idle_in_transaction_session_timeout` that
+/// `WritePlane::client()` applies to every checkout (that wiring is
+/// pinned by `write_plane::pg_it::client_checkout_stamps_statement_and_
+/// idle_timeouts`), takes the lease row lock, then goes idle. Postgres
+/// must kill it and roll its locks back so failover and commits resume
+/// within a bounded wait.
+#[test]
+fn idle_wedged_lock_holder_is_killed_so_failover_resumes() {
+    let plane = fresh_plane();
+    let epoch_a = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-a").expect("acquire a");
+    assert!(matches!(
+        commit_blind(&plane, epoch_a, 0, "docs/w", 1),
+        CommitOutcome::Committed { .. }
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    // Keep the client (and its socket) alive across the failover attempt
+    // — dropping it would roll the transaction back and release the lock
+    // for the wrong reason.
+    let wedged_client = runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+            .await
+            .expect("wedge connect");
+        tokio::spawn(connection);
+        client
+            .batch_execute(&format!(
+                "SET idle_in_transaction_session_timeout = 500;
+                 BEGIN;
+                 SELECT epoch FROM aster.lease
+                  WHERE tenant = '{TENANT}' AND deployment = '{DEPLOYMENT}' FOR UPDATE"
+            ))
+            .await
+            .expect("wedge: lock the lease row");
+        client
+    });
+
+    // Failover: the UPDATE blocks on the wedged session's row lock until
+    // the idle killer fires (~500ms). Margins are generous to stay
+    // flake-free; before the fix this hung unboundedly.
+    let started = std::time::Instant::now();
+    let epoch_b = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-b")
+        .expect("failover acquire");
+    let waited = started.elapsed();
+    assert_eq!(epoch_b, epoch_a + 1);
+    assert!(
+        waited < Duration::from_secs(20),
+        "failover took {waited:?} — the idle-in-transaction kill did not fire"
+    );
+
+    // Commits resume under the new epoch.
+    assert!(matches!(
+        commit_blind(&plane, epoch_b, 1, "docs/after", 2),
+        CommitOutcome::Committed { .. }
+    ));
+    drop(wedged_client);
+}
+
 #[test]
 fn replay_commits_as_a_second_transaction() {
     let plane = fresh_plane();
@@ -416,6 +555,57 @@ fn absence_and_tombstone_reads_conflict_on_later_writes() {
     );
 }
 
+/// The other half of the `Changed({k}; (s,h])` predicate (R5): a
+/// tombstone WRITE is a write event too. A fence that declared a point
+/// read of a key present at `s` must abort when a DELETE of that key
+/// (document = NULL) committed in `(s, h]` — the conflict scan matches
+/// log events regardless of live-vs-tombstone payload.
+#[test]
+fn tombstone_write_in_window_conflicts_with_point_read() {
+    let plane = fresh_plane();
+    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/t", 1),
+        CommitOutcome::Committed { .. }
+    ));
+    let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
+
+    // Interfering DELETE of the key the reader observed, inside (s, h].
+    let deleted = plane
+        .commit(&FenceInput {
+            tenant: TENANT,
+            deployment: DEPLOYMENT,
+            committer_epoch: epoch,
+            context_epoch: epoch,
+            snapshot: s,
+            read_points: &[],
+            read_windows: &[],
+            writes: &[(DocumentId::new("docs/t"), None)],
+        })
+        .expect("delete");
+    assert!(matches!(deleted, CommitOutcome::Committed { .. }));
+
+    // The reader's fence: its point read of docs/t at s is stale now.
+    let outcome = plane
+        .commit(&FenceInput {
+            tenant: TENANT,
+            deployment: DEPLOYMENT,
+            committer_epoch: epoch,
+            context_epoch: epoch,
+            snapshot: s,
+            read_points: &[DocumentId::new("docs/t")],
+            read_windows: &[],
+            writes: &[put("docs/dependent", 1)],
+        })
+        .expect("reader fence");
+    assert_eq!(
+        outcome,
+        CommitOutcome::Conflict {
+            key: DocumentId::new("docs/t")
+        }
+    );
+}
+
 #[test]
 fn read_point_and_live_prefix_scan_follow_mvcc_semantics() {
     let plane = fresh_plane();
@@ -472,10 +662,21 @@ fn read_point_and_live_prefix_scan_follow_mvcc_semantics() {
     assert!(rows.is_empty(), "LIKE wildcard must be escaped: {rows:?}");
 }
 
+/// Committers drive commits from worker threads (see
+/// `concurrent_write_skew_pair_commits_exactly_once`), so the fence
+/// input types must be `Send + Sync` — asserted at COMPILE time here,
+/// which is what this test's previous name
+/// (`observed_window_types_are_reusable_across_threads`) claimed but
+/// never exercised (R7). The window assertions keep the
+/// certificate→window semantics visible at the same site.
 #[test]
-fn observed_window_types_are_reusable_across_threads() {
-    // Compile-time style check that ObservedWindow (built from a
-    // certificate) crosses the FenceInput boundary naturally.
+fn fence_input_types_are_send_sync_and_window_matches_boundary() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ObservedWindow>();
+    assert_send_sync::<FenceInput<'static>>();
+    assert_send_sync::<CommitOutcome>();
+    assert_send_sync::<WritePlane>();
+
     let cert = RangeCertificate {
         interval: KeyInterval::Prefix("docs/".into()),
         direction: ScanDirection::Ascending,

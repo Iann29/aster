@@ -330,6 +330,130 @@ fn scan_prefix_skips_tombstones_without_consuming_limit() {
     assert!(entries_before[0].0 .0.contains(ID_IAN_HEX));
 }
 
+/// Stamp the document-retention floor the way Convex's vacuum would —
+/// `persistence_globals['min_document_snapshot_ts']` (gotcha #10).
+fn set_min_document_snapshot_ts(value: i64) {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("ad-hoc runtime for retention floor");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&url(), NoTls)
+            .await
+            .expect("connect for retention floor");
+        let handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {TEST_SCHEMA}.persistence_globals (key, json_value) \
+                     VALUES ('min_document_snapshot_ts', convert_to($1, 'UTF8')) \
+                     ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value"
+                ),
+                &[&value.to_string()],
+            )
+            .await
+            .expect("upsert retention floor");
+        drop(client);
+        handle.abort();
+    });
+}
+
+/// A pinned snapshot below the retention floor must fail loudly with
+/// `Stale` — the rows it would see are half-vacuumed history, and a
+/// "missing" answer there would become false sealed absence evidence.
+#[test]
+fn read_point_below_retention_floor_returns_stale() {
+    reset_fixture(&url());
+    set_min_document_snapshot_ts(150);
+    let store = make_store();
+    let key = DocumentId::new(format!("{TEST_TABLE_ID_HEX}/{ID_IAN_HEX}"));
+
+    match store.read_point(&key, 100) {
+        Err(StoreError::Stale { requested, latest }) => {
+            assert_eq!(requested, 100);
+            assert_eq!(latest, 150, "latest must carry the floor");
+        }
+        other => panic!("expected Stale below the floor, got {other:?}"),
+    }
+
+    // At/above the floor reads stay normal — the visible revision's own
+    // ts may sit below the floor (retention bounds snapshots, not
+    // revision ages).
+    let value = store.read_point(&key, 150).expect("at-floor read");
+    assert_eq!(value.version, Some(100));
+    let value = store.read_point(&key, 200).expect("above-floor read");
+    assert_eq!(value.version, Some(100));
+}
+
+/// Same gate on the scan path: an Exhausted certificate minted below
+/// the floor would falsely attest absence for vacuumed keys.
+#[test]
+fn scan_prefix_below_retention_floor_returns_stale() {
+    reset_fixture(&url());
+    set_min_document_snapshot_ts(150);
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    match store.scan_prefix(&prefix, 100, 100) {
+        Err(StoreError::Stale { requested, latest }) => {
+            assert_eq!(requested, 100);
+            assert_eq!(latest, 150);
+        }
+        other => panic!("expected Stale below the floor, got {other:?}"),
+    }
+
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 200).expect("above-floor scan");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 2);
+}
+
+/// Missing floor key (fixtures/fresh deployments) means floor 0 — reads
+/// at any snapshot behave normally; a low floor is equally harmless.
+#[test]
+fn reads_with_absent_or_low_retention_floor_behave_normally() {
+    reset_fixture(&url()); // seed.sql sets no min_document_snapshot_ts
+    let store = make_store();
+    let key = DocumentId::new(format!("{TEST_TABLE_ID_HEX}/{ID_IAN_HEX}"));
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    let value = store.read_point(&key, 50).expect("absent floor read");
+    assert!(value.version.is_none(), "pre-insert snapshot is missing, not Stale");
+
+    set_min_document_snapshot_ts(50);
+    let value = store.read_point(&key, 100).expect("low-floor read");
+    assert_eq!(value.version, Some(100));
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 150).expect("low-floor scan");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 1, "ts=150 sees only the first insert");
+}
+
+/// `decode_hex` accepts uppercase hex but keys re-encode lowercase —
+/// the certificate interval must be canonicalized to the same form, or
+/// every returned key fails `interval.contains` and the broker seals a
+/// structurally invalid capsule (KeyOutsideInterval at verify time).
+#[test]
+fn scan_prefix_with_uppercase_prefix_yields_canonical_valid_certificate() {
+    reset_fixture(&url());
+    let store = make_store();
+    let upper = format!("{}/", TEST_TABLE_ID_HEX.to_uppercase());
+    let lower = format!("{TEST_TABLE_ID_HEX}/");
+
+    let (cert, entries) = store.scan_prefix(&upper, 100, 200).expect("uppercase scan");
+    assert_eq!(entries.len(), 2, "same rows as the lowercase form");
+    cert.validate()
+        .expect("uppercase prefix must still yield a structurally valid certificate");
+    assert_eq!(
+        cert.interval,
+        KeyInterval::Prefix(lower.clone()),
+        "interval must be the canonical lowercase wire form"
+    );
+    for (id, _) in &entries {
+        assert!(id.0.starts_with(&lower), "keys are lowercase: {id:?}");
+    }
+}
+
 #[test]
 fn scan_prefix_rejects_zero_limit() {
     reset_fixture(&url());
