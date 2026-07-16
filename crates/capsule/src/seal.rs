@@ -14,9 +14,8 @@
 //! canonical digest is still computed and carried in the seal, but only as
 //! an audit/tooling convenience — it is not a MAC input.
 
-use crate::{
-    DeploymentId, Document, DocumentId, SnapshotCapsule, TenantId, Value, VersionedDocument,
-};
+use crate::canon::{encode_capsule_bytes, put_bytes, put_str, put_u64};
+use crate::SnapshotCapsule;
 use serde::{Deserialize, Serialize};
 
 const ASTER_SEAL_ALG: &str = "aster-blake3-keyed-v2";
@@ -184,94 +183,12 @@ fn seal_mac(encoded_capsule: &[u8], key: &CapsuleSealKey, context: &SealContext)
     *blake3::keyed_hash(key.bytes(), &msg).as_bytes()
 }
 
-pub fn encode_capsule_bytes(capsule: &SnapshotCapsule) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"aster-capsule-v2\0");
-    put_identity(&mut out, &capsule.tenant, &capsule.deployment, capsule.ts);
-    put_u64(&mut out, capsule.docs.len() as u64);
-    for (key, value) in &capsule.docs {
-        put_document_id(&mut out, key);
-        put_versioned_document(&mut out, value);
-    }
-    out
-}
-
-fn put_identity(out: &mut Vec<u8>, tenant: &TenantId, deployment: &DeploymentId, ts: u64) {
-    put_str(out, &tenant.0);
-    put_str(out, &deployment.0);
-    put_u64(out, ts);
-}
-
-fn put_document_id(out: &mut Vec<u8>, key: &DocumentId) {
-    put_str(out, &key.0);
-}
-
-fn put_versioned_document(out: &mut Vec<u8>, value: &VersionedDocument) {
-    match value.version {
-        Some(version) => {
-            out.push(1);
-            put_u64(out, version);
-        }
-        None => {
-            out.push(0);
-        }
-    }
-    match &value.document {
-        Some(document) => {
-            out.push(1);
-            put_document(out, document);
-        }
-        None => {
-            out.push(0);
-        }
-    }
-}
-
-fn put_document(out: &mut Vec<u8>, document: &Document) {
-    put_u64(out, document.len() as u64);
-    for (field, value) in document {
-        put_str(out, field);
-        put_value(out, value);
-    }
-}
-
-fn put_value(out: &mut Vec<u8>, value: &Value) {
-    match value {
-        Value::Int(value) => {
-            out.push(b'i');
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Value::Text(value) => {
-            out.push(b's');
-            put_str(out, value);
-        }
-        Value::Bool(value) => {
-            out.push(b'b');
-            out.push(u8::from(*value));
-        }
-        Value::Null => {
-            out.push(b'n');
-        }
-    }
-}
-
-fn put_str(out: &mut Vec<u8>, value: &str) {
-    put_bytes(out, value.as_bytes());
-}
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_u64(out, bytes.len() as u64);
-    out.extend_from_slice(bytes);
-}
-
-fn put_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{doc_with_i64, MvccStore};
+    use crate::{
+        doc_with_i64, DeploymentId, DocumentId, MvccStore, TenantId, VersionedDocument,
+    };
 
     fn sealed_fixture() -> (SealedCapsule, CapsuleSealKey, SealContext) {
         let store = MvccStore::new();
