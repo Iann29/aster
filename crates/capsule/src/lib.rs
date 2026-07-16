@@ -22,6 +22,7 @@ pub mod seal;
 pub use canon::{decode_capsule_bytes, encode_capsule_bytes, DecodeError};
 pub use seal::{
     capsule_digest, CapsuleSeal, CapsuleSealKey, SealContext, SealError, SealedCapsule,
+    SessionBinding,
 };
 
 use serde::{Deserialize, Serialize};

@@ -16,6 +16,12 @@ base64 = "0.22"
 # would force per-target builds and double the docker/smoke surface.
 # Dead-code elim removes the unused symbols from aster_v8cell at link.
 aster-store-postgres = { path = "../store-postgres" }
+# Session ids (C-CHANNEL) are minted from OS entropy in the brokerd binary.
+# getrandom is the standard thin wrapper over getrandom(2)/equivalents and
+# is already in the workspace's dependency tree; never mint sessions from
+# time or constant seeds. Linked into the cell binary too but unused there
+# (same dead-code-elim note as aster-store-postgres above).
+getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Convex emits per-source-package bundles as ZIP archives (one entry

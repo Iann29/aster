@@ -53,8 +53,9 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
     assert!(stdout.contains("\"traps\":1"), "stdout={stdout}");
 
     // Attack simulation from the host test: get a capsule legitimately for
-    // cell-a, then present it under cell-b over the real socket. The broker
-    // process must reject the stale/wrong-cell capability before hydrating.
+    // cell-a, then present it under cell-b over the real socket — on
+    // cell-a's own session. The broker must reject the relabelled context
+    // at the session table (C-CHANNEL), before the seal is even consulted.
     let client = UdsCapsuleBrokerClient::new(socket.clone());
     let tenant = TenantId::new("tenant-proc");
     let deployment = DeploymentId::new("dep-proc");
@@ -67,21 +68,131 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
             Vec::new(),
         )
         .expect("initial capsule through UDS");
+    let session = client.session().expect("client holds the granted session");
     let response = client
         .raw_call(IpcRequest::HydratePoint {
             context: SealContext::new("cell-b", 7),
+            session: Some(session),
             capsule: sealed,
             key: DocumentId::new("counters/b"),
         })
         .expect("raw hydrate response");
     match response {
         IpcResponse::HydratePoint(Err(error)) => {
-            assert!(
-                error.message.contains("different cell") || error.code.contains("WrongCell"),
-                "unexpected error: {error:?}"
-            );
+            assert_eq!(error.code, "session_context_mismatch", "got {error:?}");
         }
         other => panic!("wrong-cell hydrate should fail, got {other:?}"),
+    }
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+/// The C-CHANNEL repair end-to-end over the real socket: the happy path is
+/// green with the broker-minted session, and every channel violation the
+/// theorem names is rejected — unbound hydrates, unknown session ids, and
+/// capsules transplanted across sessions of the same cell_id (the
+/// re-spawned-cell replay).
+#[test]
+fn session_binding_gates_wire_hydrates() {
+    let temp = TempDir::new("aster-ipc-session");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-sess", 7);
+    let sealed = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            2,
+            Vec::new(),
+        )
+        .expect("initial capsule through UDS");
+    let session_a = client.session().expect("session held after initial");
+
+    // Full bound roundtrip: initial + point + prefix through the client,
+    // which presents the held session on every verb.
+    let sealed_after_point = client
+        .hydrate_point(&context, sealed.clone(), DocumentId::new("counters/a"))
+        .expect("bound point hydrate");
+    let sealed_after_prefix = client
+        .hydrate_prefix(&context, sealed_after_point, "counters/".to_string(), 2)
+        .expect("bound prefix hydrate");
+    assert_eq!(sealed_after_prefix.capsule().ranges.len(), 1);
+    let value = sealed_after_prefix
+        .capsule()
+        .get(&DocumentId::new("counters/a"))
+        .and_then(|doc| doc.document.as_ref())
+        .and_then(|doc| doc.get("value"));
+    assert_eq!(value, Some(&aster_capsule::Value::Int(20)));
+
+    // Unbound wire hydrate: session omitted entirely. Rejected before any
+    // seal or store work.
+    let response = client
+        .raw_call(IpcRequest::HydratePoint {
+            context: context.clone(),
+            session: None,
+            capsule: sealed.clone(),
+            key: DocumentId::new("counters/b"),
+        })
+        .expect("raw unbound response");
+    match response {
+        IpcResponse::HydratePoint(Err(error)) => {
+            assert_eq!(error.code, "session_required", "got {error:?}");
+        }
+        other => panic!("unbound hydrate should fail, got {other:?}"),
+    }
+
+    // Fabricated session id: unguessable table key, so a made-up id is
+    // simply unknown.
+    let response = client
+        .raw_call(IpcRequest::HydratePoint {
+            context: context.clone(),
+            session: Some(aster_capsule::SessionBinding::from_bytes([0x42; 32])),
+            capsule: sealed.clone(),
+            key: DocumentId::new("counters/b"),
+        })
+        .expect("raw unknown-session response");
+    match response {
+        IpcResponse::HydratePoint(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("unknown-session hydrate should fail, got {other:?}"),
+    }
+
+    // Re-spawned cell: a SECOND session for the identical cell_id/epoch.
+    // The session-A capsule presented on session B passes the public
+    // context checks and must die in the seal MAC (WrongSession).
+    let _sealed_b = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            2,
+            Vec::new(),
+        )
+        .expect("second initial capsule");
+    let session_b = client.session().expect("session held after re-initial");
+    assert_ne!(session_a, session_b, "each grant mints a fresh session");
+    let response = client
+        .raw_call(IpcRequest::HydratePoint {
+            context: context.clone(),
+            session: Some(session_b),
+            capsule: sealed,
+            key: DocumentId::new("counters/b"),
+        })
+        .expect("raw cross-session response");
+    match response {
+        IpcResponse::HydratePoint(Err(error)) => {
+            assert!(
+                error.code.contains("WrongSession"),
+                "expected seal-level wrong-session rejection, got {error:?}"
+            );
+        }
+        other => panic!("cross-session capsule should fail, got {other:?}"),
     }
 
     client.shutdown().expect("shutdown broker");
@@ -141,6 +252,7 @@ fn prefix_hydrate_over_uds_carries_certificate() {
     let response = client
         .raw_call(IpcRequest::HydratePrefix {
             context: context.clone(),
+            session: client.session(),
             capsule: sealed.clone(),
             prefix: "counters/".to_string(),
             limit: 0,
