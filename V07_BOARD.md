@@ -17,8 +17,8 @@ merged.
 | S6 | Commit fence transacional (1 tx Postgres: lease FOR UPDATE + tip + conflict scan + append) | ✅ | `c615bd9` + 13 testes `write_plane_it` |
 | S7 | Variante B runtime honesto: consumption tracking (`V8ExecutionResult.consumed_reads`) + warm-hit no `1.0/get` (bench bug b, F7) | ✅ | `b40b4e5` |
 | S8 | Broker não se auto-esgota (lifetime budget removido — bench bug a) | ✅ | `b8fce68` |
-| S9 | Commit verb IPC: capsule + consumo declarado + write set → fence. Fecha o loop cell→commit. Inclui época REAL vinda da lease authority no lugar da auto-declarada | ⬜ próxima (depois do merge do round) | |
-| S10 | Bench do write path — EQ3/EQ4 MEDIDOS (gate do paper de sistemas) | ⬜ depende de S9 | `paper/sources/aster-bench.sh` como base |
+| S9 | Commit verb IPC + mutation syscalls — loop cell→broker→fence FECHADO. S9a: verbos Commit/Abort (Variante B: declared ⊆ capsule, B-SUBSET), CommitFence trait (MemoryFence twin + teste de paridade com WritePlane), sessão fecha no commit/abort, **época da lease authority no boot em modo Postgres** (obrigação C-CHANNEL #2 morta; ASTER_LEASE_EPOCH só stand-in de memory mode), consumed_reads no envelope. S9b: insert/patch/replace/delete no V8 com write set nascendo na célula, read-your-own-writes sem trap, existência upstream-parity, e2e JS→fence real (pg_v8_mutation_write_set_commits_and_interleaved_conflict_aborts) | ✅ | merge `6a00150` (85ab52f, bc59933, b82da6d) |
+| S10 | Bench do write path — EQ3/EQ4 MEDIDOS (gate do paper de sistemas) + re-run read bench pós-warm-hit + fence isolado + curva reseal EQ2 | 🔄 em andamento | `paper/sources/aster-bench.sh` como base |
 | S11 | TLA+ do fence/GC/failover com TLC rodado de verdade (F8 — junta mais fraca): positivo 14,8M estados / 6 invariantes OK; negativos F1-reuse→I3 e no-pin→I2 violam como previsto | ✅ | `656bc91` + addendum `885ef9b` |
 | S12 | Paper "Authenticate the Reads, Not the Code" — Ian Lucas Beé, draft 9.588 palavras + CLAIMS.md | ✅ draft (reconciliação pós-merge no review) | `cb8c630` |
 
@@ -85,6 +85,8 @@ reportar status e encerrar o turno.
 - Suíte: `cargo test --workspace --exclude aster-v8cell` (v8cell à parte: `cargo test -p aster-v8cell`).
 - Write plane (Postgres real): container `aster-pg-dev` na `:5433` —
   `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test -p aster-store-postgres --features postgres-it --test write_plane_it -- --test-threads=1`
+- Lane gated do brokerd (fence e2e via handle_request):
+  `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test -p aster-ipc --features postgres-it -- --test-threads=1`
 - Worktrees compartilham cache: `export CARGO_TARGET_DIR=/home/ian/Documents/amage/aster/target`.
 - Cron do loop: 15min, id `5ce96300`.
 - Fontes do paper/teorema: `paper/sources/` (teorema completo em `ctt.txt`,
