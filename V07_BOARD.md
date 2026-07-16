@@ -48,12 +48,32 @@ dessincronizado (C13). 8 sem verificação (limite de sessão): R0/R2/R5/R7
 plausíveis → verificar-e-corrigir no round 3; R1/R3/R6 duplicatas de
 confirmados; R4 = escopo S9 aceito. Overflow U2/U3/U4 = paper minors.
 
-**Round 3 EM ANDAMENTO (wf_fd6697e3-e31):** 3 agentes em worktrees —
-A) store-postgres: C2+C3+C7+R0+R2+R5+R7 (único usando aster-pg-dev);
-B) ipc/seal/broker: C4+C6+C8; C) paper: reconciliação completa
-(C0/C1/C5/C9-C15 + U2/U3/U4). Merge: A,B,C (paths disjuntos) + re-stamp
-dos counts do paper pós-merge (agentes A/B adicionam testes). Depois:
-S9 → S10 → re-referee externo (GPT) com errata.
+**Round 3 CONCLUÍDO (16/07 ~09:30, merges `b10d415`+`cca2ebe`+`311564a`+
+re-stamp `558eaa5`):** TODOS os 16 confirmados aplicados e os 4 não-verificados
+(R0/R2/R5/R7) se provaram REAIS e foram corrigidos — zero refutados.
+Código: write plane ganhou `idle_in_transaction_session_timeout` (knob no
+config) + TCP keepalives (C2), guard do retention floor upstream
+(`min_document_snapshot_ts` → `StoreError::Stale`, checado PÓS-query —
+floor monotônico — pra não correr com vacuum concorrente) (C3), conversões
+i64 checadas (R0), prefixo normalizado lowercase no certificate (R2);
+brokerd contém erro por-conexão (EPIPE/FrameTooLarge → log/erro estruturado
+`response_too_large`, broker sobrevive) (C4). Testes novos matam as mutações
+que o review provou passarem: session-bytes-no-MAC (C6), scan-at-capsule.ts
+(C8), pin Lemma R bidirecional (C7), tombstone-write-vs-read (R5), wedge de
+idle resolvendo failover (C2), Send/Sync real (R7). Paper: seal v1→v2→v3
+história honesta, C-CHANNEL rebaixado pra mecanismo real + obrigações
+nomeadas, contagens re-medidas e re-carimbadas pós-merge (14,4k LOC / 217
+testes / 14 provas do fence), CLAIMS.md reconciliado + linha do addendum
+TLC. Suítes no HEAD: workspace 23 suítes ok, v8cell ok, postgres-it
+33+25+14 ok.
+
+**Próximo: S9 (commit verb IPC)** — fecha célula→broker→fence: capsule +
+`consumed_reads` (Variante B) + write set no wire; sessões fecham no
+commit/abort; época REAL da lease authority no read path (mata a obrigação
+C-CHANNEL restante #2); considerar launch-token pro mint (obrigação #1).
+Depois **S10 (bench write path)**: re-run read bench pós-fixes (warm-hit),
+fence isolado, fim-a-fim, curva de reseal EQ2. Depois: re-referee externo
+(GPT) com errata teorema↔código.
 
 **Se uma iteração de cron pegar este arquivo com round em andamento:** NÃO
 iniciar fatia nova; checar task notifications; se workflow ainda roda, só
