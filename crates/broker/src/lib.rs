@@ -284,6 +284,85 @@ mod tests {
         assert_eq!(sealed.capsule().ranges[1].stop, ScanStop::Exhausted);
     }
 
+    /// Certificates are evidence about the capsule snapshot: a prefix
+    /// hydrate on a capsule issued at `ts` must scan at `ts` even after
+    /// the store head has advanced (trait contract on `hydrate_prefix`).
+    /// A mutant that scans at `store.snapshot_ts()` leaks docs/b into the
+    /// certificate and the capsule.
+    #[test]
+    fn broker_hydrate_prefix_scans_at_capsule_ts_not_store_head() {
+        use aster_capsule::ScanStop;
+
+        let store = MvccStore::new();
+        let tenant = TenantId::new("tenant-broker");
+        let deployment = DeploymentId::new("dep-broker");
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        let ts = store.snapshot_ts();
+        let broker = LocalCapsuleBroker::new(
+            &store,
+            CapsuleSealKey::derive_for_tests(b"broker-unit-test"),
+        );
+        let context = SealContext::new("cell-1", 9);
+        let sealed = broker
+            .initial_capsule(&context, tenant, deployment, ts, Vec::new())
+            .expect("initial capsule");
+
+        // Head advances past the capsule's snapshot.
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        assert!(store.snapshot_ts() > ts, "head must advance");
+
+        let sealed = broker
+            .hydrate_prefix(&context, sealed, "docs/".to_string(), 10)
+            .expect("hydrate prefix");
+        let capsule = sealed.capsule();
+        assert_eq!(capsule.ranges.len(), 1);
+        let certificate = &capsule.ranges[0];
+        assert_eq!(certificate.keys, vec![DocumentId::new("docs/a")]);
+        // docs/b is invisible at ts, so the scan ran out of the prefix
+        // without filling the limit.
+        assert_eq!(certificate.stop, ScanStop::Exhausted);
+        assert!(
+            capsule.get(&DocumentId::new("docs/b")).is_none(),
+            "post-snapshot key must not hydrate into the capsule"
+        );
+    }
+
+    /// Point hydrates resolve at the capsule snapshot too: a second
+    /// revision committed after issuance stays invisible — the capsule
+    /// carries the ts-time version, never the head version.
+    #[test]
+    fn broker_hydrate_point_reads_at_capsule_ts_not_store_head() {
+        let store = MvccStore::new();
+        let tenant = TenantId::new("tenant-broker");
+        let deployment = DeploymentId::new("dep-broker");
+        let key = DocumentId::new("docs/1");
+        store.seed(key.clone(), doc_with_i64("value", 1));
+        let ts = store.snapshot_ts();
+        let broker = LocalCapsuleBroker::new(
+            &store,
+            CapsuleSealKey::derive_for_tests(b"broker-unit-test"),
+        );
+        let context = SealContext::new("cell-1", 9);
+        let sealed = broker
+            .initial_capsule(&context, tenant, deployment, ts, Vec::new())
+            .expect("initial capsule");
+
+        // A second revision of the same key lands after issuance.
+        store.seed(key.clone(), doc_with_i64("value", 99));
+
+        let sealed = broker
+            .hydrate_point(&context, sealed, key.clone())
+            .expect("hydrate point");
+        let hydrated = sealed.capsule().get(&key).expect("key hydrated");
+        assert_eq!(
+            hydrated.version,
+            Some(ts),
+            "capsule must carry the ts-time version, not the head version"
+        );
+        let value = hydrated.document.as_ref().and_then(|doc| doc.get("value"));
+        assert_eq!(value, Some(&Value::Int(1)));
+    }
+
     #[test]
     fn broker_rejects_wrong_cell_seal_on_hydrate_prefix() {
         let store = MvccStore::new();

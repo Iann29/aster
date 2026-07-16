@@ -399,6 +399,30 @@ mod tests {
         );
     }
 
+    /// The session bytes are a MAC input, not only a seal-field claim.
+    /// `sealed_capsule_rejects_wrong_session` above stops at the friendly
+    /// ct_eq pre-check on the attacker-mutable `seal.session` field; here
+    /// the attacker rewrites that claim to the session it verifies against
+    /// (so the pre-check passes, B == B) and must still die at the MAC,
+    /// which was keyed over session A. Kills the mutant that drops
+    /// `session.as_bytes()` from `seal_mac`.
+    #[test]
+    fn sealed_capsule_rejects_rewritten_session_binding() {
+        let seal_key = CapsuleSealKey::derive_for_tests(b"unit-test-key");
+        let session_a = SessionBinding::from_bytes([0xaa; 32]);
+        let session_b = SessionBinding::from_bytes([0xbb; 32]);
+        let mut sealed = SealedCapsule::new(
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 1),
+            &seal_key,
+            &SealContext::bound("cell-a", 11, session_a),
+        );
+        sealed.seal_mut_for_test().session = Some(session_b);
+        assert_eq!(
+            sealed.verify(&seal_key, &SealContext::bound("cell-a", 11, session_b)),
+            Err(SealError::MacMismatch)
+        );
+    }
+
     /// Bound and Unbound must reject each other in both directions: a
     /// capsule sealed for a wire session never verifies in an unbound
     /// context, and an in-process unbound capsule never verifies on a

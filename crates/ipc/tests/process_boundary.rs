@@ -1,11 +1,12 @@
 use std::fs;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aster_broker::CapsuleBrokerClient;
+use aster_broker::{BrokerError, CapsuleBrokerClient};
 use aster_capsule::{DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId};
-use aster_ipc::{IpcRequest, IpcResponse, UdsCapsuleBrokerClient};
+use aster_ipc::{write_frame, IpcRequest, IpcResponse, UdsCapsuleBrokerClient};
 
 #[test]
 fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
@@ -298,17 +299,175 @@ fn broker_outlives_many_sequential_connections() {
     assert!(broker.wait().expect("broker wait").success());
 }
 
+/// One bad client must never kill the broker — and with it the in-process
+/// session table every other live cell depends on. Two hostile shapes,
+/// several times each: a peer that sends a valid request and hangs up
+/// without reading (the broker's response write hits EPIPE — Rust ignores
+/// SIGPIPE), and a peer that connects and sends nothing (read fails, and
+/// the bad_request reply lands on the same closed peer). Before C4 either
+/// one `?`-propagated out of the accept loop and exited the process.
+#[test]
+fn broker_survives_clients_that_close_before_reading() {
+    let temp = TempDir::new("aster-ipc-epipe");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    for _ in 0..4 {
+        // Valid request, immediate close: the broker still has to read and
+        // handle before it writes, so our close wins the race and its
+        // response write meets a hung-up peer.
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        write_frame(
+            &mut stream,
+            &IpcRequest::InitialCapsule {
+                context: SealContext::new("cell-epipe", 7),
+                tenant: TenantId::new("tenant-proc"),
+                deployment: DeploymentId::new("dep-proc"),
+                snapshot_ts: 2,
+                prewarm: Vec::new(),
+            },
+        )
+        .expect("write doomed request");
+        drop(stream);
+
+        // No bytes at all: the broker's read_frame errors out.
+        let stream = UnixStream::connect(&socket).expect("connect");
+        drop(stream);
+    }
+
+    // The broker outlived every hostile connection and still serves a
+    // normal grant + hydrate roundtrip.
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-after", 7);
+    let sealed = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            2,
+            Vec::new(),
+        )
+        .expect("initial capsule after hostile clients");
+    let sealed = client
+        .hydrate_point(&context, sealed, DocumentId::new("counters/a"))
+        .expect("hydrate after hostile clients");
+    let value = sealed
+        .capsule()
+        .get(&DocumentId::new("counters/a"))
+        .and_then(|doc| doc.document.as_ref())
+        .and_then(|doc| doc.get("value"));
+    assert_eq!(value, Some(&aster_capsule::Value::Int(20)));
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+/// A hydrate whose RESPONSE outgrows the 1 MiB frame cap must come back as
+/// a structured `response_too_large` error — with the broker still alive —
+/// never a dead socket (before C4 the broker exited on it, wiping every
+/// session).
+///
+/// Growth engine: every hydrate_prefix appends a full RangeCertificate
+/// (all matched keys) to the capsule, so re-hydrating the same prefix
+/// grows it by ~one certificate (~100 KiB here) per round. The request
+/// always carries one certificate fewer than the response it produces, so
+/// the response crosses the cap strictly first — the loop below cannot
+/// die on a client-side FrameTooLarge.
+#[test]
+fn oversized_response_returns_structured_error_and_broker_survives() {
+    let temp = TempDir::new("aster-ipc-toolarge");
+    let socket = temp.path().join("broker.sock");
+    let count = 200_usize;
+    let seed = big_prefix_seed("bulk/", count, 500);
+    let mut broker = spawn_broker_with_seed(&socket, &seed);
+    wait_for_socket(&socket);
+
+    // Unset ASTER_SNAPSHOT_TS makes brokerd pin the post-seed store head:
+    // one ts per seeded doc.
+    let snapshot_ts = count as u64;
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-big", 7);
+    let mut sealed = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            snapshot_ts,
+            Vec::new(),
+        )
+        .expect("initial capsule");
+
+    let mut rounds = 0_usize;
+    let error = loop {
+        rounds += 1;
+        assert!(rounds <= 32, "response never crossed the frame cap");
+        match client.hydrate_prefix(&context, sealed.clone(), "bulk/".to_string(), count) {
+            Ok(next) => sealed = next,
+            Err(error) => break error,
+        }
+    };
+    match &error {
+        BrokerError::Remote(message) => assert!(
+            message.starts_with("response_too_large"),
+            "expected response_too_large, got {message:?}"
+        ),
+        other => panic!("expected remote response_too_large error, got {other:?}"),
+    }
+
+    // The broker survived the oversized response and still serves small
+    // hydrates on a fresh grant.
+    let context = SealContext::new("cell-small", 7);
+    let sealed = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            snapshot_ts,
+            Vec::new(),
+        )
+        .expect("initial capsule after oversized response");
+    let sealed = client
+        .hydrate_prefix(&context, sealed, "bulk/".to_string(), 1)
+        .expect("small hydrate after oversized response");
+    assert_eq!(sealed.capsule().ranges[0].keys.len(), 1);
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
 fn spawn_broker(socket: &Path) -> Child {
+    spawn_broker_with_seed(socket, "counters/a:value:20,counters/b:value:22")
+}
+
+fn spawn_broker_with_seed(socket: &Path, seed: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_aster_brokerd"))
         .env("ASTER_BROKER_SOCK", socket)
         .env("ASTER_TENANT", "tenant-proc")
         .env("ASTER_DEPLOYMENT", "dep-proc")
-        .env("ASTER_SEED_I64", "counters/a:value:20,counters/b:value:22")
+        .env("ASTER_SEED_I64", seed)
         .env("ASTER_SEAL_SEED", "process-boundary-test-key")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn brokerd")
+}
+
+/// `count` seed entries under `prefix`, each key padded to `key_len` bytes —
+/// one prefix hydrate over these yields a certificate of roughly
+/// `count * key_len` bytes. Sized to stay under Linux's 128 KiB
+/// single-env-var cap (MAX_ARG_STRLEN).
+fn big_prefix_seed(prefix: &str, count: usize, key_len: usize) -> String {
+    (0..count)
+        .map(|i| {
+            let mut key = format!("{prefix}{i:04}");
+            while key.len() < key_len {
+                key.push('x');
+            }
+            format!("{key}:value:{i}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn wait_for_socket(socket: &Path) {

@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +11,7 @@ use aster_capsule::{
     SessionBinding, TenantId, Value,
 };
 use aster_ipc::{
-    read_frame, write_frame, InitialCapsuleGrant, IpcRequest, IpcResponse, ModuleBundle,
+    read_frame, write_frame, InitialCapsuleGrant, IpcError, IpcRequest, IpcResponse, ModuleBundle,
     WireBrokerError,
 };
 
@@ -236,19 +236,25 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // broker killed itself mid-workload. The write path multiplies traps, so
     // the lifetime budget is gone; concurrency control belongs at the
     // accept/queue layer if the broker ever goes parallel.
+    //
+    // Per-connection I/O failures stay per-connection: a `?` on the response
+    // write let ONE bad client (a peer that hung up before reading — EPIPE,
+    // Rust ignores SIGPIPE — or a response that outgrew the frame cap) kill
+    // the broker and with it the in-process session table every other live
+    // cell depends on. Only accept errors remain fatal.
     for stream in listener.incoming() {
         let mut stream = stream?;
         let request = read_frame::<IpcRequest>(&mut stream);
         let should_shutdown = match request {
             Ok(request) => {
                 let (response, should_shutdown) = handle_request(&broker, request);
-                write_frame(&mut stream, &response)?;
+                send_response(&mut stream, &response);
                 should_shutdown
             }
             Err(error) => {
                 let response =
                     IpcResponse::Error(WireBrokerError::new("bad_request", error.to_string()));
-                write_frame(&mut stream, &response)?;
+                send_response(&mut stream, &response);
                 false
             }
         };
@@ -260,6 +266,38 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+/// Write one response, containing every failure to that connection.
+///
+/// `write_frame` serializes fully before writing, so a `FrameTooLarge`
+/// response has put zero bytes on the socket — the stream is still clean
+/// and the peer gets a small structured `response_too_large` error it can
+/// act on (e.g. re-issue the hydrate with a smaller limit) instead of a
+/// dead connection. No broker-side cap on HydratePrefix limits backs this
+/// up: response size, not the requested limit, is the scarce resource (a
+/// huge limit over a small prefix is harmless, and store allocation is
+/// bounded by what actually matches), and this serialize-then-check gate
+/// measures the real thing exactly.
+///
+/// Any other write failure — EPIPE from a peer that closed before reading,
+/// a short write — is logged and dropped; the accept loop moves on.
+fn send_response(stream: &mut UnixStream, response: &IpcResponse) {
+    match write_frame(stream, response) {
+        Ok(()) => {}
+        Err(IpcError::FrameTooLarge { len, max }) => {
+            let fallback = IpcResponse::Error(WireBrokerError::new(
+                "response_too_large",
+                format!("response frame would be {len} bytes; the IPC cap is {max}"),
+            ));
+            if let Err(error) = write_frame(stream, &fallback) {
+                eprintln!("aster_brokerd: connection write error: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("aster_brokerd: connection write error: {error}");
+        }
+    }
 }
 
 fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, bool) {
@@ -653,6 +691,7 @@ fn env_optional_u64(name: &str) -> Result<Option<u64>, Box<dyn std::error::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aster_capsule::{doc_with_i64, SnapshotCapsule, VersionedDocument};
     use std::sync::Mutex;
 
     #[test]
@@ -864,6 +903,146 @@ mod tests {
             }
             other => panic!("cross-session capsule should fail, got {other:?}"),
         }
+    }
+
+    /// Wire twin of the capsule-level rewritten-session test: grants A and
+    /// B share cell_id/epoch, so rewriting A's (attacker-mutable)
+    /// `seal.session` claim to B and presenting on B's session passes both
+    /// the session table AND the seal's friendly ct_eq pre-check — only the
+    /// session bytes inside the MAC reject the transplant. Pins the wire
+    /// code to the seal MacMismatch mapping, NOT unknown_session /
+    /// session_context_mismatch / WrongSession; a mutant that drops the
+    /// session bytes from `seal_mac` hydrates successfully here.
+    #[test]
+    fn rewritten_session_claim_dies_at_the_seal_mac() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let context = SealContext::new("cell-a", 1);
+        let grant_a = initial_grant(&broker, &context);
+        let grant_b = initial_grant(&broker, &context);
+        assert_ne!(grant_a.session, grant_b.session, "sessions must be unique");
+
+        let mut capsule = grant_a.capsule;
+        capsule.seal_mut_for_test().session = Some(grant_b.session);
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: Some(grant_b.session),
+                capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "seal_MacMismatch", "got {error:?}");
+            }
+            other => panic!("rewritten session claim should fail, got {other:?}"),
+        }
+    }
+
+    /// Wire mirror of the broker-level snapshot pinning tests: a hydrate
+    /// through `handle_request` must scan at the capsule's ts even after
+    /// the store head advanced past the broker's pinned snapshot. A mutant
+    /// that scans at `store.snapshot_ts()` leaks docs/b into the
+    /// certificate and the capsule.
+    #[test]
+    fn wire_hydrate_prefix_scans_at_capsule_ts_not_store_head() {
+        let store = Arc::new(MvccStore::new());
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        let snapshot_ts = store.snapshot_ts().expect("snapshot ts");
+        // initial_grant pins snapshot_ts=1 in its request; the single seed
+        // above puts the store head exactly there.
+        assert_eq!(snapshot_ts, 1);
+        let broker = ProcessBroker {
+            store: store.clone(),
+            module_source: Arc::new(FakeModuleSource::new(None)),
+            seal_key: CapsuleSealKey::derive_for_tests(b"test-seed"),
+            tenant: TenantId::new("tenant-test"),
+            deployment: DeploymentId::new("dep-test"),
+            snapshot_ts,
+            sessions: SessionTable::default(),
+        };
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        // Store head advances past the broker's pinned snapshot.
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePrefix {
+                context,
+                session: Some(grant.session),
+                capsule: grant.capsule,
+                prefix: "docs/".into(),
+                limit: 10,
+            },
+        )
+        .0;
+        let sealed = match response {
+            IpcResponse::HydratePrefix(Ok(sealed)) => sealed,
+            other => panic!("prefix hydrate should succeed, got {other:?}"),
+        };
+        let capsule = sealed.capsule();
+        assert_eq!(capsule.ranges.len(), 1);
+        assert_eq!(capsule.ranges[0].keys, vec![DocumentId::new("docs/a")]);
+        assert!(
+            capsule.get(&DocumentId::new("docs/b")).is_none(),
+            "post-snapshot key must not hydrate into the capsule"
+        );
+    }
+
+    /// C4 containment at the frame layer: a response that outgrows the
+    /// frame cap never touches the socket (write_frame serializes first)
+    /// and the peer gets the small structured error instead. The
+    /// process_boundary E2E drives the same path over a real brokerd.
+    #[test]
+    fn oversized_response_maps_to_structured_error() {
+        let (mut server, mut peer) = UnixStream::pair().expect("socketpair");
+        let mut document = Document::new();
+        document.insert(
+            "blob".to_string(),
+            Value::Text("x".repeat(2 * aster_ipc::MAX_FRAME_BYTES)),
+        );
+        let mut capsule = SnapshotCapsule::empty(
+            TenantId::new("tenant-test"),
+            DeploymentId::new("dep-test"),
+            1,
+        );
+        capsule.hydrate_point(
+            DocumentId::new("docs/big"),
+            VersionedDocument {
+                version: Some(1),
+                document: Some(document),
+            },
+        );
+        let sealed = SealedCapsule::new(
+            capsule,
+            &CapsuleSealKey::derive_for_tests(b"test-seed"),
+            &SealContext::new("cell-a", 1),
+        );
+
+        send_response(&mut server, &IpcResponse::HydratePrefix(Ok(sealed)));
+
+        let received: IpcResponse = read_frame(&mut peer).expect("fallback frame");
+        match received {
+            IpcResponse::Error(error) => {
+                assert_eq!(error.code, "response_too_large", "got {error:?}");
+            }
+            other => panic!("expected structured error, got {other:?}"),
+        }
+    }
+
+    /// C4 containment for a peer that hung up before reading: the write
+    /// hits EPIPE (Rust ignores SIGPIPE) and must be swallowed, never
+    /// propagated up to kill the accept loop.
+    #[test]
+    fn send_response_survives_peer_hangup() {
+        let (mut server, peer) = UnixStream::pair().expect("socketpair");
+        drop(peer);
+        send_response(&mut server, &IpcResponse::ShutdownAck);
     }
 
     #[test]

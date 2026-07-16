@@ -181,6 +181,11 @@ impl From<serde_json::Error> for IpcError {
 
 pub type IpcResult<T> = Result<T, IpcError>;
 
+/// Serializes fully before touching the socket: an oversized message
+/// returns `FrameTooLarge` with zero bytes on the wire, leaving the stream
+/// clean. brokerd's `send_response` relies on that ordering to substitute
+/// a small structured `response_too_large` frame — don't switch this to
+/// streaming serialization without revisiting that fallback.
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, message: &T) -> IpcResult<()> {
     let bytes = serde_json::to_vec(message)?;
     if bytes.len() > MAX_FRAME_BYTES {
