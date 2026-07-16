@@ -103,9 +103,8 @@ pub struct PostgresConfig {
     /// access to Convex's module storage on disk.
     pub modules_dir: Option<PathBuf>,
 
-    /// Hard cap on connections. Each in-flight cell hydrate may take
-    /// one. Default 16 — sized against the `ASTER_MAX_CONNECTIONS=1024`
-    /// brokerd cap; raise if you increase that.
+    /// Hard cap on pooled Postgres connections. Each in-flight cell
+    /// hydrate may take one. Default 16.
     pub pool_max_size: usize,
 
     /// Per-checkout `SET statement_timeout`. Prevents a slow query from

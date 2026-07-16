@@ -70,7 +70,6 @@ docker run -d --name "${BROKER}" --network "${NETWORK}" \
     -e ASTER_DB_URL="postgres://aster:${PG_PASSWORD}@postgres:5432/aster" \
     -e ASTER_DB_SCHEMA=convex_dev \
     -e ASTER_SNAPSHOT_TS=200 \
-    -e ASTER_MAX_CONNECTIONS=8 \
     "${BROKERD_IMAGE}" >/dev/null
 
 echo "==> waiting for broker ready"

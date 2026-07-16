@@ -56,7 +56,6 @@ struct BrokerConfig {
     snapshot_ts: u64,
     seeds: Vec<(DocumentId, Document)>,
     seal_key: CapsuleSealKey,
-    max_connections: usize,
     store_kind: StoreKind,
     /// Postgres connection URL when `store_kind == Postgres`. None for memory.
     db_url: Option<String>,
@@ -78,7 +77,6 @@ impl BrokerConfig {
         let snapshot_ts = env_optional_u64("ASTER_SNAPSHOT_TS")?.unwrap_or(0);
         let seeds = parse_seeds(&env_optional_string("ASTER_SEED_I64")?.unwrap_or_default())?;
         let seal_key = CapsuleSealKey::derive_for_tests(env_string("ASTER_SEAL_SEED")?.as_bytes());
-        let max_connections = env_optional_usize("ASTER_MAX_CONNECTIONS")?.unwrap_or(1024);
         let store_kind =
             StoreKind::from_env_value(&env_optional_string("ASTER_STORE")?.unwrap_or_default())?;
         let db_url = match store_kind {
@@ -95,7 +93,6 @@ impl BrokerConfig {
             snapshot_ts,
             seeds,
             seal_key,
-            max_connections,
             store_kind,
             db_url,
             db_schema,
@@ -227,11 +224,13 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
         snapshot_ts
     );
 
-    for (count, stream) in listener.incoming().enumerate() {
-        if count >= config.max_connections {
-            eprintln!("aster_brokerd: max connections reached");
-            break;
-        }
+    // One connection per request, served serially until a Shutdown verb.
+    // v0.6 capped total connections served since boot (ASTER_MAX_CONNECTIONS)
+    // and exited past the cap — with one connection per read trap, a busy
+    // broker killed itself mid-workload. The write path multiplies traps, so
+    // the lifetime budget is gone; concurrency control belongs at the
+    // accept/queue layer if the broker ever goes parallel.
+    for stream in listener.incoming() {
         let mut stream = stream?;
         let request = read_frame::<IpcRequest>(&mut stream);
         let should_shutdown = match request {
@@ -450,14 +449,6 @@ fn env_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn env_optional_u64(name: &str) -> Result<Option<u64>, Box<dyn std::error::Error>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value.parse()?)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn env_optional_usize(name: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value.parse()?)),
         Err(std::env::VarError::NotPresent) => Ok(None),

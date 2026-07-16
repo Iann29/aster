@@ -323,7 +323,6 @@ docker run -d --name "${BROKER}" --network "${NETWORK}" \
     -e ASTER_DB_SCHEMA="${SCHEMA}" \
     -e ASTER_MODULES_DIR=/run/aster/modules \
     -e ASTER_SNAPSHOT_TS=200 \
-    -e ASTER_MAX_CONNECTIONS=8 \
     "${BROKERD_IMAGE}" >/dev/null
 
 echo "==> waiting for broker ready"

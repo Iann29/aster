@@ -88,6 +88,35 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
     assert!(broker.wait().expect("broker wait").success());
 }
 
+#[test]
+fn broker_outlives_many_sequential_connections() {
+    let temp = TempDir::new("aster-ipc-manyconn");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    // Regression for the v0.6 lifetime budget: ASTER_MAX_CONNECTIONS counted
+    // every connection served since boot and exited the accept loop past the
+    // cap, so a busy broker (one connection per trap) died mid-workload.
+    // Serve well past the old test cap of 16 and prove the broker only exits
+    // on the Shutdown verb.
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-many", 7);
+    for _ in 0..48 {
+        client
+            .initial_capsule(
+                &context,
+                TenantId::new("tenant-proc"),
+                DeploymentId::new("dep-proc"),
+                2,
+                Vec::new(),
+            )
+            .expect("initial capsule");
+    }
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
 fn spawn_broker(socket: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_aster_brokerd"))
         .env("ASTER_BROKER_SOCK", socket)
@@ -95,7 +124,6 @@ fn spawn_broker(socket: &Path) -> Child {
         .env("ASTER_DEPLOYMENT", "dep-proc")
         .env("ASTER_SEED_I64", "counters/a:value:20,counters/b:value:22")
         .env("ASTER_SEAL_SEED", "process-boundary-test-key")
-        .env("ASTER_MAX_CONNECTIONS", "16")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

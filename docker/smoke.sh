@@ -52,7 +52,6 @@ docker run -d \
     -e ASTER_DEPLOYMENT=dep-smoke \
     -e ASTER_SEED_I64='counters/a:value:20,counters/b:value:22' \
     -e ASTER_SEAL_SEED=smoke-seed \
-    -e ASTER_MAX_CONNECTIONS=8 \
     "${BROKERD_IMAGE}" >/dev/null
 
 # The broker logs "ready socket=..." on stderr the moment it binds.
