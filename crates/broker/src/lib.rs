@@ -8,10 +8,15 @@
 //!
 //! v0.3+ generalises the storage backend behind a `CapsuleStore` trait
 //! (see `store.rs`) so a real Postgres adapter can plug in without touching
-//! the cell-facing IPC.
+//! the cell-facing IPC. v0.7 adds the write-side twin: `CommitFence`
+//! (see `fence.rs`) abstracts the lease authority + commit fence so the
+//! brokerd binary drives the same admission semantics against Postgres
+//! (`WritePlane`) or the in-memory prototype store.
 
+pub mod fence;
 pub mod store;
 
+pub use fence::{CommitFence, CommitOutcome, FenceInput, MemoryFence};
 pub use store::{CapsuleStore, StoreError};
 
 use aster_capsule::{

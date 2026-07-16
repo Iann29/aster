@@ -34,8 +34,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aster_broker::StoreError;
-use aster_capsule::{Document, DocumentId, ObservedWindow, Timestamp, VersionedDocument};
+use aster_broker::{CommitFence, StoreError};
+// The fence input/outcome types moved to `aster_broker::fence` in S9a so
+// the brokerd binary can dispatch on the `CommitFence` seam; re-exported
+// here so `aster_store_postgres::{FenceInput, CommitOutcome}` call sites
+// (and the write_plane_it suite) stay source-compatible.
+pub use aster_broker::{CommitOutcome, FenceInput};
+use aster_capsule::{Document, DocumentId, Timestamp, VersionedDocument};
 use deadpool_postgres::{
     Manager, ManagerConfig, Pool, RecyclingMethod, Runtime as DeadpoolRuntime,
 };
@@ -86,50 +91,6 @@ impl Default for WritePlaneConfig {
             idle_in_transaction_session_timeout: Duration::from_secs(30),
         }
     }
-}
-
-/// One point-in-time commit request, already reduced by the committer to
-/// the theorem's validated ingredients: the declared authenticated
-/// observations (points + range windows) and the policy-authorized write
-/// set. Capsule verification happens in the committer, not here.
-pub struct FenceInput<'a> {
-    pub tenant: &'a str,
-    pub deployment: &'a str,
-    /// Epoch this committer acquired from the lease authority (`e_now`).
-    pub committer_epoch: u64,
-    /// Epoch sealed in the capsule context (`ctx.e`). V2 requires it to
-    /// equal the live lease epoch — passing it separately lets the fence
-    /// reject a stale-epoch capsule even when the committer itself is
-    /// current.
-    pub context_epoch: u64,
-    /// The capsule snapshot `s`.
-    pub snapshot: Timestamp,
-    /// Declared point observations (present, absent, and tombstone reads
-    /// all conflict on any write event touching the key — the theorem's
-    /// `Changed({k}; (s,h])` predicate).
-    pub read_points: &'a [DocumentId],
-    /// Declared range observations, already reduced to conflict windows.
-    pub read_windows: &'a [ObservedWindow],
-    /// The write set: `Some(document)` puts, `None` deletes.
-    pub writes: &'a [(DocumentId, Option<Document>)],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommitOutcome {
-    Committed { ts: Timestamp },
-    /// A committed write in `(s, h]` intersects a declared observation.
-    Conflict { key: DocumentId },
-    /// Lease epoch mismatch — the committer or the capsule context is
-    /// stale relative to the storage lease authority.
-    StaleEpoch { lease_epoch: u64 },
-    /// The capsule claims a snapshot the log has never committed
-    /// (S-SNAPSHOT violation — honest brokers cannot produce this).
-    SnapshotBeyondHorizon { horizon: Timestamp },
-    /// Validation history below the snapshot is no longer retained
-    /// (Lemma R: coverage `g <= s` failed). Retry from a fresh snapshot.
-    RetentionViolated { low_watermark: Timestamp },
-    /// Mutations-only path: an empty write set never enters the log.
-    EmptyWriteSet,
 }
 
 pub struct WritePlane {
@@ -607,6 +568,24 @@ impl WritePlane {
                 .map_err(|err| StoreError::Backend(format!("retention commit: {err}")))?;
             Ok(effective as u64)
         })
+    }
+}
+
+/// `WritePlane` IS the theorem's commit fence; the trait impl exposes the
+/// inherent methods through the backend-agnostic seam the brokerd binary
+/// dispatches on (memory mode gets `aster_broker::MemoryFence` instead).
+impl CommitFence for WritePlane {
+    fn acquire_lease(
+        &self,
+        tenant: &str,
+        deployment: &str,
+        holder: &str,
+    ) -> Result<u64, StoreError> {
+        WritePlane::acquire_lease(self, tenant, deployment, holder)
+    }
+
+    fn commit(&self, input: &FenceInput<'_>) -> Result<CommitOutcome, StoreError> {
+        WritePlane::commit(self, input)
     }
 }
 

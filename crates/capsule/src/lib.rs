@@ -672,6 +672,25 @@ impl MvccStore {
             })
             .unwrap_or_else(VersionedDocument::missing)
     }
+
+    /// Keys with at least one write event in `(after, up_to]` — the
+    /// theorem's `Changed(K; (s, h])` enumeration a commit fence needs to
+    /// test declared range windows against the committed suffix. Tombstone
+    /// writes are write events too (they carry a revision), so a delete in
+    /// the window is reported exactly like a put.
+    pub fn changed_keys_in(&self, after: Timestamp, up_to: Timestamp) -> Vec<DocumentId> {
+        let inner = self.inner.lock().expect("mvcc mutex poisoned");
+        inner
+            .docs
+            .iter()
+            .filter(|(_, revisions)| {
+                revisions
+                    .iter()
+                    .any(|revision| revision.ts > after && revision.ts <= up_to)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -926,6 +945,29 @@ mod tests {
         assert_eq!(exhausted.stop, ScanStop::Exhausted);
         assert_eq!(exhausted.keys.len(), 2);
         exhausted.validate().expect("valid exhausted certificate");
+    }
+
+    #[test]
+    fn changed_keys_in_reports_write_events_including_tombstones() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+        let mut deletion = WriteSet::default();
+        deletion.delete(DocumentId::new("docs/a"));
+        store
+            .commit(store.snapshot_ts(), &ReadSet::default(), &deletion)
+            .expect("tombstone commit"); // ts=3
+
+        // Window (1, 3]: docs/b's put at 2 and docs/a's DELETE at 3 are
+        // both write events; docs/a's original put at 1 is outside.
+        let mut changed = store.changed_keys_in(1, 3);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![DocumentId::new("docs/a"), DocumentId::new("docs/b")]
+        );
+        assert_eq!(store.changed_keys_in(3, 3), Vec::<DocumentId>::new());
+        assert_eq!(store.changed_keys_in(2, 3), vec![DocumentId::new("docs/a")]);
     }
 
     #[test]
