@@ -29,6 +29,11 @@
 //! - `scan_prefix()` — certified bounded live scan (`DISTINCT ON (id)`
 //!   visibility subquery, tombstones filtered outside it so they never
 //!   consume limit slots) returning the `RangeCertificate` evidence.
+//! - Certified reads enforce Convex's retention floor: `read_point` and
+//!   `scan_prefix` re-check `persistence_globals['min_document_snapshot_ts']`
+//!   on the same connection and surface `StoreError::Stale` for pinned
+//!   snapshots below it (reference doc gotcha #10) — a stale snapshot
+//!   must fail loudly, never mint half-vacuumed evidence.
 //! - Document body is currently passed through as raw JSON bytes under
 //!   a `_raw` field. The ConvexValue codec exists for metadata and future
 //!   typed value handling; the current v8cell `1.0/get` shim intentionally
@@ -292,10 +297,10 @@ impl CapsuleStore for PostgresCapsuleStore {
         // IDv6 string (the JS bundle's `db.get(id)` path). Dispatching
         // on the form lives inside the async block so the IDv6 case
         // can refresh the table-mapping cache via Postgres on a miss.
+        let ts_signed = as_i64(ts)?;
         self.block_on(async {
             let (table_id, doc_id) = self.resolve_document_id(key).await?;
             let client = self.checkout().await?;
-            let ts_signed = ts as i64;
             let row = client
                 .query_opt(
                     &format!(
@@ -309,6 +314,10 @@ impl CapsuleStore for PostgresCapsuleStore {
                 )
                 .await
                 .map_err(|err| StoreError::Backend(format!("read_point: {err}")))?;
+
+            // Retention gate BEFORE interpreting the row (a missing row
+            // below the floor is exactly the false-absence case).
+            self.check_retention_floor(&client, ts, ts_signed).await?;
 
             let Some(row) = row else {
                 return Ok(VersionedDocument::missing());
@@ -368,10 +377,20 @@ impl CapsuleStore for PostgresCapsuleStore {
                 RangeCertificateError::ZeroLimit
             )));
         }
+        let ts_signed = as_i64(ts)?;
+        // Canonicalize the prefix for the certificate: `decode_hex`
+        // accepts case-insensitive hex (same liberal posture as
+        // `read_point`), but returned keys re-encode as LOWERCASE hex —
+        // DocumentId's canonical wire form. Built from the raw caller
+        // string, an uppercase-but-valid prefix would make every
+        // returned key fail `interval.contains`, and the broker would
+        // seal a structurally invalid capsule (KeyOutsideInterval at
+        // verify time). Re-encoding from the decoded bytes pins the
+        // interval to the exact form the keys carry.
+        let canonical_prefix = format!("{}/", encode_hex(&table_id));
 
         self.block_on(async {
             let client = self.checkout().await?;
-            let ts_signed = ts as i64;
             let limit_i64 = limit.min(i64::MAX as usize) as i64;
             // Visibility (latest revision <= ts per id) resolves in the
             // inner DISTINCT ON; tombstones are dropped OUTSIDE it so a
@@ -397,6 +416,11 @@ impl CapsuleStore for PostgresCapsuleStore {
                 .await
                 .map_err(|err| StoreError::Backend(format!("scan_prefix: {err}")))?;
 
+            // Retention gate BEFORE building the certificate — an
+            // Exhausted certificate over half-vacuumed history is false
+            // absence evidence.
+            self.check_retention_floor(&client, ts, ts_signed).await?;
+
             let mut entries = Vec::with_capacity(rows.len());
             for row in rows {
                 let id_bytes: Vec<u8> = row.get(0);
@@ -421,7 +445,7 @@ impl CapsuleStore for PostgresCapsuleStore {
                 ScanStop::Exhausted
             };
             let certificate = RangeCertificate {
-                interval: KeyInterval::Prefix(prefix.to_string()),
+                interval: KeyInterval::Prefix(canonical_prefix),
                 direction: ScanDirection::Ascending,
                 limit: limit as u64,
                 keys: entries.iter().map(|(key, _)| key.clone()).collect(),
@@ -458,6 +482,57 @@ impl PostgresCapsuleStore {
             .get()
             .await
             .map_err(|err| StoreError::Unavailable(format!("pool checkout: {err}")))
+    }
+
+    /// Refuse certified reads below Convex's document-retention floor
+    /// (`persistence_globals['min_document_snapshot_ts']`) — reference
+    /// doc gotcha #10. The vacuum deletes superseded revisions below the
+    /// floor lazily, so a snapshot pinned under it can silently observe
+    /// half-vacuumed history and mint FALSE sealed evidence (absence
+    /// certificates for keys whose old revisions were deleted). Convex's
+    /// own readers run a retention_validator with the same rule.
+    ///
+    /// Checked on the SAME connection, AFTER the data query: the floor
+    /// only moves up, so `floor <= ts` observed here proves it held for
+    /// the whole query — checking before would race a concurrent vacuum.
+    /// A missing row/key means retention has never advanced: floor 0
+    /// (fixtures may not set it).
+    async fn check_retention_floor(
+        &self,
+        client: &deadpool_postgres::Object,
+        ts: Timestamp,
+        ts_signed: i64,
+    ) -> Result<(), StoreError> {
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT json_value FROM {schema}.persistence_globals \
+                     WHERE key = 'min_document_snapshot_ts'",
+                    schema = self.schema
+                ),
+                &[],
+            )
+            .await
+            .map_err(|err| StoreError::Backend(format!("retention floor: {err}")))?;
+        let floor: i64 = match row {
+            None => 0,
+            Some(row) => {
+                let bytes: Vec<u8> = row.get(0);
+                let s = std::str::from_utf8(&bytes).map_err(|err| {
+                    StoreError::Backend(format!("min_document_snapshot_ts utf8: {err}"))
+                })?;
+                s.trim().parse::<i64>().map_err(|err| {
+                    StoreError::Backend(format!("min_document_snapshot_ts parse: {err}"))
+                })?
+            }
+        };
+        if ts_signed < floor {
+            return Err(StoreError::Stale {
+                requested: ts,
+                latest: floor.max(0) as u64,
+            });
+        }
+        Ok(())
     }
 
     /// Resolve a `DocumentId` to the `(table_id, id)` byte pair the
@@ -617,6 +692,16 @@ fn parse_aster_document_id(raw: &str) -> Result<(Vec<u8>, Vec<u8>), StoreError> 
     Ok((table_id, doc_id))
 }
 
+/// u64 → i64 for SQL binds — mirrors `write_plane::as_i64`. A snapshot
+/// past `i64::MAX` would otherwise wrap negative under `as`, match no
+/// rows, and mint a structurally VALID empty result (a missing point /
+/// an Exhausted certificate) — false absence evidence instead of an
+/// error.
+fn as_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Backend(format!("timestamp {value} exceeds i64 range")))
+}
+
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
@@ -718,6 +803,45 @@ mod tests {
         match store.read_point(&key, 200) {
             Err(StoreError::Unavailable(_)) => {}
             other => panic!("expected Unavailable(...) on dead Postgres, got {other:?}"),
+        }
+    }
+
+    /// Snapshots past i64::MAX must be a typed error BEFORE any Postgres
+    /// roundtrip — the dead-PG store would surface Unavailable if the
+    /// checked conversion ran after checkout, and the old `ts as i64`
+    /// wrapped negative and returned a false "missing" instead.
+    #[test]
+    fn read_point_rejects_timestamp_beyond_i64() {
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let key =
+            DocumentId::new("0123456789abcdef0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        match store.read_point(&key, u64::MAX) {
+            Err(StoreError::Backend(msg)) => {
+                assert!(msg.contains("exceeds i64 range"), "got {msg:?}")
+            }
+            other => panic!("expected Backend(exceeds i64 range), got {other:?}"),
+        }
+    }
+
+    /// Same guard on the scan path — a wrapped bound would yield a
+    /// structurally valid Exhausted certificate falsely attesting an
+    /// empty prefix.
+    #[test]
+    fn scan_prefix_rejects_timestamp_beyond_i64() {
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        match store.scan_prefix("0123456789abcdef0123456789abcdef/", 10, u64::MAX) {
+            Err(StoreError::Backend(msg)) => {
+                assert!(msg.contains("exceeds i64 range"), "got {msg:?}")
+            }
+            other => panic!("expected Backend(exceeds i64 range), got {other:?}"),
         }
     }
 

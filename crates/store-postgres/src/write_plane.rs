@@ -42,15 +42,38 @@ use deadpool_postgres::{
 use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{Config as PgConfig, NoTls};
 
+/// TCP keepalive timers for the plane's connections. Deliberately short:
+/// a committer whose peer vanished (partition, killed VM) must notice in
+/// tens of seconds, not the OS default ~2h11m — until then its pool slots
+/// hang on dead sockets. The server-side mirror of this problem (a dead
+/// COMMITTER holding row locks) is what `idle_in_transaction_session_timeout`
+/// bounds; keepalives cover the client-side half.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
 #[derive(Clone, Debug)]
 pub struct WritePlaneConfig {
     /// libpq-style connection URL. Same caveats as `PostgresConfig::url`.
     pub url: String,
     pub pool_max_size: usize,
     pub runtime_worker_threads: usize,
-    /// Per-checkout `SET statement_timeout`. Bounds how long a fence can
-    /// hold the lease/retention locks if Postgres stalls.
+    /// Per-checkout `SET statement_timeout`. Bounds how long any single
+    /// statement may EXECUTE. It does NOT bound how long a fence holds
+    /// the lease/retention row locks: the fence transaction spans many
+    /// client round-trips, and a session that is idle *between* statements
+    /// (mid-transaction) never trips statement_timeout — that case is
+    /// bounded by `idle_in_transaction_session_timeout` below.
     pub statement_timeout: Duration,
+    /// Per-checkout `SET idle_in_transaction_session_timeout`. Bounds how
+    /// long a fence transaction may sit idle between round-trips while
+    /// holding the lease/retention row locks. Without it, a SIGSTOPped or
+    /// partitioned committer wedges failover, every commit, and GC until
+    /// TCP gives up (~2h11m by kernel default; forever under SIGSTOP with
+    /// keepalives answered by the healthy kernel) — with it, Postgres
+    /// kills the idle session and its locks roll back. Defaults to the
+    /// same bound as `statement_timeout`.
+    pub idle_in_transaction_session_timeout: Duration,
 }
 
 impl Default for WritePlaneConfig {
@@ -60,6 +83,7 @@ impl Default for WritePlaneConfig {
             pool_max_size: 16,
             runtime_worker_threads: 2,
             statement_timeout: Duration::from_secs(30),
+            idle_in_transaction_session_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -112,6 +136,7 @@ pub struct WritePlane {
     runtime: Arc<Runtime>,
     pool: Pool,
     statement_timeout_ms: u64,
+    idle_in_transaction_ms: u64,
 }
 
 impl WritePlane {
@@ -121,10 +146,7 @@ impl WritePlane {
                 "WritePlaneConfig.url is empty".into(),
             ));
         }
-        let pg_config: PgConfig = config
-            .url
-            .parse()
-            .map_err(|err: tokio_postgres::Error| StoreError::Backend(format!("bad url: {err}")))?;
+        let pg_config = parse_pg_config(&config.url)?;
         let runtime = Builder::new_multi_thread()
             .worker_threads(config.runtime_worker_threads.max(1))
             .enable_all()
@@ -146,6 +168,9 @@ impl WritePlane {
             runtime: Arc::new(runtime),
             pool,
             statement_timeout_ms: config.statement_timeout.as_millis() as u64,
+            idle_in_transaction_ms: config
+                .idle_in_transaction_session_timeout
+                .as_millis() as u64,
         })
     }
 
@@ -162,13 +187,18 @@ impl WritePlane {
             .get()
             .await
             .map_err(|err| StoreError::Unavailable(format!("pool checkout: {err}")))?;
+        // Both GUCs are session-scoped and deadpool's Fast recycling does
+        // not reset them, but re-stamping per checkout keeps the value in
+        // lockstep with this plane's config even if the session was first
+        // opened by a differently-configured plane sharing the database.
         client
             .batch_execute(&format!(
-                "SET statement_timeout = {}",
-                self.statement_timeout_ms
+                "SET statement_timeout = {}; \
+                 SET idle_in_transaction_session_timeout = {}",
+                self.statement_timeout_ms, self.idle_in_transaction_ms
             ))
             .await
-            .map_err(|err| StoreError::Backend(format!("set statement_timeout: {err}")))?;
+            .map_err(|err| StoreError::Backend(format!("set session timeouts: {err}")))?;
         Ok(client)
     }
 
@@ -580,6 +610,20 @@ impl WritePlane {
     }
 }
 
+/// Parse the URL and stamp the short TCP keepalive timers on the connect
+/// config — every pooled connection the write plane opens gets them.
+fn parse_pg_config(url: &str) -> Result<PgConfig, StoreError> {
+    let mut pg_config: PgConfig = url
+        .parse()
+        .map_err(|err: tokio_postgres::Error| StoreError::Backend(format!("bad url: {err}")))?;
+    pg_config
+        .keepalives(true)
+        .keepalives_idle(TCP_KEEPALIVE_IDLE)
+        .keepalives_interval(TCP_KEEPALIVE_INTERVAL)
+        .keepalives_retries(TCP_KEEPALIVE_RETRIES);
+    Ok(pg_config)
+}
+
 fn as_i64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::Backend(format!("timestamp {value} exceeds i64 range")))
@@ -608,12 +652,68 @@ fn escape_like(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like;
+    use super::*;
 
     #[test]
     fn escape_like_neutralizes_wildcards() {
         assert_eq!(escape_like("docs/"), "docs/");
         assert_eq!(escape_like("do%cs_"), "do\\%cs\\_");
         assert_eq!(escape_like("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn connect_config_carries_short_tcp_keepalives() {
+        let pg_config =
+            parse_pg_config("postgres://stub:stub@127.0.0.1:1/stub").expect("parse url");
+        assert!(pg_config.get_keepalives());
+        assert_eq!(pg_config.get_keepalives_idle(), TCP_KEEPALIVE_IDLE);
+        assert_eq!(
+            pg_config.get_keepalives_interval(),
+            Some(TCP_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(pg_config.get_keepalives_retries(), Some(TCP_KEEPALIVE_RETRIES));
+    }
+}
+
+#[cfg(all(test, feature = "postgres-it"))]
+mod pg_it {
+    use super::*;
+
+    /// Both per-checkout GUCs must be stamped on every pooled session.
+    /// The idle-in-transaction bound is the load-bearing half: without it
+    /// a session idle mid-fence holds the lease/retention row locks
+    /// unbounded (statement_timeout never fires while no statement runs).
+    /// The wedge-resolution proof lives in `write_plane_it.rs`
+    /// (`idle_wedged_lock_holder_is_killed_so_failover_resumes`); this
+    /// test pins the config → session wiring it relies on.
+    #[test]
+    fn client_checkout_stamps_statement_and_idle_timeouts() {
+        let url = std::env::var("ASTER_DB_URL")
+            .expect("set ASTER_DB_URL to run postgres-it tests");
+        // Millisecond values chosen to not reduce to whole seconds so
+        // SHOW echoes them back in ms and the assertion stays exact.
+        let plane = WritePlane::connect(WritePlaneConfig {
+            url,
+            statement_timeout: Duration::from_millis(4321),
+            idle_in_transaction_session_timeout: Duration::from_millis(1234),
+            ..WritePlaneConfig::default()
+        })
+        .expect("connect");
+        let (statement, idle) = plane.block_on(async {
+            let client = plane.client().await.expect("checkout");
+            let statement: String = client
+                .query_one("SHOW statement_timeout", &[])
+                .await
+                .expect("show statement_timeout")
+                .get(0);
+            let idle: String = client
+                .query_one("SHOW idle_in_transaction_session_timeout", &[])
+                .await
+                .expect("show idle_in_transaction_session_timeout")
+                .get(0);
+            (statement, idle)
+        });
+        assert_eq!(statement, "4321ms");
+        assert_eq!(idle, "1234ms");
     }
 }
