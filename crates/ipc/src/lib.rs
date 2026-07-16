@@ -16,9 +16,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aster_broker::{BrokerError, CapsuleBrokerClient};
+use aster_broker::{BrokerError, CapsuleBrokerClient, CommitOutcome};
 use aster_capsule::{
-    DeploymentId, DocumentId, SealContext, SealedCapsule, SessionBinding, TenantId,
+    DeploymentId, Document, DocumentId, SealContext, SealedCapsule, SessionBinding, TenantId,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,31 @@ pub enum IpcRequest {
         capsule: SealedCapsule,
         path: String,
     },
+    /// The write path (S9a): submit the sealed capsule, the declared
+    /// dependency subset (the theorem's Variante B `S`), and the write
+    /// set for fenced commit. Unlike the hydrate verbs there is no
+    /// separate `context` claim — the capsule's own seal fields are the
+    /// claimed context the broker checks against its session table before
+    /// the seal MAC enforces the binding. ANY structured answer (success
+    /// or rejection past the session gate) CLOSES the session: one
+    /// session = one transaction attempt.
+    Commit {
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        /// Declared point observations, by key. Every key must reference
+        /// an atom the sealed capsule carries (B-SUBSET); a capsule key
+        /// left undeclared is legal and demotes that dependency to an
+        /// authorized blind write (Variante B omission, T2).
+        declared_reads: Vec<DocumentId>,
+        /// `Some(document)` puts, `None` deletes.
+        writes: Vec<(DocumentId, Option<Document>)>,
+    },
+    /// No-commit end-of-life for a session: closes it without touching
+    /// the fence. Unknown ids are rejected (`unknown_session`), never
+    /// silently ignored.
+    Abort {
+        session: SessionBinding,
+    },
     Shutdown,
 }
 
@@ -83,8 +108,58 @@ pub enum IpcResponse {
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
     HydratePrefix(Result<SealedCapsule, WireBrokerError>),
     LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
+    Commit(Result<WireCommitOutcome, WireBrokerError>),
+    Abort(Result<(), WireBrokerError>),
     ShutdownAck,
     Error(WireBrokerError),
+}
+
+/// Wire mirror of the fence's `CommitOutcome` — field-for-field parity
+/// with `aster_broker::CommitOutcome` so the committer's answer crosses
+/// the socket lossless.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WireCommitOutcome {
+    Committed {
+        ts: u64,
+    },
+    /// A committed write in `(s, h]` intersects a declared observation.
+    Conflict {
+        key: DocumentId,
+    },
+    /// The committer or the capsule context is stale relative to the
+    /// storage lease authority.
+    StaleEpoch {
+        lease_epoch: u64,
+    },
+    /// The capsule claims a snapshot the log has never committed
+    /// (S-SNAPSHOT violation — honest brokers cannot produce this).
+    SnapshotBeyondHorizon {
+        horizon: u64,
+    },
+    /// Validation history below the snapshot is no longer retained;
+    /// retry from a fresh snapshot.
+    RetentionViolated {
+        low_watermark: u64,
+    },
+    /// Mutations-only path: an empty write set never enters the log.
+    EmptyWriteSet,
+}
+
+impl From<CommitOutcome> for WireCommitOutcome {
+    fn from(value: CommitOutcome) -> Self {
+        match value {
+            CommitOutcome::Committed { ts } => Self::Committed { ts },
+            CommitOutcome::Conflict { key } => Self::Conflict { key },
+            CommitOutcome::StaleEpoch { lease_epoch } => Self::StaleEpoch { lease_epoch },
+            CommitOutcome::SnapshotBeyondHorizon { horizon } => {
+                Self::SnapshotBeyondHorizon { horizon }
+            }
+            CommitOutcome::RetentionViolated { low_watermark } => {
+                Self::RetentionViolated { low_watermark }
+            }
+            CommitOutcome::EmptyWriteSet => Self::EmptyWriteSet,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,7 +308,9 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> IpcR
 /// signature unchanged — the v8cell execute path drives the trait and must
 /// stay oblivious to wire-only concerns. A later `initial_capsule` on the
 /// same client replaces the held session, matching brokerd, where every
-/// InitialCapsule mints a fresh session.
+/// InitialCapsule mints a fresh session; `commit`/`abort` clear it, because
+/// the broker closes the session on those verbs (one session = one
+/// transaction attempt).
 #[derive(Clone, Debug)]
 pub struct UdsCapsuleBrokerClient {
     socket_path: PathBuf,
@@ -256,6 +333,10 @@ impl UdsCapsuleBrokerClient {
 
     fn store_session(&self, session: SessionBinding) {
         *self.session.lock().expect("session slot lock") = Some(session);
+    }
+
+    fn clear_session(&self) {
+        *self.session.lock().expect("session slot lock") = None;
     }
 
     pub fn shutdown(&self) -> IpcResult<()> {
@@ -295,6 +376,77 @@ impl UdsCapsuleBrokerClient {
                 )))
             }
             _ => Err(IpcError::UnexpectedResponse("LoadModuleBundle")),
+        }
+    }
+
+    /// Close the loop: submit the sealed capsule, the declared dependency
+    /// subset (Variante B), and the write set for fenced commit, on the
+    /// held session. The broker closes the session on every structured
+    /// answer (one session = one transaction attempt), so the held id is
+    /// dropped before returning — the next transaction starts with a
+    /// fresh `initial_capsule`. Structured broker rejections fold into
+    /// `IpcError::Protocol` (same shape as `load_module_bundle`); fence
+    /// outcomes — including `Conflict` — are the `Ok` value.
+    pub fn commit(
+        &self,
+        capsule: SealedCapsule,
+        declared_reads: Vec<DocumentId>,
+        writes: Vec<(DocumentId, Option<Document>)>,
+    ) -> IpcResult<WireCommitOutcome> {
+        let response = self.call(IpcRequest::Commit {
+            session: self.session(),
+            capsule,
+            declared_reads,
+            writes,
+        })?;
+        match response {
+            IpcResponse::Commit(result) => {
+                // Every rejection this client can produce is issued at or
+                // past the session gate, where the broker has already
+                // closed the session — holding onto the id would only set
+                // up an unknown_session surprise later.
+                self.clear_session();
+                result.map_err(|error| {
+                    IpcError::Protocol(format!(
+                        "broker rejected commit: {}: {}",
+                        error.code, error.message
+                    ))
+                })
+            }
+            IpcResponse::Error(error) => Err(IpcError::Protocol(format!(
+                "broker rejected commit: {}: {}",
+                error.code, error.message
+            ))),
+            _ => Err(IpcError::UnexpectedResponse("Commit")),
+        }
+    }
+
+    /// End the held session without committing (the no-commit half of
+    /// session end-of-life). The slot is cleared on any structured
+    /// answer — an `unknown_session` rejection means the session is gone
+    /// either way.
+    pub fn abort(&self) -> IpcResult<()> {
+        let Some(session) = self.session() else {
+            return Err(IpcError::Protocol(
+                "abort requires a session held from initial_capsule".into(),
+            ));
+        };
+        let response = self.call(IpcRequest::Abort { session })?;
+        match response {
+            IpcResponse::Abort(result) => {
+                self.clear_session();
+                result.map_err(|error| {
+                    IpcError::Protocol(format!(
+                        "broker rejected abort: {}: {}",
+                        error.code, error.message
+                    ))
+                })
+            }
+            IpcResponse::Error(error) => Err(IpcError::Protocol(format!(
+                "broker rejected abort: {}: {}",
+                error.code, error.message
+            ))),
+            _ => Err(IpcError::UnexpectedResponse("Abort")),
         }
     }
 

@@ -1,19 +1,22 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aster_broker::{BrokerError, CapsuleBrokerClient, CapsuleStore};
+use aster_broker::{
+    BrokerError, CapsuleBrokerClient, CapsuleStore, CommitFence, FenceInput, MemoryFence,
+};
 use aster_capsule::{
-    CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, SealContext, SealedCapsule,
-    SessionBinding, TenantId, Value,
+    CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, ObservedWindow, SealContext,
+    SealedCapsule, SessionBinding, TenantId, Value,
 };
 use aster_ipc::{
     read_frame, write_frame, InitialCapsuleGrant, IpcError, IpcRequest, IpcResponse, ModuleBundle,
-    WireBrokerError,
+    WireBrokerError, WireCommitOutcome,
 };
+use aster_store_postgres::{WritePlane, WritePlaneConfig};
 
 fn main() {
     if let Err(error) = run() {
@@ -72,6 +75,13 @@ struct BrokerConfig {
     /// `ASTER_STORE=postgres`; memory-store brokerds report module loading as
     /// unavailable even when this is set.
     modules_dir: Option<PathBuf>,
+    /// Memory-mode ONLY (prototype stand-in): the lease epoch this broker
+    /// commits under and stamps into every minted session, default 1. In
+    /// Postgres mode the epoch comes from `WritePlane::acquire_lease` at
+    /// boot — the storage lease authority — and this env is ignored
+    /// (C-CHANNEL obligation #2: the epoch is never self-asserted where a
+    /// real authority exists).
+    lease_epoch: Option<u64>,
 }
 
 impl BrokerConfig {
@@ -91,6 +101,7 @@ impl BrokerConfig {
         let db_schema =
             env_optional_string("ASTER_DB_SCHEMA")?.unwrap_or_else(|| "public".to_string());
         let modules_dir = env_optional_string("ASTER_MODULES_DIR")?.map(PathBuf::from);
+        let lease_epoch = env_optional_u64("ASTER_LEASE_EPOCH")?;
         Ok(Self {
             socket_path,
             tenant,
@@ -102,6 +113,7 @@ impl BrokerConfig {
             db_url,
             db_schema,
             modules_dir,
+            lease_epoch,
         })
     }
 }
@@ -154,22 +166,34 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Arc<dyn ...> shape lets the request loop stay backend-agnostic;
     // this is the single dispatch point and adding more backends
     // (e.g. ASTER_STORE=mock for fuzz harnesses) only touches this
-    // match.
+    // match. The commit fence rides the same dispatch: the write path's
+    // lease authority is inseparable from where commits land.
     let configured_ts = config.snapshot_ts;
-    let (store, module_source): (
+    let (store, module_source, fence, authority_epoch): (
         Arc<dyn CapsuleStore + Send + Sync>,
         Arc<dyn ModuleBundleSource + Send + Sync>,
+        Arc<dyn CommitFence>,
+        u64,
     ) = match config.store_kind {
         StoreKind::Memory => {
-            let mvcc = MvccStore::new();
+            let mvcc = Arc::new(MvccStore::new());
             for (key, document) in config.seeds {
                 mvcc.seed(key, document);
             }
+            // Prototype stand-in (C-CHANNEL obligation #2 applies only
+            // where a real lease authority exists): memory mode has no
+            // durable authority, so the epoch comes from the launch env
+            // (default 1) and seeds the in-memory fence's lease directly.
+            let epoch = config.lease_epoch.unwrap_or(1);
+            let fence = MemoryFence::new(mvcc.clone());
+            fence.seed_lease(&config.tenant.0, &config.deployment.0, epoch);
             (
-                Arc::new(mvcc),
+                mvcc,
                 Arc::new(NoModuleBundleSource {
                     reason: "module loading requires ASTER_STORE=postgres",
                 }),
+                Arc::new(fence),
+                epoch,
             )
         }
         StoreKind::Postgres => {
@@ -178,7 +202,7 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
                 .clone()
                 .expect("postgres url present by from_env");
             let pg_cfg = aster_store_postgres::PostgresConfig {
-                url,
+                url: url.clone(),
                 schema: config.db_schema.clone(),
                 modules_dir: config.modules_dir.clone(),
                 ..aster_store_postgres::PostgresConfig::default()
@@ -192,12 +216,51 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
                 aster_store_postgres::PostgresCapsuleStore::connect(pg_cfg)
                     .map_err(|err| format!("postgres connect: {err}"))?,
             );
+            // Lease authority (C-CHANNEL obligation #2): acquire the
+            // single-writer lease at boot. The resulting epoch is BOTH
+            // this broker's committer epoch and the lease_epoch stamped
+            // into every minted session — the env variable is not
+            // consulted. Sessions minted before a failover die naturally:
+            // once a new holder acquires, the fence's V2 check rejects
+            // their context epoch.
+            let plane = Arc::new(
+                WritePlane::connect(WritePlaneConfig {
+                    url,
+                    ..WritePlaneConfig::default()
+                })
+                .map_err(|err| format!("write plane connect: {err}"))?,
+            );
+            plane
+                .ensure_schema()
+                .map_err(|err| format!("write plane schema: {err}"))?;
+            let holder = format!("aster_brokerd:{}", std::process::id());
+            let epoch =
+                WritePlane::acquire_lease(&plane, &config.tenant.0, &config.deployment.0, &holder)
+                    .map_err(|err| format!("acquire lease: {err}"))?;
+            if config.lease_epoch.is_some() {
+                eprintln!(
+                    "aster_brokerd: ASTER_LEASE_EPOCH is ignored with ASTER_STORE=postgres — \
+                     the storage lease authority owns the epoch"
+                );
+            }
             (
                 store.clone() as Arc<dyn CapsuleStore + Send + Sync>,
                 store as Arc<dyn ModuleBundleSource + Send + Sync>,
+                plane,
+                epoch,
             )
         }
     };
+    // Harnesses parse this line to launch cells with the matching epoch
+    // (see docker/smoke-postgres.sh) — keep the `lease epoch=` shape.
+    eprintln!(
+        "aster_brokerd: lease epoch={} source={}",
+        authority_epoch,
+        match config.store_kind {
+            StoreKind::Memory => "env-standin",
+            StoreKind::Postgres => "lease-authority",
+        }
+    );
     let snapshot_ts = if configured_ts == 0 {
         store
             .snapshot_ts()
@@ -221,6 +284,8 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
         deployment: config.deployment,
         snapshot_ts,
         sessions: SessionTable::default(),
+        fence,
+        authority_epoch,
     };
 
     let listener = UnixListener::bind(&config.socket_path)?;
@@ -311,9 +376,10 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
         } => {
             // Only brokerd mints session bindings — a pre-bound context in
             // an InitialCapsule request is confused or hostile, never
-            // legitimate. The request's cell_id/lease_epoch stand in for
-            // trusted launch metadata in this prototype (a production
-            // broker reads them from the launch channel, not the payload).
+            // legitimate. The request's cell_id stands in for trusted
+            // launch metadata in this prototype (a production broker reads
+            // it from the launch channel, not the payload — the remaining
+            // C-CHANNEL obligation #1).
             if context.session.is_some() {
                 return (
                     IpcResponse::InitialCapsule(Err(WireBrokerError::new(
@@ -323,8 +389,27 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                     false,
                 );
             }
-            let session = broker.sessions.mint(&context.cell_id, context.lease_epoch);
-            let bound = SealContext::bound(context.cell_id, context.lease_epoch, session);
+            // The lease epoch, by contrast, is authority-derived since S9a
+            // (C-CHANNEL obligation #2): every minted session carries the
+            // broker's own epoch. A context claiming any other value is a
+            // stale pre-failover launch config or hostile — refuse at mint
+            // so the cell fails fast instead of dying on its first hydrate.
+            if context.lease_epoch != broker.authority_epoch {
+                return (
+                    IpcResponse::InitialCapsule(Err(WireBrokerError::new(
+                        "stale_lease_epoch",
+                        format!(
+                            "context lease epoch {} does not match the lease authority epoch {}",
+                            context.lease_epoch, broker.authority_epoch
+                        ),
+                    ))),
+                    false,
+                );
+            }
+            let session = broker
+                .sessions
+                .mint(&context.cell_id, broker.authority_epoch);
+            let bound = SealContext::bound(context.cell_id, broker.authority_epoch, session);
             let result =
                 match broker.initial_capsule(&bound, tenant, deployment, snapshot_ts, prewarm) {
                     Ok(capsule) => Ok(InitialCapsuleGrant { capsule, session }),
@@ -332,7 +417,7 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                         // A failed grant returned no session id to anyone —
                         // drop the reservation so hostile cells can't bloat the
                         // table with failing requests.
-                        broker.sessions.remove(&session);
+                        let _ = broker.sessions.remove(&session);
                         Err(WireBrokerError::from(error))
                     }
                 };
@@ -389,6 +474,55 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             ),
             false,
         ),
+        IpcRequest::Commit {
+            session,
+            capsule,
+            declared_reads,
+            writes,
+        } => {
+            // Commit carries no separate context claim — the capsule's own
+            // seal fields ARE the claimed context for the session
+            // chokepoint. Equality against the trusted table entry happens
+            // in resolve_bound_context; the seal MAC against the rebuilt
+            // bound context (inside `commit`) is the enforcement.
+            let claimed = SealContext {
+                cell_id: capsule.seal().cell_id.clone(),
+                lease_epoch: capsule.seal().lease_epoch,
+                session: capsule.seal().session,
+            };
+            let result = broker
+                .resolve_bound_context(session, &claimed)
+                .and_then(|bound| {
+                    let outcome = broker.commit(&bound, capsule, &declared_reads, &writes);
+                    // Session end-of-life (the S4 deferred obligation): one
+                    // session = one transaction attempt. EVERY answer past
+                    // the session gate — Committed, Conflict, or a
+                    // structured rejection — closes the session; only
+                    // transport failures (which never reach this point)
+                    // leave it open. Replay of the ISSUED capsule bytes is
+                    // inevitable under bearer semantics (theorem CE2.1);
+                    // closing the session here is what bounds it.
+                    if let Some(session) = session {
+                        let _ = broker.sessions.remove(&session);
+                    }
+                    outcome
+                });
+            (IpcResponse::Commit(result), false)
+        }
+        // Abort is the no-commit end-of-life for a session: same closure
+        // rule as Commit, no capsule and no data authority involved. The
+        // session gate still applies in table form — unknown ids are
+        // rejected, not silently ignored, so double-closes surface.
+        IpcRequest::Abort { session } => {
+            let result = match broker.sessions.remove(&session) {
+                Some(_) => Ok(()),
+                None => Err(WireBrokerError::new(
+                    "unknown_session",
+                    "session id is not registered with this broker",
+                )),
+            };
+            (IpcResponse::Abort(result), false)
+        }
         // Shutdown is process-lifecycle scaffolding for the prototype
         // harnesses, not a capsule verb — it carries no capsule and grants
         // no data authority, so it stays outside the session gate.
@@ -403,10 +537,12 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
 /// context is only checked for equality against the record and then
 /// discarded, never used as authority.
 ///
-/// Unbounded for now: sessions get no end-of-life until the S9 commit verb
-/// lands (commit/abort closes a session; lease-epoch fencing sweeps the
-/// rest). Until then a hostile cell can grow this map by hammering
-/// InitialCapsule — accepted for the prototype, tracked for S9.
+/// End-of-life (S9a): one session = one transaction attempt — Commit (any
+/// structured answer) and Abort both remove the entry, and subsequent
+/// verbs on the id get `unknown_session`. What remains unbounded is the
+/// MINT side: a hostile cell can still grow the table by hammering
+/// InitialCapsule and never finishing — accepted for the prototype,
+/// alongside launch-token minting (C-CHANNEL obligation #1).
 #[derive(Default)]
 struct SessionTable {
     sessions: Mutex<HashMap<SessionBinding, SessionEntry>>,
@@ -442,11 +578,14 @@ impl SessionTable {
         }
     }
 
-    fn remove(&self, session: &SessionBinding) {
+    /// Remove a session, returning its entry so callers can distinguish
+    /// a real close from a no-op (Abort's unknown_session answer rides
+    /// on this — one atomic map op, no lookup-then-remove race).
+    fn remove(&self, session: &SessionBinding) -> Option<SessionEntry> {
         self.sessions
             .lock()
             .expect("session table lock")
-            .remove(session);
+            .remove(session)
     }
 
     fn lookup(&self, session: &SessionBinding) -> Option<SessionEntry> {
@@ -466,6 +605,14 @@ struct ProcessBroker {
     deployment: DeploymentId,
     snapshot_ts: u64,
     sessions: SessionTable,
+    /// The commit fence commits land through: the Postgres `WritePlane`
+    /// in postgres mode, `MemoryFence` over the read store otherwise.
+    fence: Arc<dyn CommitFence>,
+    /// The lease epoch this broker holds — acquired from the storage
+    /// lease authority at boot in postgres mode, env stand-in (default 1)
+    /// in memory mode. Committer epoch for every fence call AND the
+    /// lease_epoch stamped into every minted session.
+    authority_epoch: u64,
 }
 
 impl ProcessBroker {
@@ -548,6 +695,91 @@ impl ProcessBroker {
         self.module_source
             .load_module_bundle(&path)
             .map(|bundle| bundle.map(|bytes| (path, bytes)))
+    }
+
+    /// The theorem's fence admission path (§1.8, Variante B): verify the
+    /// capsule seal against the session-bound context, validate the
+    /// declared subset against the sealed observation set, reduce
+    /// everything to a `FenceInput`, and let the commit fence decide.
+    fn commit(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        declared_reads: &[DocumentId],
+        writes: &[(DocumentId, Option<Document>)],
+    ) -> Result<WireCommitOutcome, WireBrokerError> {
+        // (a) Seal verification against the table-rebuilt bound context —
+        // the same trust chokepoint as every hydrate — plus the broker's
+        // tenant/deployment/snapshot pins.
+        let capsule = capsule
+            .into_capsule(&self.seal_key, context)
+            .map_err(|error| WireBrokerError::from(BrokerError::from(error)))?;
+        if capsule.tenant != self.tenant {
+            return Err(WireBrokerError::from(BrokerError::TenantMismatch));
+        }
+        if capsule.deployment != self.deployment {
+            return Err(WireBrokerError::from(BrokerError::DeploymentMismatch));
+        }
+        if capsule.ts != self.snapshot_ts {
+            return Err(WireBrokerError::from(BrokerError::Remote(format!(
+                "capsule snapshot_ts {} is not broker snapshot {}",
+                capsule.ts, self.snapshot_ts
+            ))));
+        }
+        // (b) Variante B declaration check (Repair B-SUBSET): every
+        // declared point must reference an observation atom the sealed
+        // capsule actually carries, without duplicates. The INVERSE is
+        // legal by design: a capsule key left undeclared demotes that
+        // dependency to an authorized blind write — T2 still orders it;
+        // omission costs the cell its own conflict protection, never
+        // anyone else's safety.
+        let mut declared = BTreeSet::new();
+        for key in declared_reads {
+            if !capsule.docs.contains_key(key) {
+                return Err(WireBrokerError::new(
+                    "declared_read_not_in_capsule",
+                    format!(
+                        "declared read {:?} is not an observation this capsule carries",
+                        key.0
+                    ),
+                ));
+            }
+            if !declared.insert(key) {
+                return Err(WireBrokerError::new(
+                    "duplicate_declared_read",
+                    format!("declared read {:?} appears more than once", key.0),
+                ));
+            }
+        }
+        // (c) Build the fence input. Point observations are the declared
+        // keys — the versioned state they were observed at is pinned by
+        // the sealed capsule at `capsule.ts` (S-SNAPSHOT), and the fence's
+        // `Changed({k}; (s, h])` predicate needs only the key. Conflict
+        // windows are derived by THIS committer from ALL sealed range
+        // certificates (theorem A6 — windows are never a cell claim);
+        // conservative inclusion of every certificate is the honest
+        // default: a scan the declaration forgot still keeps its phantom
+        // protection, at the price of spurious aborts, never a missed
+        // conflict.
+        let windows: Vec<ObservedWindow> = capsule
+            .ranges
+            .iter()
+            .map(|certificate| certificate.window())
+            .collect();
+        let input = FenceInput {
+            tenant: &self.tenant.0,
+            deployment: &self.deployment.0,
+            committer_epoch: self.authority_epoch,
+            context_epoch: context.lease_epoch,
+            snapshot: capsule.ts,
+            read_points: declared_reads,
+            read_windows: &windows,
+            writes,
+        };
+        self.fence
+            .commit(&input)
+            .map(WireCommitOutcome::from)
+            .map_err(|error| WireBrokerError::from(BrokerError::from(error)))
     }
 }
 
@@ -706,6 +938,14 @@ mod tests {
     /// tests must go through `handle_request` — calling the trait method
     /// directly would skip the layer under test.
     fn initial_grant(broker: &ProcessBroker, context: &SealContext) -> InitialCapsuleGrant {
+        initial_grant_with_prewarm(broker, context, Vec::new())
+    }
+
+    fn initial_grant_with_prewarm(
+        broker: &ProcessBroker,
+        context: &SealContext,
+        prewarm: Vec<DocumentId>,
+    ) -> InitialCapsuleGrant {
         match handle_request(
             broker,
             IpcRequest::InitialCapsule {
@@ -713,7 +953,7 @@ mod tests {
                 tenant: TenantId::new("tenant-test"),
                 deployment: DeploymentId::new("dep-test"),
                 snapshot_ts: 1,
-                prewarm: Vec::new(),
+                prewarm,
             },
         )
         .0
@@ -963,6 +1203,8 @@ mod tests {
             deployment: DeploymentId::new("dep-test"),
             snapshot_ts,
             sessions: SessionTable::default(),
+            fence: Arc::new(MemoryFence::new(store.clone())),
+            authority_epoch: 1,
         };
         let context = SealContext::new("cell-a", 1);
         let grant = initial_grant(&broker, &context);
@@ -1098,16 +1340,370 @@ mod tests {
         }
     }
 
+    /// Drive the Commit verb through the full wire path.
+    fn commit_request(
+        broker: &ProcessBroker,
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        declared_reads: Vec<DocumentId>,
+        writes: Vec<(DocumentId, Option<Document>)>,
+    ) -> Result<WireCommitOutcome, WireBrokerError> {
+        match handle_request(
+            broker,
+            IpcRequest::Commit {
+                session,
+                capsule,
+                declared_reads,
+                writes,
+            },
+        )
+        .0
+        {
+            IpcResponse::Commit(result) => result,
+            other => panic!("expected a Commit response, got {other:?}"),
+        }
+    }
+
+    fn put(key: &str, value: i64) -> (DocumentId, Option<Document>) {
+        (DocumentId::new(key), Some(doc_with_i64("value", value)))
+    }
+
+    /// InitialCapsule mints sessions with the broker's OWN epoch; a
+    /// context claiming any other epoch is refused at mint (C-CHANNEL
+    /// obligation #2 — the epoch is authority-derived, never accepted
+    /// from the payload) and leaves no session behind.
+    #[test]
+    fn initial_capsule_rejects_stale_lease_epoch() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let response = handle_request(
+            &broker,
+            IpcRequest::InitialCapsule {
+                context: SealContext::new("cell-a", 9),
+                tenant: TenantId::new("tenant-test"),
+                deployment: DeploymentId::new("dep-test"),
+                snapshot_ts: 1,
+                prewarm: Vec::new(),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::InitialCapsule(Err(error)) => {
+                assert_eq!(error.code, "stale_lease_epoch", "got {error:?}");
+            }
+            other => panic!("stale-epoch mint should fail, got {other:?}"),
+        }
+        assert!(
+            broker
+                .sessions
+                .sessions
+                .lock()
+                .expect("session table lock")
+                .is_empty(),
+            "refused mint must not leak a table entry"
+        );
+    }
+
+    /// Happy path: declared subset + fence Committed, and the write is
+    /// visible through the shared store the fence appended into.
+    #[test]
+    fn commit_happy_path_appends_through_the_fence() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7)); // head = broker snapshot = 1
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        let outcome = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            vec![DocumentId::new("docs/1")],
+            vec![put("docs/2", 42)],
+        )
+        .expect("commit should pass the fence");
+        assert_eq!(outcome, WireCommitOutcome::Committed { ts: 2 });
+        let written = store.read_at(&DocumentId::new("docs/2"), 2);
+        assert_eq!(written.version, Some(2));
+        assert!(written.document.is_some(), "fence write must be visible");
+    }
+
+    /// Variante B omission (T2): a capsule key left UNdeclared is a legal
+    /// blind write — the fence must not conflict on interference with an
+    /// observation the cell chose not to declare.
+    #[test]
+    fn undeclared_capsule_key_is_a_legal_blind_write() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        // Interfering write to the OBSERVED-but-undeclared key.
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 8));
+
+        let outcome = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            Vec::new(),
+            vec![put("docs/other", 1)],
+        )
+        .expect("blind write should commit");
+        assert!(
+            matches!(outcome, WireCommitOutcome::Committed { .. }),
+            "omission demotes to an authorized blind write, got {outcome:?}"
+        );
+    }
+
+    /// B-SUBSET: declaring a key the capsule never carried is a structured
+    /// error — and the session still closes (the request spent its one
+    /// transaction attempt).
+    #[test]
+    fn commit_rejects_declared_read_not_in_capsule() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let error = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule.clone(),
+            vec![DocumentId::new("docs/ghost")],
+            vec![put("docs/2", 1)],
+        )
+        .expect_err("undeclarable read must be rejected");
+        assert_eq!(error.code, "declared_read_not_in_capsule", "got {error:?}");
+        assert!(
+            broker.sessions.lookup(&grant.session).is_none(),
+            "a structured commit answer past the session gate closes the session"
+        );
+    }
+
+    /// B-SUBSET also rejects duplicate declarations.
+    #[test]
+    fn commit_rejects_duplicate_declared_read() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        let error = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            vec![DocumentId::new("docs/1"), DocumentId::new("docs/1")],
+            vec![put("docs/2", 1)],
+        )
+        .expect_err("duplicate declaration must be rejected");
+        assert_eq!(error.code, "duplicate_declared_read", "got {error:?}");
+    }
+
+    /// The commit verb goes through the same session chokepoint as every
+    /// capsule verb: no session and unknown sessions are structured
+    /// rejections (and neither touches the fence).
+    #[test]
+    fn commit_requires_a_live_session() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let error = commit_request(
+            &broker,
+            None,
+            grant.capsule.clone(),
+            Vec::new(),
+            vec![put("docs/2", 1)],
+        )
+        .expect_err("unbound commit must fail");
+        assert_eq!(error.code, "session_required", "got {error:?}");
+
+        let error = commit_request(
+            &broker,
+            Some(SessionBinding::from_bytes([0x77; 32])),
+            grant.capsule,
+            Vec::new(),
+            vec![put("docs/2", 1)],
+        )
+        .expect_err("unknown-session commit must fail");
+        assert_eq!(error.code, "unknown_session", "got {error:?}");
+    }
+
+    /// Session end-of-life: a commit (any outcome) closes the session, so
+    /// the next verb on it is unknown.
+    #[test]
+    fn commit_closes_the_session() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        let outcome = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule.clone(),
+            vec![DocumentId::new("docs/1")],
+            vec![put("docs/2", 1)],
+        )
+        .expect("commit");
+        assert!(matches!(outcome, WireCommitOutcome::Committed { .. }));
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: Some(grant.session),
+                capsule: grant.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "unknown_session", "got {error:?}");
+            }
+            other => panic!("post-commit verb should fail, got {other:?}"),
+        }
+    }
+
+    /// Abort closes the session without committing; a second abort (or any
+    /// later verb) sees unknown_session.
+    #[test]
+    fn abort_closes_the_session() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::Abort {
+                session: grant.session,
+            },
+        )
+        .0;
+        assert!(
+            matches!(response, IpcResponse::Abort(Ok(()))),
+            "first abort should close cleanly, got {response:?}"
+        );
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::Abort {
+                session: grant.session,
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::Abort(Err(error)) => {
+                assert_eq!(error.code, "unknown_session", "got {error:?}");
+            }
+            other => panic!("double abort should fail, got {other:?}"),
+        }
+
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context,
+                session: Some(grant.session),
+                capsule: grant.capsule,
+                key: DocumentId::new("docs/1"),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "unknown_session", "got {error:?}");
+            }
+            other => panic!("post-abort verb should fail, got {other:?}"),
+        }
+    }
+
+    /// A session minted before a failover dies at the FENCE, not at the
+    /// session table: after a new holder acquires the lease, the old
+    /// context epoch is rejected by the V2 check as a structured
+    /// StaleEpoch outcome.
+    #[test]
+    fn commit_stale_epoch_context_rejected_via_fence_outcome() {
+        let (broker, store, fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        // Failover: a new holder acquires; the lease moves to epoch 2
+        // while this broker (and the minted session) stay at 1.
+        let new_epoch = fence
+            .acquire_lease("tenant-test", "dep-test", "committer-b")
+            .expect("failover acquire");
+        assert_eq!(new_epoch, 2);
+
+        let outcome = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            vec![DocumentId::new("docs/1")],
+            vec![put("docs/2", 1)],
+        )
+        .expect("fence answers, structured");
+        assert_eq!(outcome, WireCommitOutcome::StaleEpoch { lease_epoch: 2 });
+    }
+
+    /// Conflict surfaces on the wire: a write lands between capsule
+    /// issuance and commit, touching a DECLARED read.
+    #[test]
+    fn commit_conflict_when_declared_read_changed_after_issuance() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let context = SealContext::new("cell-a", 1);
+        let grant = initial_grant_with_prewarm(&broker, &context, vec![DocumentId::new("docs/1")]);
+
+        // Interfering write after issuance (a foreign writer, via the
+        // store seam the fence's admission window must catch).
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 8));
+
+        let outcome = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            vec![DocumentId::new("docs/1")],
+            vec![put("docs/2", 1)],
+        )
+        .expect("commit answers, structured");
+        assert_eq!(
+            outcome,
+            WireCommitOutcome::Conflict {
+                key: DocumentId::new("docs/1")
+            }
+        );
+    }
+
     fn test_broker(module_source: Arc<dyn ModuleBundleSource + Send + Sync>) -> ProcessBroker {
-        ProcessBroker {
-            store: Arc::new(MvccStore::new()),
+        let (broker, _store, _fence) = test_broker_parts(module_source);
+        broker
+    }
+
+    /// Like `test_broker`, but hands back the concrete store + fence so
+    /// commit tests can seed interfering writes and move the lease.
+    /// The fence rides the SAME `MvccStore` the broker reads from —
+    /// mirroring run_broker's memory arm — and its lease is seeded to
+    /// the broker's authority epoch (1), like the env stand-in.
+    fn test_broker_parts(
+        module_source: Arc<dyn ModuleBundleSource + Send + Sync>,
+    ) -> (ProcessBroker, Arc<MvccStore>, Arc<MemoryFence>) {
+        let store = Arc::new(MvccStore::new());
+        let fence = Arc::new(MemoryFence::new(store.clone()));
+        fence.seed_lease("tenant-test", "dep-test", 1);
+        let broker = ProcessBroker {
+            store: store.clone(),
             module_source,
             seal_key: CapsuleSealKey::derive_for_tests(b"test-seed"),
             tenant: TenantId::new("tenant-test"),
             deployment: DeploymentId::new("dep-test"),
             snapshot_ts: 1,
             sessions: SessionTable::default(),
-        }
+            fence: fence.clone(),
+            authority_epoch: 1,
+        };
+        (broker, store, fence)
     }
 
     struct FakeModuleSource {
@@ -1126,5 +1722,310 @@ mod tests {
         fn load_module_bundle(&self, _path: &str) -> Result<Option<Vec<u8>>, BrokerError> {
             Ok(self.bytes.lock().expect("module source mutex").clone())
         }
+    }
+}
+
+/// Postgres-gated commit e2e: the SAME `handle_request` fence admission
+/// path the default suite exercises over `MemoryFence`, against the REAL
+/// `WritePlane` — boot-acquired lease epoch, capsules sealed with it,
+/// point/window conflicts judged by the Postgres fence, and session
+/// end-of-life bounding capsule replay. The read side stays the in-memory
+/// store (the Convex read adapter is not what is under test here); every
+/// conflict is seeded through the write plane itself, so the admission
+/// decision is 100% Postgres.
+///
+/// Run with:
+///     ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster \
+///         cargo test -p aster-ipc --features postgres-it \
+///         --bin aster_brokerd -- --test-threads=1
+#[cfg(all(test, feature = "postgres-it"))]
+mod pg_commit_e2e {
+    use super::*;
+    use aster_broker::CommitOutcome;
+    use aster_capsule::doc_with_i64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TENANT: &str = "tenant-ipc-it";
+
+    fn url() -> String {
+        std::env::var("ASTER_DB_URL").expect("set ASTER_DB_URL to run postgres-it tests")
+    }
+
+    /// Unique deployment per test run: the `aster` schema is shared with
+    /// the write_plane_it suite, so isolation comes from the log's
+    /// (tenant, deployment) keying, never from schema drops.
+    fn fresh_deployment(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        format!("dep-ipc-{label}-{nanos}")
+    }
+
+    /// brokerd's postgres boot sequence in miniature (run_broker's
+    /// Postgres arm): connect the write plane, ensure the schema, acquire
+    /// the lease — the epoch it returns is the broker's authority_epoch
+    /// AND the epoch stamped into every session. Tests drive
+    /// `handle_request` directly because a binary's internals are not
+    /// linkable from `tests/`.
+    ///
+    /// One blind write seeds `docs/a` on BOTH sides (write-plane log and
+    /// the in-memory read store), so the broker's pinned snapshot (1) is
+    /// a committed prefix of the real log (S-SNAPSHOT).
+    fn pg_broker(deployment: &str) -> (ProcessBroker, Arc<WritePlane>, u64) {
+        let plane = Arc::new(
+            WritePlane::connect(WritePlaneConfig {
+                url: url(),
+                ..WritePlaneConfig::default()
+            })
+            .expect("connect write plane"),
+        );
+        plane.ensure_schema().expect("ensure schema");
+        let epoch = WritePlane::acquire_lease(&plane, TENANT, deployment, "aster_brokerd-it")
+            .expect("boot lease acquire");
+        assert_eq!(epoch, 1, "fresh (tenant, deployment) must start at epoch 1");
+        let seeded = WritePlane::commit(
+            &plane,
+            &FenceInput {
+                tenant: TENANT,
+                deployment,
+                committer_epoch: epoch,
+                context_epoch: epoch,
+                snapshot: 0,
+                read_points: &[],
+                read_windows: &[],
+                writes: &[(DocumentId::new("docs/a"), Some(doc_with_i64("value", 1)))],
+            },
+        )
+        .expect("seed write");
+        assert_eq!(seeded, CommitOutcome::Committed { ts: 1 });
+
+        let store = Arc::new(MvccStore::new());
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        let broker = ProcessBroker {
+            store,
+            module_source: Arc::new(NoModuleBundleSource {
+                reason: "no module loading in the commit e2e",
+            }),
+            seal_key: CapsuleSealKey::derive_for_tests(b"pg-commit-e2e-seed"),
+            tenant: TenantId::new(TENANT),
+            deployment: DeploymentId::new(deployment.to_string()),
+            snapshot_ts: 1,
+            sessions: SessionTable::default(),
+            fence: plane.clone(),
+            authority_epoch: epoch,
+        };
+        (broker, plane, epoch)
+    }
+
+    fn grant(broker: &ProcessBroker, deployment: &str, epoch: u64) -> InitialCapsuleGrant {
+        match handle_request(
+            broker,
+            IpcRequest::InitialCapsule {
+                context: SealContext::new("cell-pg", epoch),
+                tenant: TenantId::new(TENANT),
+                deployment: DeploymentId::new(deployment.to_string()),
+                snapshot_ts: 1,
+                prewarm: vec![DocumentId::new("docs/a")],
+            },
+        )
+        .0
+        {
+            IpcResponse::InitialCapsule(Ok(grant)) => grant,
+            other => panic!("initial capsule should succeed, got {other:?}"),
+        }
+    }
+
+    fn commit_request(
+        broker: &ProcessBroker,
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        declared_reads: Vec<DocumentId>,
+        writes: Vec<(DocumentId, Option<Document>)>,
+    ) -> Result<WireCommitOutcome, WireBrokerError> {
+        match handle_request(
+            broker,
+            IpcRequest::Commit {
+                session,
+                capsule,
+                declared_reads,
+                writes,
+            },
+        )
+        .0
+        {
+            IpcResponse::Commit(result) => result,
+            other => panic!("expected a Commit response, got {other:?}"),
+        }
+    }
+
+    fn blind_write(plane: &WritePlane, deployment: &str, epoch: u64, snapshot: u64, key: &str) {
+        let outcome = WritePlane::commit(
+            plane,
+            &FenceInput {
+                tenant: TENANT,
+                deployment,
+                committer_epoch: epoch,
+                context_epoch: epoch,
+                snapshot,
+                read_points: &[],
+                read_windows: &[],
+                writes: &[(DocumentId::new(key), Some(doc_with_i64("value", 9)))],
+            },
+        )
+        .expect("interfering write");
+        assert!(
+            matches!(outcome, CommitOutcome::Committed { .. }),
+            "interfering write must land: {outcome:?}"
+        );
+    }
+
+    /// Happy path against the real fence, then replay-after-close.
+    ///
+    /// CE2.1 note: replay of the ISSUED capsule bytes is inevitable —
+    /// capsules are stateless bearer evidence and the broker stores no
+    /// "latest" digest. Session end-of-life is what bounds it: the commit
+    /// closed the session, so the replayed bytes die at the session gate
+    /// (`unknown_session`) before any fence work.
+    #[test]
+    fn pg_commit_through_boot_epoch_and_replay_after_close_rejected() {
+        let deployment = fresh_deployment("happy");
+        let (broker, plane, epoch) = pg_broker(&deployment);
+        let g = grant(&broker, &deployment, epoch);
+
+        let outcome = commit_request(
+            &broker,
+            Some(g.session),
+            g.capsule.clone(),
+            vec![DocumentId::new("docs/a")],
+            vec![(DocumentId::new("docs/out"), Some(doc_with_i64("value", 2)))],
+        )
+        .expect("commit through the real fence");
+        assert_eq!(outcome, WireCommitOutcome::Committed { ts: 2 });
+        // The append is in the real log.
+        let written = plane
+            .read_point(TENANT, &deployment, &DocumentId::new("docs/out"), 2)
+            .expect("read back");
+        assert_eq!(written.version, Some(2));
+
+        // Replay the identical request — same session id, same capsule.
+        let error = commit_request(
+            &broker,
+            Some(g.session),
+            g.capsule,
+            vec![DocumentId::new("docs/a")],
+            vec![(DocumentId::new("docs/out"), Some(doc_with_i64("value", 3)))],
+        )
+        .expect_err("replay after close must be rejected");
+        assert_eq!(error.code, "unknown_session", "got {error:?}");
+        // And nothing landed for it.
+        let after = plane
+            .snapshot_ts(TENANT, &deployment)
+            .expect("tip after replay");
+        assert_eq!(after, 2, "rejected replay must not append");
+    }
+
+    /// A write-plane commit between issuance and commit conflicts a
+    /// declared point read.
+    #[test]
+    fn pg_point_conflict_between_issuance_and_commit() {
+        let deployment = fresh_deployment("point");
+        let (broker, plane, epoch) = pg_broker(&deployment);
+        let g = grant(&broker, &deployment, epoch);
+
+        blind_write(&plane, &deployment, epoch, 1, "docs/a");
+
+        let outcome = commit_request(
+            &broker,
+            Some(g.session),
+            g.capsule,
+            vec![DocumentId::new("docs/a")],
+            vec![(DocumentId::new("docs/out"), Some(doc_with_i64("value", 2)))],
+        )
+        .expect("fence answers, structured");
+        assert_eq!(
+            outcome,
+            WireCommitOutcome::Conflict {
+                key: DocumentId::new("docs/a")
+            }
+        );
+    }
+
+    /// Range windows ride every commit (conservative inclusion of ALL
+    /// sealed certificates), so a phantom insert into a scanned prefix
+    /// conflicts even with an EMPTY declared point set.
+    #[test]
+    fn pg_window_conflict_from_sealed_certificate() {
+        let deployment = fresh_deployment("window");
+        let (broker, plane, epoch) = pg_broker(&deployment);
+        let g = grant(&broker, &deployment, epoch);
+
+        // Hydrate a prefix scan into the capsule (read side, at s=1):
+        // docs/a is the only live key, so the certificate is Exhausted
+        // and its window covers the whole docs/ prefix.
+        let context = SealContext::new("cell-pg", epoch);
+        let sealed = match handle_request(
+            &broker,
+            IpcRequest::HydratePrefix {
+                context,
+                session: Some(g.session),
+                capsule: g.capsule,
+                prefix: "docs/".into(),
+                limit: 10,
+            },
+        )
+        .0
+        {
+            IpcResponse::HydratePrefix(Ok(sealed)) => sealed,
+            other => panic!("prefix hydrate should succeed, got {other:?}"),
+        };
+        assert_eq!(sealed.capsule().ranges.len(), 1);
+
+        // Phantom insert into the scanned prefix, through the write plane.
+        blind_write(&plane, &deployment, epoch, 1, "docs/zz");
+
+        let outcome = commit_request(
+            &broker,
+            Some(g.session),
+            sealed,
+            Vec::new(),
+            vec![(DocumentId::new("docs/out"), Some(doc_with_i64("value", 2)))],
+        )
+        .expect("fence answers, structured");
+        assert_eq!(
+            outcome,
+            WireCommitOutcome::Conflict {
+                key: DocumentId::new("docs/zz")
+            }
+        );
+    }
+
+    /// Failover: a new holder acquires the lease AFTER this broker booted
+    /// and minted a session. The session dies naturally at the fence's V2
+    /// epoch check — a structured StaleEpoch, not a session-table error.
+    #[test]
+    fn pg_stale_epoch_after_failover_rejected_by_fence() {
+        let deployment = fresh_deployment("failover");
+        let (broker, plane, epoch) = pg_broker(&deployment);
+        let g = grant(&broker, &deployment, epoch);
+
+        let new_epoch = WritePlane::acquire_lease(&plane, TENANT, &deployment, "committer-b")
+            .expect("failover acquire");
+        assert_eq!(new_epoch, epoch + 1);
+
+        let outcome = commit_request(
+            &broker,
+            Some(g.session),
+            g.capsule,
+            vec![DocumentId::new("docs/a")],
+            vec![(DocumentId::new("docs/out"), Some(doc_with_i64("value", 2)))],
+        )
+        .expect("fence answers, structured");
+        assert_eq!(
+            outcome,
+            WireCommitOutcome::StaleEpoch {
+                lease_epoch: new_epoch
+            }
+        );
     }
 }

@@ -5,8 +5,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aster_broker::{BrokerError, CapsuleBrokerClient};
-use aster_capsule::{DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId};
-use aster_ipc::{write_frame, IpcRequest, IpcResponse, UdsCapsuleBrokerClient};
+use aster_capsule::{
+    doc_with_i64, DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId,
+};
+use aster_ipc::{write_frame, IpcRequest, IpcResponse, UdsCapsuleBrokerClient, WireCommitOutcome};
 
 #[test]
 fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
@@ -52,6 +54,13 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"output\":42"), "stdout={stdout}");
     assert!(stdout.contains("\"traps\":1"), "stdout={stdout}");
+    // R4: the envelope carries the runtime's consumption ledger
+    // (BTreeSet-ordered) so a harness can drive the Commit verb's
+    // declared_reads from the real observations.
+    assert!(
+        stdout.contains("\"consumed_reads\":[\"counters/a\",\"counters/b\"]"),
+        "stdout={stdout}"
+    );
 
     // Attack simulation from the host test: get a capsule legitimately for
     // cell-a, then present it under cell-b over the real socket — on
@@ -270,6 +279,140 @@ fn prefix_hydrate_over_uds_carries_certificate() {
     assert!(broker.wait().expect("broker wait").success());
 }
 
+/// S9a closes the loop over the real socket: initial → hydrate → commit
+/// through the in-memory fence. The commit CLOSES the session (one
+/// session = one transaction attempt), the identical replayed request
+/// dies at the session gate, a second reader whose declared absence-read
+/// was hit by the first commit gets a structured Conflict, and Abort is
+/// the no-commit close.
+#[test]
+fn commit_verb_closes_the_loop_and_the_session() {
+    let temp = TempDir::new("aster-ipc-commit");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let context = SealContext::new("cell-commit", 7);
+    let tenant = TenantId::new("tenant-proc");
+    let deployment = DeploymentId::new("dep-proc");
+
+    // Reader-writer: observe counters/a (prewarm) + counters/b (trap),
+    // then commit a write declaring both reads (Variante B subset —
+    // here, the full observation set).
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let sealed = client
+        .initial_capsule(
+            &context,
+            tenant.clone(),
+            deployment.clone(),
+            2,
+            vec![DocumentId::new("counters/a")],
+        )
+        .expect("initial capsule");
+    let session = client.session().expect("session held");
+    let sealed = client
+        .hydrate_point(&context, sealed, DocumentId::new("counters/b"))
+        .expect("hydrate counters/b");
+    let replay_capsule = sealed.clone();
+    let outcome = client
+        .commit(
+            sealed,
+            vec![DocumentId::new("counters/a"), DocumentId::new("counters/b")],
+            vec![(
+                DocumentId::new("counters/total"),
+                Some(doc_with_i64("value", 42)),
+            )],
+        )
+        .expect("commit over UDS");
+    assert_eq!(outcome, WireCommitOutcome::Committed { ts: 3 });
+    assert!(
+        client.session().is_none(),
+        "client drops the session the broker closed"
+    );
+
+    // Session end-of-life: the same bytes replayed on the closed session
+    // die at the session gate. CE2.1: replay of the ISSUED capsule is
+    // inevitable under bearer semantics — session EOL is what bounds it.
+    let response = client
+        .raw_call(IpcRequest::Commit {
+            session: Some(session),
+            capsule: replay_capsule.clone(),
+            declared_reads: vec![DocumentId::new("counters/a")],
+            writes: vec![(
+                DocumentId::new("counters/total"),
+                Some(doc_with_i64("value", 43)),
+            )],
+        })
+        .expect("raw replay response");
+    match response {
+        IpcResponse::Commit(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("replay after close should fail, got {other:?}"),
+    }
+    // ... and so does any hydrate on the closed session.
+    let response = client
+        .raw_call(IpcRequest::HydratePoint {
+            context: context.clone(),
+            session: Some(session),
+            capsule: replay_capsule,
+            key: DocumentId::new("counters/b"),
+        })
+        .expect("raw post-commit hydrate response");
+    match response {
+        IpcResponse::HydratePoint(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("post-commit hydrate should fail, got {other:?}"),
+    }
+
+    // A second reader still snapshotted at s=2 observes counters/total as
+    // ABSENT, declares that read, and must conflict: the first commit
+    // wrote it at ts 3 ∈ (2, h] (the absence-flip case, through the wire).
+    let sealed = client
+        .initial_capsule(&context, tenant.clone(), deployment.clone(), 2, Vec::new())
+        .expect("second initial capsule");
+    let sealed = client
+        .hydrate_point(&context, sealed, DocumentId::new("counters/total"))
+        .expect("hydrate counters/total");
+    let outcome = client
+        .commit(
+            sealed,
+            vec![DocumentId::new("counters/total")],
+            vec![(
+                DocumentId::new("counters/other"),
+                Some(doc_with_i64("value", 1)),
+            )],
+        )
+        .expect("conflicting commit over UDS");
+    assert_eq!(
+        outcome,
+        WireCommitOutcome::Conflict {
+            key: DocumentId::new("counters/total")
+        }
+    );
+
+    // Abort: the no-commit close. Double-close surfaces as unknown.
+    let _sealed = client
+        .initial_capsule(&context, tenant, deployment, 2, Vec::new())
+        .expect("third initial capsule");
+    let session = client.session().expect("session held");
+    client.abort().expect("abort over UDS");
+    assert!(client.session().is_none(), "abort drops the held session");
+    let response = client
+        .raw_call(IpcRequest::Abort { session })
+        .expect("raw double-abort response");
+    match response {
+        IpcResponse::Abort(Err(error)) => {
+            assert_eq!(error.code, "unknown_session", "got {error:?}");
+        }
+        other => panic!("double abort should fail, got {other:?}"),
+    }
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
 #[test]
 fn broker_outlives_many_sequential_connections() {
     let temp = TempDir::new("aster-ipc-manyconn");
@@ -447,6 +590,10 @@ fn spawn_broker_with_seed(socket: &Path, seed: &str) -> Child {
         .env("ASTER_DEPLOYMENT", "dep-proc")
         .env("ASTER_SEED_I64", seed)
         .env("ASTER_SEAL_SEED", "process-boundary-test-key")
+        // Memory-mode lease stand-in (S9a): the broker only mints sessions
+        // for contexts claiming ITS epoch, so this must match the epoch 7
+        // every context in this file claims.
+        .env("ASTER_LEASE_EPOCH", "7")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

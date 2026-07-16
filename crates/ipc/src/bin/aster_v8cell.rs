@@ -104,6 +104,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "output": output_json,
         "traps": result.traps,
         "capsule_hash": result.capsule_hash,
+        // Review finding R4 (S9): the runtime's consumption ledger —
+        // deduped, BTreeSet-ordered — rides the envelope so a harness can
+        // drive the Commit verb's declared_reads from what the JS
+        // actually observed (Variante B), not from prewarm guesses.
+        // Additive field; existing consumers keep parsing.
+        "consumed_reads": result.consumed_reads,
     });
     println!("{}", serde_json::to_string(&envelope).unwrap());
     Ok(())

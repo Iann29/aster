@@ -30,3 +30,10 @@ serde_json = "1"
 # Convex's emitted compression; we explicitly disable other features
 # to keep the crate's dep surface narrow.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+# Gates the brokerd commit e2e (`pg_commit_e2e` in bin/aster_brokerd.rs)
+# that fences against a real Postgres via `WritePlane`. Same lane as
+# aster-store-postgres's postgres-it: needs ASTER_DB_URL and
+# --test-threads=1.
+postgres-it = []
