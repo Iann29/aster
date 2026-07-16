@@ -510,10 +510,11 @@ impl WritePlane {
         })
     }
 
-    /// GC: raise the retention low-watermark (never lowers) and compact
-    /// revisions at or below it that are shadowed by a newer revision of
-    /// the same key. Serialized with in-flight fences via the retention
-    /// row lock — this is the sweeper half of Lemma R's pin.
+    /// GC: raise the retention low-watermark (never lowers, never advances
+    /// past the log tip) and compact revisions at or below it that are
+    /// shadowed by a newer revision of the same key. Serialized with
+    /// in-flight fences via the retention row lock — this is the sweeper
+    /// half of Lemma R's pin.
     pub fn advance_retention(
         &self,
         tenant: &str,
@@ -536,7 +537,22 @@ impl WritePlane {
                 .await
                 .map_err(|err| StoreError::Backend(format!("retention lock: {err}")))?
                 .get(0);
-            let effective = current.max(requested);
+            // Clamp to the log tip (stable here: fences also take the
+            // retention row lock before appending). A watermark past the tip
+            // claims retention over events that don't exist yet and would
+            // wedge commit admission permanently — every future fence's
+            // snapshot floor would sit below it, and monotonicity forbids
+            // walking it back.
+            let tip: i64 = tx
+                .query_one(
+                    "SELECT COALESCE(MAX(ts), 0) FROM aster.log
+                     WHERE tenant = $1 AND deployment = $2",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("retention tip: {err}")))?
+                .get(0);
+            let effective = current.max(requested.min(tip));
             tx.execute(
                 "UPDATE aster.retention SET low_watermark = $3
                  WHERE tenant = $1 AND deployment = $2",

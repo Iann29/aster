@@ -227,3 +227,28 @@ java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceReuse.cfg -workers 
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceNoPin.cfg -workers auto -deadlock       # I2 violation, <1s
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceNoPinSound.cfg -workers auto -deadlock  # PASS, ~104s
 ```
+
+---
+
+## Addendum 2026-07-16: retention clamp (liveness fix) re-verification
+
+The liveness observation from the first modeling pass (an above-tip watermark
+permanently wedges commit admission — safety unaffected) was fixed in
+`write_plane.rs::advance_retention`: the applied watermark now clamps to the
+log tip (`current.max(requested.min(tip))`, tip read under the same retention
+row lock), with regression `write_plane_it.rs::retention_watermark_clamps_to_log_tip`.
+`AdvanceRetention(w)` gained the matching guard `w <= Tip`, modeling the
+post-clamp effect. All four configs re-run (TLC 2.19, Java 21, -workers auto
+-deadlock, same commands as above):
+
+| Config | Result | States generated / distinct |
+|---|---|---|
+| AsterFence (positive) | **No error** — all 6 invariants hold | 14,813,201 / 5,956,127 |
+| AsterFenceReuse (F1 negative) | **Invariant I3_EpochBlockOrder violated** (depth 9) | 3,349 / 2,350 |
+| AsterFenceNoPin (Lemma R negative) | **Invariant I2_NoValidationAgainstPruned violated** (depth 10) | 17,851 / 15,206 |
+| AsterFenceNoPinSound (finding) | **No error** — shadowed-only compaction still sound unpinned | 22,175,377 / 7,333,215 |
+
+State counts shrank versus the first pass (e.g. positive 14.9M→14.8M
+generated, NoPinSound 29.8M→22.2M) exactly as expected: the Tip guard removes
+the above-tip GC branches from the reachable space. Both negatives still
+produce their violations, so the model kept its teeth after the change.

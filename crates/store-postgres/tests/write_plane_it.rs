@@ -487,3 +487,37 @@ fn observed_window_types_are_reusable_across_threads() {
     assert!(window.contains(&DocumentId::new("docs/a")));
     assert!(!window.contains(&DocumentId::new("docs/b")));
 }
+
+#[test]
+fn retention_watermark_clamps_to_log_tip() {
+    let plane = fresh_plane();
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire");
+
+    // Empty log: any requested watermark clamps to tip 0 — a fresh
+    // deployment cannot be wedged before its first commit.
+    let effective = plane
+        .advance_retention(TENANT, DEPLOYMENT, 5)
+        .expect("advance on empty log");
+    assert_eq!(effective, 0);
+
+    let tip = match commit_blind(&plane, epoch, 0, "docs/a", 1) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+
+    // A watermark past the tip claims retention over events that don't
+    // exist yet; unclamped it would wedge commit admission permanently
+    // (monotonicity forbids walking it back). It must clamp to the tip...
+    let effective = plane
+        .advance_retention(TENANT, DEPLOYMENT, tip + 1_000)
+        .expect("advance past tip");
+    assert_eq!(effective, tip);
+
+    // ...so admission survives: a fresh snapshot at the tip still commits.
+    assert!(matches!(
+        commit_blind(&plane, epoch, tip, "docs/b", 2),
+        CommitOutcome::Committed { .. }
+    ));
+}

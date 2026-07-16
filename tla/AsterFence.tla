@@ -220,6 +220,10 @@ AdvanceRetention(w) ==
     /\ (RetentionPinned => inflight = None)
     /\ w > floor
     /\ w <= MaxPos
+    \* Code clamp (write_plane.rs): the applied watermark never exceeds the
+    \* log tip — an above-tip watermark would wedge commit admission forever
+    \* (floor never lowers). Guarding w <= Tip models the post-clamp effect.
+    /\ w <= Tip
     /\ floor' = w
     /\ LET dead == {e \in log : e.pos <= w /\ Shadowed(e, w)}
        IN /\ log' = log \ dead
