@@ -15,13 +15,16 @@
 //!   `block_on`s internally; cells see a stable, runtime-free trait.
 //! - All methods take `&self`, so impls must do their own internal
 //!   synchronisation (the in-memory store already has a `Mutex`).
-//! - `read_prefix` matches the existing `prefix_at` shape — point reads plus
-//!   bounded prefix scans cover every read trap the v0.3 prototype emits.
+//! - `scan_prefix` is the certified form of the old `read_prefix`/`prefix_at`
+//!   shape — point reads plus certified bounded prefix scans cover every read
+//!   trap the prototype emits, and the scan now returns the sealed evidence
+//!   the v0.7 write path needs.
 
 use std::sync::Arc;
 
 use aster_capsule::{
-    DeploymentId, DocumentId, MvccStore, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
+    DeploymentId, DocumentId, MvccStore, RangeCertificate, SnapshotCapsule, TenantId, Timestamp,
+    VersionedDocument,
 };
 
 /// Storage backend used by `LocalCapsuleBroker` to satisfy read traps.
@@ -43,14 +46,22 @@ pub trait CapsuleStore: Send + Sync {
     /// outside the retention window.
     fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError>;
 
-    /// Read every document whose key starts with `prefix`, up to `limit` rows,
-    /// at the given snapshot. Used by the v0.3 prefix read trap path.
-    fn read_prefix(
+    /// Certified ascending prefix scan at the given snapshot — the
+    /// `Scan_σs(I, ℓ)` evidence the v0.7 phantom-safe commit path consumes.
+    /// Returns the `RangeCertificate` together with the live entries its
+    /// keys reference (`SnapshotCapsule::hydrate_range` merges both).
+    /// Semantics every impl must honour: latest revision `<= ts` wins;
+    /// tombstoned and post-snapshot keys are skipped and never consume
+    /// limit slots; `stop == Boundary` iff exactly `limit` live entries
+    /// were collected. `limit` must be `>= 1` — the broker rejects zero
+    /// before consulting the store, and impls surface it as a `StoreError`
+    /// rather than fabricating an invalid certificate.
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError>;
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError>;
 
     /// Build the capsule the cell starts with. Default impl loops through
     /// `prewarm` calling `read_point`; the Postgres impl will override with
@@ -125,13 +136,14 @@ impl CapsuleStore for &MvccStore {
         Ok(MvccStore::read_at(self, key, ts))
     }
 
-    fn read_prefix(
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
-        Ok(MvccStore::prefix_at(self, prefix, limit, ts))
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
+        MvccStore::scan_prefix_at(self, prefix, limit, ts)
+            .map_err(|err| StoreError::Backend(format!("scan_prefix: {err}")))
     }
 
     fn build_capsule(
@@ -161,13 +173,14 @@ impl CapsuleStore for MvccStore {
         Ok(MvccStore::read_at(self, key, ts))
     }
 
-    fn read_prefix(
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
-        Ok(MvccStore::prefix_at(self, prefix, limit, ts))
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
+        MvccStore::scan_prefix_at(self, prefix, limit, ts)
+            .map_err(|err| StoreError::Backend(format!("scan_prefix: {err}")))
     }
 
     fn build_capsule(
@@ -195,13 +208,13 @@ impl<S: CapsuleStore + ?Sized> CapsuleStore for Arc<S> {
         (**self).read_point(key, ts)
     }
 
-    fn read_prefix(
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
-        (**self).read_prefix(prefix, limit, ts)
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
+        (**self).scan_prefix(prefix, limit, ts)
     }
 
     fn build_capsule(

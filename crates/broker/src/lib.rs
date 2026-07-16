@@ -23,6 +23,10 @@ pub enum BrokerError {
     Seal(SealError),
     TenantMismatch,
     DeploymentMismatch,
+    /// A prefix hydrate asked for `limit == 0`, which can never produce a
+    /// valid range certificate (Definition 1.1 requires ℓ >= 1). Rejected
+    /// before the seal or store is consulted.
+    ZeroScanLimit,
     Remote(String),
 }
 
@@ -55,6 +59,7 @@ impl std::fmt::Display for BrokerError {
             Self::DeploymentMismatch => {
                 write!(f, "hydrate deployment did not match broker deployment")
             }
+            Self::ZeroScanLimit => write!(f, "prefix scan limit must be >= 1"),
             Self::Remote(error) => write!(f, "remote broker error: {error}"),
         }
     }
@@ -82,6 +87,19 @@ pub trait CapsuleBrokerClient {
         context: &SealContext,
         capsule: SealedCapsule,
         key: DocumentId,
+    ) -> Result<SealedCapsule, BrokerError>;
+
+    /// Certified prefix hydrate: run a limited ascending scan at the
+    /// capsule's snapshot and merge the resulting `RangeCertificate` plus
+    /// live entries into the capsule (`hydrate_range`), resealing it. The
+    /// certificate is evidence about the capsule snapshot — implementations
+    /// must scan at `capsule.ts`, never at the store head.
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
     ) -> Result<SealedCapsule, BrokerError>;
 }
 
@@ -130,6 +148,22 @@ impl<S: CapsuleStore> CapsuleBrokerClient for LocalCapsuleBroker<S> {
         let mut capsule = capsule.into_capsule(&self.seal_key, context)?;
         let value = self.store.read_point(&key, capsule.ts)?;
         capsule.hydrate_point(key, value);
+        Ok(SealedCapsule::new(capsule, &self.seal_key, context))
+    }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        if limit == 0 {
+            return Err(BrokerError::ZeroScanLimit);
+        }
+        let mut capsule = capsule.into_capsule(&self.seal_key, context)?;
+        let (certificate, entries) = self.store.scan_prefix(&prefix, limit, capsule.ts)?;
+        capsule.hydrate_range(certificate, entries);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
 }
@@ -193,6 +227,106 @@ mod tests {
         assert_eq!(
             broker.hydrate_point(&cell_b, sealed, key),
             Err(BrokerError::Seal(SealError::WrongCell))
+        );
+    }
+
+    #[test]
+    fn broker_hydrate_prefix_reseals_with_certificate_evidence() {
+        use aster_capsule::{KeyInterval, ScanStop, WriteSet};
+
+        let store = MvccStore::new();
+        let tenant = TenantId::new("tenant-broker");
+        let deployment = DeploymentId::new("dep-broker");
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        let mut deletion = WriteSet::default();
+        deletion.delete(DocumentId::new("docs/a"));
+        store
+            .commit(store.snapshot_ts(), &Default::default(), &deletion)
+            .expect("tombstone commit");
+        let ts = store.snapshot_ts();
+
+        let broker = LocalCapsuleBroker::new(
+            &store,
+            CapsuleSealKey::derive_for_tests(b"broker-unit-test"),
+        );
+        let context = SealContext::new("cell-1", 9);
+        let sealed = broker
+            .initial_capsule(&context, tenant, deployment, ts, Vec::new())
+            .expect("initial capsule");
+
+        let sealed = broker
+            .hydrate_prefix(&context, sealed, "docs/".to_string(), 1)
+            .expect("hydrate prefix");
+        sealed
+            .verify(broker.seal_key(), &context)
+            .expect("resealed capsule verifies");
+
+        let capsule = sealed.capsule();
+        assert_eq!(capsule.ranges.len(), 1);
+        let certificate = &capsule.ranges[0];
+        certificate.validate().expect("valid certificate");
+        assert_eq!(certificate.interval, KeyInterval::Prefix("docs/".into()));
+        // docs/a is tombstoned at ts — the single limit slot goes to docs/b.
+        assert_eq!(certificate.keys, vec![DocumentId::new("docs/b")]);
+        assert_eq!(certificate.stop, ScanStop::Boundary);
+        let value = capsule
+            .get(&DocumentId::new("docs/b"))
+            .and_then(|doc| doc.document.as_ref())
+            .and_then(|doc| doc.get("value"));
+        assert_eq!(value, Some(&Value::Int(2)));
+
+        // Repeated scans are legal and append in order.
+        let sealed = broker
+            .hydrate_prefix(&context, sealed, "docs/".to_string(), 5)
+            .expect("second hydrate");
+        assert_eq!(sealed.capsule().ranges.len(), 2);
+        assert_eq!(sealed.capsule().ranges[1].stop, ScanStop::Exhausted);
+    }
+
+    #[test]
+    fn broker_rejects_wrong_cell_seal_on_hydrate_prefix() {
+        let store = MvccStore::new();
+        let tenant = TenantId::new("tenant-broker");
+        let deployment = DeploymentId::new("dep-broker");
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 5));
+        let broker = LocalCapsuleBroker::new(
+            &store,
+            CapsuleSealKey::derive_for_tests(b"broker-unit-test"),
+        );
+        let cell_a = SealContext::new("cell-a", 9);
+        let cell_b = SealContext::new("cell-b", 9);
+        let sealed = broker
+            .initial_capsule(&cell_a, tenant, deployment, store.snapshot_ts(), Vec::new())
+            .expect("initial capsule");
+
+        assert_eq!(
+            broker.hydrate_prefix(&cell_b, sealed, "docs/".to_string(), 4),
+            Err(BrokerError::Seal(SealError::WrongCell))
+        );
+    }
+
+    #[test]
+    fn broker_rejects_zero_limit_prefix_hydrate() {
+        let store = MvccStore::new();
+        let broker = LocalCapsuleBroker::new(
+            &store,
+            CapsuleSealKey::derive_for_tests(b"broker-unit-test"),
+        );
+        let context = SealContext::new("cell-1", 9);
+        let sealed = broker
+            .initial_capsule(
+                &context,
+                TenantId::new("tenant-broker"),
+                DeploymentId::new("dep-broker"),
+                store.snapshot_ts(),
+                Vec::new(),
+            )
+            .expect("initial capsule");
+
+        assert_eq!(
+            broker.hydrate_prefix(&context, sealed, "docs/".to_string(), 0),
+            Err(BrokerError::ZeroScanLimit)
         );
     }
 }

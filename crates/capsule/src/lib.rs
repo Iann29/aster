@@ -549,24 +549,66 @@ impl MvccStore {
         Self::read_at_inner(&inner, key, ts)
     }
 
-    pub fn prefix_at(
+    /// Certified ascending prefix scan at snapshot `ts` — the theorem's
+    /// `Scan_σs(I, ℓ)` for `I = Prefix(prefix)` (Definition 1.1).
+    ///
+    /// Visibility is the latest revision with `rev.ts <= ts`. Keys whose
+    /// visible state is a tombstone or that do not exist yet at `ts` are
+    /// skipped and do NOT consume limit slots; keys created after `ts` are
+    /// invisible. The scan collects until `limit` live entries:
+    /// `stop == Boundary` iff exactly `limit` were collected, `Exhausted`
+    /// otherwise (`RangeCertificate::validate` couples the two by design).
+    ///
+    /// Referee finding F2 — completeness is a CALLER contract: a `Boundary`
+    /// certificate only proves the first-`limit` answer, so a caller that
+    /// wants to assert "this is the whole prefix" must request `limit + 1`
+    /// (or otherwise check for an `Exhausted` stop) instead of treating a
+    /// full-limit result as complete.
+    ///
+    /// `limit == 0` cannot produce a valid certificate and is rejected with
+    /// `RangeCertificateError::ZeroLimit` before scanning.
+    pub fn scan_prefix_at(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Vec<(DocumentId, VersionedDocument)> {
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), RangeCertificateError>
+    {
+        if limit == 0 {
+            return Err(RangeCertificateError::ZeroLimit);
+        }
         let inner = self.inner.lock().expect("mvcc mutex poisoned");
-        inner
-            .docs
-            .keys()
-            .filter(|key| key.0.starts_with(prefix))
-            .take(limit)
-            .cloned()
-            .map(|key| {
-                let value = Self::read_at_inner(&inner, &key, ts);
-                (key, value)
-            })
-            .collect()
+        let mut entries = Vec::new();
+        // Keys sharing a prefix form one contiguous BTreeMap run starting
+        // at the prefix itself.
+        for key in inner.docs.range(DocumentId::new(prefix)..).map(|(k, _)| k) {
+            if !key.0.starts_with(prefix) {
+                break;
+            }
+            // Reuse the point-read visibility rule so scan and point can
+            // never disagree about what a snapshot contains.
+            let value = Self::read_at_inner(&inner, key, ts);
+            if value.version.is_none() || value.document.is_none() {
+                continue;
+            }
+            entries.push((key.clone(), value));
+            if entries.len() == limit {
+                break;
+            }
+        }
+        let stop = if entries.len() == limit {
+            ScanStop::Boundary
+        } else {
+            ScanStop::Exhausted
+        };
+        let certificate = RangeCertificate {
+            interval: KeyInterval::Prefix(prefix.to_string()),
+            direction: ScanDirection::Ascending,
+            limit: limit as u64,
+            keys: entries.iter().map(|(key, _)| key.clone()).collect(),
+            stop,
+        };
+        Ok((certificate, entries))
     }
 
     pub fn build_capsule(
@@ -820,6 +862,96 @@ mod tests {
             asc_cert(prefix(), 1, &["docs/a"], ScanStop::Exhausted).validate(),
             Err(RangeCertificateError::StopInconsistent)
         );
+    }
+
+    #[test]
+    fn scan_prefix_skips_tombstones_without_consuming_limit() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+        store.seed(DocumentId::new("docs/c"), doc_with_i64("value", 3)); // ts=3
+        let mut deletion = WriteSet::default();
+        deletion.delete(DocumentId::new("docs/b"));
+        store
+            .commit(store.snapshot_ts(), &ReadSet::default(), &deletion)
+            .expect("tombstone commit"); // ts=4
+
+        // The buggy prefix_at counted docs/b toward the limit and returned
+        // its tombstone; the certified scan must return the 2 live keys.
+        let (cert, entries) = store
+            .scan_prefix_at("docs/", 2, store.snapshot_ts())
+            .expect("scan");
+        cert.validate().expect("valid certificate");
+        assert_eq!(
+            cert.keys,
+            vec![DocumentId::new("docs/a"), DocumentId::new("docs/c")]
+        );
+        assert_eq!(cert.stop, ScanStop::Boundary);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1.version, Some(1));
+        assert_eq!(entries[1].1.version, Some(3));
+    }
+
+    #[test]
+    fn scan_prefix_hides_keys_created_after_snapshot() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        let snapshot = store.snapshot_ts();
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+
+        let (cert, entries) = store.scan_prefix_at("docs/", 10, snapshot).expect("scan");
+        cert.validate().expect("valid certificate");
+        // docs/b exists in the key space but not at the snapshot — it must
+        // be invisible, and the scan proves the rest of the interval empty.
+        assert_eq!(cert.keys, vec![DocumentId::new("docs/a")]);
+        assert_eq!(cert.stop, ScanStop::Exhausted);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn scan_prefix_stop_is_boundary_iff_limit_hit() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        let ts = store.snapshot_ts();
+
+        // Exactly limit live keys → Boundary, even though nothing follows.
+        // Completeness needs limit+1 (referee F2) — this is the footgun case.
+        let (boundary, _) = store.scan_prefix_at("docs/", 2, ts).expect("scan");
+        assert_eq!(boundary.stop, ScanStop::Boundary);
+        boundary.validate().expect("valid boundary certificate");
+
+        let (exhausted, _) = store.scan_prefix_at("docs/", 3, ts).expect("scan");
+        assert_eq!(exhausted.stop, ScanStop::Exhausted);
+        assert_eq!(exhausted.keys.len(), 2);
+        exhausted.validate().expect("valid exhausted certificate");
+    }
+
+    #[test]
+    fn scan_prefix_rejects_zero_limit() {
+        let store = MvccStore::new();
+        assert_eq!(
+            store.scan_prefix_at("docs/", 0, 1),
+            Err(RangeCertificateError::ZeroLimit)
+        );
+    }
+
+    #[test]
+    fn scan_prefix_hydrates_capsule_that_validates() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        let ts = store.snapshot_ts();
+
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), ts);
+        let (cert, entries) = store.scan_prefix_at("docs/", 2, ts).expect("scan");
+        capsule.hydrate_range(cert, entries);
+        capsule
+            .validate_structure()
+            .expect("issued capsules satisfy structure by construction");
+        assert_eq!(capsule.ranges.len(), 1);
+        assert!(capsule.get(&DocumentId::new("docs/a")).is_some());
     }
 
     #[test]

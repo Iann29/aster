@@ -41,6 +41,12 @@ pub enum IpcRequest {
         capsule: SealedCapsule,
         key: DocumentId,
     },
+    HydratePrefix {
+        context: SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    },
     LoadModuleBundle {
         context: SealContext,
         capsule: SealedCapsule,
@@ -53,6 +59,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     InitialCapsule(Result<SealedCapsule, WireBrokerError>),
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
+    HydratePrefix(Result<SealedCapsule, WireBrokerError>),
     LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
     ShutdownAck,
     Error(WireBrokerError),
@@ -105,6 +112,7 @@ impl From<BrokerError> for WireBrokerError {
             BrokerError::Seal(error) => Self::new(format!("seal_{error:?}"), value.to_string()),
             BrokerError::TenantMismatch => Self::new("tenant_mismatch", value.to_string()),
             BrokerError::DeploymentMismatch => Self::new("deployment_mismatch", value.to_string()),
+            BrokerError::ZeroScanLimit => Self::new("zero_scan_limit", value.to_string()),
             BrokerError::Remote(_) => Self::new("remote", value.to_string()),
         }
     }
@@ -291,6 +299,30 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
             Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
             Ok(_) => Err(BrokerError::Remote(
                 IpcError::UnexpectedResponse("HydratePoint").to_string(),
+            )),
+            Err(error) => Err(BrokerError::Remote(error.to_string())),
+        }
+    }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        match self.call(IpcRequest::HydratePrefix {
+            context: context.clone(),
+            capsule,
+            prefix,
+            limit,
+        }) {
+            Ok(IpcResponse::HydratePrefix(result)) => {
+                result.map_err(|error| error.to_broker_error())
+            }
+            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
+            Ok(_) => Err(BrokerError::Remote(
+                IpcError::UnexpectedResponse("HydratePrefix").to_string(),
             )),
             Err(error) => Err(BrokerError::Remote(error.to_string())),
         }

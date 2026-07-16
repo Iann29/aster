@@ -284,6 +284,19 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             ),
             false,
         ),
+        IpcRequest::HydratePrefix {
+            context,
+            capsule,
+            prefix,
+            limit,
+        } => (
+            IpcResponse::HydratePrefix(
+                broker
+                    .hydrate_prefix(&context, capsule, prefix, limit)
+                    .map_err(WireBrokerError::from),
+            ),
+            false,
+        ),
         IpcRequest::LoadModuleBundle {
             context,
             capsule,
@@ -398,6 +411,37 @@ impl CapsuleBrokerClient for ProcessBroker {
         }
         let value = self.store.read_point(&key, capsule.ts)?;
         capsule.hydrate_point(key, value);
+        Ok(SealedCapsule::new(capsule, &self.seal_key, context))
+    }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        if limit == 0 {
+            return Err(BrokerError::ZeroScanLimit);
+        }
+        let mut capsule = capsule.into_capsule(&self.seal_key, context)?;
+        if capsule.tenant != self.tenant {
+            return Err(BrokerError::TenantMismatch);
+        }
+        if capsule.deployment != self.deployment {
+            return Err(BrokerError::DeploymentMismatch);
+        }
+        if capsule.ts != self.snapshot_ts {
+            return Err(BrokerError::Remote(format!(
+                "capsule snapshot_ts {} is not broker snapshot {}",
+                capsule.ts, self.snapshot_ts
+            )));
+        }
+        // Certificates are evidence about the capsule snapshot: scan at
+        // capsule.ts (== broker snapshot after the check above), never at
+        // whatever the store head has advanced to.
+        let (certificate, entries) = self.store.scan_prefix(&prefix, limit, capsule.ts)?;
+        capsule.hydrate_range(certificate, entries);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
     }
 }

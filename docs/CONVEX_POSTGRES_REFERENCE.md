@@ -231,7 +231,7 @@ writers** — readers don't take it but must respect retention.
 |---|---|
 | `snapshot_ts()` | `max(SELECT ts FROM documents ORDER BY ts DESC LIMIT 1, persistence_globals.max_repeatable_ts)` |
 | `read_point(key, ts)` | `INDEX_QUERIES`-style point lookup against `by_id` index where `index_id` is the `by_id` of the requested table's tablet, key encoded from `DocumentId` |
-| `read_prefix(prefix, limit, ts)` | `INDEX_QUERIES`-style range scan with `(key_prefix, key_sha256)` bounds derived from the prefix |
+| `scan_prefix(prefix, limit, ts)` (certified; ex-`read_prefix`) | `INDEX_QUERIES`-style range scan with `(key_prefix, key_sha256)` bounds derived from the prefix; returns the `RangeCertificate` evidence (tombstones filtered before the limit applies) |
 | `build_capsule(prewarm)` | Default trait impl loops `read_point`. v0.5+ override batches into one query. |
 
 The one Aster concept that doesn't map directly is `DocumentId(String)`.

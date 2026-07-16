@@ -62,7 +62,8 @@ The Postgres store currently implements:
   `persistence_globals['max_repeatable_ts']`.
 - `read_point()`: latest non-deleted document revision at or before the
   requested timestamp.
-- `read_prefix()`: bounded prefix reads for the Aster-native API.
+- `scan_prefix()`: certified bounded prefix scans (live keys only, sealed
+  `RangeCertificate` evidence) for the Aster-native API.
 - Convex IDv6 decoding and `_tables`-backed `table_number -> tablet_uuid`
   mapping, so a JS `db.get(id)` string can resolve without the cell knowing
   tablet UUIDs.

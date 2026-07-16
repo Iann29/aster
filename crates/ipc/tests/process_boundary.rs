@@ -4,7 +4,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aster_broker::CapsuleBrokerClient;
-use aster_capsule::{DeploymentId, DocumentId, SealContext, TenantId};
+use aster_capsule::{DeploymentId, DocumentId, KeyInterval, ScanStop, SealContext, TenantId};
 use aster_ipc::{IpcRequest, IpcResponse, UdsCapsuleBrokerClient};
 
 #[test]
@@ -82,6 +82,75 @@ fn process_separated_v8_cell_hydrates_over_uds_and_rejects_replay() {
             );
         }
         other => panic!("wrong-cell hydrate should fail, got {other:?}"),
+    }
+
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+#[test]
+fn prefix_hydrate_over_uds_carries_certificate() {
+    let temp = TempDir::new("aster-ipc-prefix");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-prefix", 7);
+    let sealed = client
+        .initial_capsule(
+            &context,
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            2,
+            Vec::new(),
+        )
+        .expect("initial capsule through UDS");
+
+    let sealed = client
+        .hydrate_prefix(&context, sealed, "counters/".to_string(), 2)
+        .expect("prefix hydrate through UDS");
+    let capsule = sealed.capsule();
+    assert_eq!(
+        capsule.ranges.len(),
+        1,
+        "returned sealed capsule must carry the scan certificate"
+    );
+    let certificate = &capsule.ranges[0];
+    certificate.validate().expect("wire certificate is valid");
+    assert_eq!(certificate.interval, KeyInterval::Prefix("counters/".into()));
+    assert_eq!(
+        certificate.keys,
+        vec![
+            DocumentId::new("counters/a"),
+            DocumentId::new("counters/b")
+        ]
+    );
+    assert_eq!(certificate.stop, ScanStop::Boundary, "2 collected == limit 2");
+    capsule
+        .validate_structure()
+        .expect("certificate keys cross-reference live docs");
+    let value = capsule
+        .get(&DocumentId::new("counters/a"))
+        .and_then(|doc| doc.document.as_ref())
+        .and_then(|doc| doc.get("value"));
+    assert_eq!(value, Some(&aster_capsule::Value::Int(20)));
+
+    // limit=0 can never carry a valid certificate — the broker process
+    // must reject it with a typed wire error, not crash or fabricate.
+    let response = client
+        .raw_call(IpcRequest::HydratePrefix {
+            context: context.clone(),
+            capsule: sealed.clone(),
+            prefix: "counters/".to_string(),
+            limit: 0,
+        })
+        .expect("raw zero-limit response");
+    match response {
+        IpcResponse::HydratePrefix(Err(error)) => {
+            assert_eq!(error.code, "zero_scan_limit", "got {error:?}");
+        }
+        other => panic!("zero-limit prefix hydrate should fail, got {other:?}"),
     }
 
     client.shutdown().expect("shutdown broker");
