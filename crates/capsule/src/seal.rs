@@ -76,6 +76,7 @@ pub enum SealError {
     MacMismatch,
     WrongCell,
     WrongLeaseEpoch,
+    MalformedCapsule(String),
 }
 
 impl std::fmt::Display for SealError {
@@ -86,6 +87,9 @@ impl std::fmt::Display for SealError {
             Self::MacMismatch => write!(f, "capsule MAC verification failed"),
             Self::WrongCell => write!(f, "capsule seal is bound to a different cell"),
             Self::WrongLeaseEpoch => write!(f, "capsule seal is bound to a different lease epoch"),
+            Self::MalformedCapsule(message) => {
+                write!(f, "capsule structure is invalid: {message}")
+            }
         }
     }
 }
@@ -144,6 +148,13 @@ impl SealedCapsule {
         if self.seal.lease_epoch != context.lease_epoch {
             return Err(SealError::WrongLeaseEpoch);
         }
+        // W-CANON chokepoint: the JSON wire path deserializes permissively,
+        // so structural validity (range certificates + cross-references) is
+        // enforced here where every capsule must pass, not only in the
+        // canonical-bytes decoder.
+        if let Err(error) = self.capsule.validate_structure() {
+            return Err(SealError::MalformedCapsule(error.to_string()));
+        }
         let encoded = encode_capsule_bytes(&self.capsule);
         let digest = *blake3::hash(&encoded).as_bytes();
         if !ct_eq(&digest, &self.seal.digest) {
@@ -187,7 +198,8 @@ fn seal_mac(encoded_capsule: &[u8], key: &CapsuleSealKey, context: &SealContext)
 mod tests {
     use super::*;
     use crate::{
-        doc_with_i64, DeploymentId, DocumentId, MvccStore, TenantId, VersionedDocument,
+        doc_with_i64, DeploymentId, DocumentId, KeyInterval, MvccStore, RangeCertificate,
+        ScanDirection, ScanStop, TenantId, VersionedDocument,
     };
 
     fn sealed_fixture() -> (SealedCapsule, CapsuleSealKey, SealContext) {
@@ -288,6 +300,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_rejects_malformed_range_structure() {
+        let (mut sealed, seal_key, context) = sealed_fixture();
+        sealed.capsule_mut_for_test().ranges.push(RangeCertificate {
+            interval: KeyInterval::Prefix("docs/".into()),
+            direction: ScanDirection::Ascending,
+            limit: 5,
+            keys: vec![DocumentId::new("docs/ghost")],
+            stop: ScanStop::Exhausted,
+        });
+        assert!(matches!(
+            sealed.verify(&seal_key, &context),
+            Err(SealError::MalformedCapsule(_))
+        ));
+    }
+
     /// Pins the exact wire construction. If this test breaks, the seal
     /// format changed and every issued capsule in the wild is invalidated —
     /// that must be a deliberate, versioned decision, never drift.
@@ -304,9 +332,12 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
+        // Deliberate re-pin (2026-07-16): capsule domain bumped to
+        // aster-capsule-v3 when the range-certificate sequence entered the
+        // canonical encoding.
         assert_eq!(
             mac_hex,
-            "e1ce81339b85198859e6103e57c43fb8b6773aa8547712680b982f4ed74e4c33"
+            "c28b56db9ec48aec56ff10f216550ceb1bfaeb049c42dc14c87fa88ee15ea21d"
         );
     }
 }
