@@ -1,0 +1,20 @@
+==> B1: read path (V8 one-shot host processes + brokerd + postgres fixture store)
+aster_brokerd: lease epoch=1 source=lease-authority
+aster_brokerd: store=postgres snapshot_ts=200
+aster_brokerd: ready socket=/tmp/aster-bench-v07.wPe5mA/broker.sock snapshot_ts=200
+broker lease epoch: 1
+sanity OK: t1=1 trap; tk_same(K=200)=1 trap (warm hits); tk_distinct(K=200)=200 traps
+RAW read-T0_noop ms=[6,5,6,5,5,6,5,5,5,6,5,5]
+RESULT {"phase":"read-T0_noop","samples":12,"median_ms":5,"p95_ms":6,"min_ms":5}
+RAW read-T1_one_trap ms=[7,7,7,7,7,7,6,6,6,6,6,6]
+RESULT {"phase":"read-T1_one_trap","samples":12,"median_ms":6,"p95_ms":7,"min_ms":6}
+RAW read-TK_same ms=[7,6,7,7,7,7,8,7,7,7,7,7]
+RESULT {"phase":"read-TK_same","samples":12,"median_ms":7,"p95_ms":8,"min_ms":6}
+RAW read-TK_distinct ms=[190,195,192,192,184,208,199,188,192,191,187,183]
+RESULT {"phase":"read-TK_distinct","samples":12,"median_ms":191,"p95_ms":208,"min_ms":183}
+derived (p50, host-process spawn cancels in subtraction):
+  first-trap cost (T1-T0):                  1 ms
+  warm-hit marginal ((TKsame-T1)/(K-1)):    0.0050 ms/read
+  distinct-trap marginal ((TKdist-T1)/(K-1)): 0.930 ms/trap (capsule grows 1->200)
+psql baseline (10x point read, in-container):
+real	0m0.252s
