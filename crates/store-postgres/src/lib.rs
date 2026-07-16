@@ -58,8 +58,10 @@
 mod module_index;
 mod modules_storage;
 mod table_mapping;
+pub mod write_plane;
 
 pub use module_index::ModuleDescriptor;
+pub use write_plane::{CommitOutcome, FenceInput, WritePlane, WritePlaneConfig};
 
 use std::path::PathBuf;
 use std::sync::Arc;

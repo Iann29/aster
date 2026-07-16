@@ -1,0 +1,603 @@
+//! Aster's own write plane: lease authority, commit log, retention floor,
+//! and the commit fence — the storage half of the Capsule Transaction
+//! Theorem's `CommitFence` (§1.8), on Aster-owned tables in the `aster`
+//! schema.
+//!
+//! Scope (referee finding F9): this plane owns its commit log. It never
+//! writes Convex's tables — integrating with a live convex-backend
+//! deployment (lease takeover vs. commit gateway) is a separate product
+//! decision outside v0.7.
+//!
+//! Theorem ↔ implementation map:
+//! - A7 (single-writer lease, strictly increasing epochs — referee F1):
+//!   `acquire_lease` bumps `aster.lease.epoch` under the row lock, so
+//!   epochs are never reused, even across failback A→B→A.
+//! - A8 (atomic commit fence): `commit` runs V2–V5 and the append inside
+//!   ONE transaction whose first statement locks the lease row
+//!   `FOR UPDATE`. Every commit takes that lock, so validation and append
+//!   share one stable horizon and no commit interposes (Lemma 3.10).
+//!   A concurrent `acquire_lease` blocks on the same row until an
+//!   in-flight fence commits — an old-epoch append therefore linearizes
+//!   before the new epoch's first fence, and later old-epoch fences fail
+//!   the epoch equality check (Lemma 3.11).
+//! - A9 / Lemma R (retention pin): the fence locks the `aster.retention`
+//!   row `FOR UPDATE` from its coverage check (`g <= s`) through append;
+//!   `advance_retention` takes the same lock, so GC cannot remove an
+//!   event in `(s, h]` mid-validation. Coverage is watermark-based here,
+//!   which is the theorem's *exact* admission condition; a wall-clock
+//!   max-age rule (V3's `s >= Now − Δ`) is a product admission policy the
+//!   caller may add on top.
+//! - A10 (tenant confinement): the log is keyed by (tenant, deployment)
+//!   columns supplied by the trusted committer, so an authorized write
+//!   physically cannot land in another tenant's key space.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aster_broker::StoreError;
+use aster_capsule::{Document, DocumentId, ObservedWindow, Timestamp, VersionedDocument};
+use deadpool_postgres::{
+    Manager, ManagerConfig, Pool, RecyclingMethod, Runtime as DeadpoolRuntime,
+};
+use tokio::runtime::{Builder, Runtime};
+use tokio_postgres::{Config as PgConfig, NoTls};
+
+#[derive(Clone, Debug)]
+pub struct WritePlaneConfig {
+    /// libpq-style connection URL. Same caveats as `PostgresConfig::url`.
+    pub url: String,
+    pub pool_max_size: usize,
+    pub runtime_worker_threads: usize,
+    /// Per-checkout `SET statement_timeout`. Bounds how long a fence can
+    /// hold the lease/retention locks if Postgres stalls.
+    pub statement_timeout: Duration,
+}
+
+impl Default for WritePlaneConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            pool_max_size: 16,
+            runtime_worker_threads: 2,
+            statement_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// One point-in-time commit request, already reduced by the committer to
+/// the theorem's validated ingredients: the declared authenticated
+/// observations (points + range windows) and the policy-authorized write
+/// set. Capsule verification happens in the committer, not here.
+pub struct FenceInput<'a> {
+    pub tenant: &'a str,
+    pub deployment: &'a str,
+    /// Epoch this committer acquired from the lease authority (`e_now`).
+    pub committer_epoch: u64,
+    /// Epoch sealed in the capsule context (`ctx.e`). V2 requires it to
+    /// equal the live lease epoch — passing it separately lets the fence
+    /// reject a stale-epoch capsule even when the committer itself is
+    /// current.
+    pub context_epoch: u64,
+    /// The capsule snapshot `s`.
+    pub snapshot: Timestamp,
+    /// Declared point observations (present, absent, and tombstone reads
+    /// all conflict on any write event touching the key — the theorem's
+    /// `Changed({k}; (s,h])` predicate).
+    pub read_points: &'a [DocumentId],
+    /// Declared range observations, already reduced to conflict windows.
+    pub read_windows: &'a [ObservedWindow],
+    /// The write set: `Some(document)` puts, `None` deletes.
+    pub writes: &'a [(DocumentId, Option<Document>)],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitOutcome {
+    Committed { ts: Timestamp },
+    /// A committed write in `(s, h]` intersects a declared observation.
+    Conflict { key: DocumentId },
+    /// Lease epoch mismatch — the committer or the capsule context is
+    /// stale relative to the storage lease authority.
+    StaleEpoch { lease_epoch: u64 },
+    /// The capsule claims a snapshot the log has never committed
+    /// (S-SNAPSHOT violation — honest brokers cannot produce this).
+    SnapshotBeyondHorizon { horizon: Timestamp },
+    /// Validation history below the snapshot is no longer retained
+    /// (Lemma R: coverage `g <= s` failed). Retry from a fresh snapshot.
+    RetentionViolated { low_watermark: Timestamp },
+    /// Mutations-only path: an empty write set never enters the log.
+    EmptyWriteSet,
+}
+
+pub struct WritePlane {
+    runtime: Arc<Runtime>,
+    pool: Pool,
+    statement_timeout_ms: u64,
+}
+
+impl WritePlane {
+    pub fn connect(config: WritePlaneConfig) -> Result<Self, StoreError> {
+        if config.url.is_empty() {
+            return Err(StoreError::Backend(
+                "WritePlaneConfig.url is empty".into(),
+            ));
+        }
+        let pg_config: PgConfig = config
+            .url
+            .parse()
+            .map_err(|err: tokio_postgres::Error| StoreError::Backend(format!("bad url: {err}")))?;
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(config.runtime_worker_threads.max(1))
+            .enable_all()
+            .build()
+            .map_err(|err| StoreError::Backend(format!("tokio runtime: {err}")))?;
+        let manager = Manager::from_config(
+            pg_config,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .max_size(config.pool_max_size)
+            .runtime(DeadpoolRuntime::Tokio1)
+            .build()
+            .map_err(|err| StoreError::Backend(format!("pool builder: {err}")))?;
+        Ok(Self {
+            runtime: Arc::new(runtime),
+            pool,
+            statement_timeout_ms: config.statement_timeout.as_millis() as u64,
+        })
+    }
+
+    fn block_on<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.runtime.block_on(fut)
+    }
+
+    async fn client(&self) -> Result<deadpool_postgres::Object, StoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| StoreError::Unavailable(format!("pool checkout: {err}")))?;
+        client
+            .batch_execute(&format!(
+                "SET statement_timeout = {}",
+                self.statement_timeout_ms
+            ))
+            .await
+            .map_err(|err| StoreError::Backend(format!("set statement_timeout: {err}")))?;
+        Ok(client)
+    }
+
+    /// Idempotent bootstrap of the `aster` schema. Call once at committer
+    /// startup (and from tests).
+    pub fn ensure_schema(&self) -> Result<(), StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            client
+                .batch_execute(
+                    "CREATE SCHEMA IF NOT EXISTS aster;
+                     CREATE TABLE IF NOT EXISTS aster.lease (
+                         tenant text NOT NULL,
+                         deployment text NOT NULL,
+                         epoch bigint NOT NULL,
+                         holder text NOT NULL DEFAULT '',
+                         acquired_at timestamptz NOT NULL DEFAULT now(),
+                         PRIMARY KEY (tenant, deployment)
+                     );
+                     CREATE TABLE IF NOT EXISTS aster.log (
+                         tenant text NOT NULL,
+                         deployment text NOT NULL,
+                         ts bigint NOT NULL,
+                         key text NOT NULL,
+                         epoch bigint NOT NULL,
+                         document text,
+                         PRIMARY KEY (tenant, deployment, ts, key)
+                     );
+                     CREATE INDEX IF NOT EXISTS log_key_ts
+                         ON aster.log (tenant, deployment, key, ts);
+                     CREATE TABLE IF NOT EXISTS aster.retention (
+                         tenant text NOT NULL,
+                         deployment text NOT NULL,
+                         low_watermark bigint NOT NULL DEFAULT 0,
+                         PRIMARY KEY (tenant, deployment)
+                     );",
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("ensure_schema: {err}")))
+        })
+    }
+
+    /// Acquire (or take over) the single-writer lease. Every acquisition
+    /// bumps the epoch — strictly increasing, never reused (F1). The
+    /// UPDATE waits on any in-flight commit fence holding the row lock,
+    /// which is exactly the failover ordering Lemma 3.11 requires.
+    pub fn acquire_lease(
+        &self,
+        tenant: &str,
+        deployment: &str,
+        holder: &str,
+    ) -> Result<u64, StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO aster.lease (tenant, deployment, epoch, holder)
+                     VALUES ($1, $2, 1, $3)
+                     ON CONFLICT (tenant, deployment) DO UPDATE
+                         SET epoch = aster.lease.epoch + 1,
+                             holder = EXCLUDED.holder,
+                             acquired_at = now()
+                     RETURNING epoch",
+                    &[&tenant, &deployment, &holder],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("acquire_lease: {err}")))?;
+            client
+                .execute(
+                    "INSERT INTO aster.retention (tenant, deployment, low_watermark)
+                     VALUES ($1, $2, 0)
+                     ON CONFLICT (tenant, deployment) DO NOTHING",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("seed retention: {err}")))?;
+            Ok(row.get::<_, i64>(0) as u64)
+        })
+    }
+
+    pub fn current_epoch(
+        &self,
+        tenant: &str,
+        deployment: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            let row = client
+                .query_opt(
+                    "SELECT epoch FROM aster.lease WHERE tenant = $1 AND deployment = $2",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("current_epoch: {err}")))?;
+            Ok(row.map(|row| row.get::<_, i64>(0) as u64))
+        })
+    }
+
+    /// Latest committed timestamp — the log tip outside any fence. Inside
+    /// the fence the tip is re-read under the lease lock; this value is
+    /// only a snapshot hint for capsule issuance.
+    pub fn snapshot_ts(&self, tenant: &str, deployment: &str) -> Result<Timestamp, StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            let row = client
+                .query_one(
+                    "SELECT COALESCE(MAX(ts), 0) FROM aster.log
+                     WHERE tenant = $1 AND deployment = $2",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("snapshot_ts: {err}")))?;
+            Ok(row.get::<_, i64>(0) as u64)
+        })
+    }
+
+    pub fn read_point(
+        &self,
+        tenant: &str,
+        deployment: &str,
+        key: &DocumentId,
+        ts: Timestamp,
+    ) -> Result<VersionedDocument, StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            let row = client
+                .query_opt(
+                    "SELECT ts, document FROM aster.log
+                     WHERE tenant = $1 AND deployment = $2 AND key = $3 AND ts <= $4
+                     ORDER BY ts DESC LIMIT 1",
+                    &[&tenant, &deployment, &key.0, &as_i64(ts)?],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("read_point: {err}")))?;
+            match row {
+                None => Ok(VersionedDocument::missing()),
+                Some(row) => Ok(VersionedDocument {
+                    version: Some(row.get::<_, i64>(0) as u64),
+                    document: decode_document(row.get::<_, Option<String>>(1))?,
+                }),
+            }
+        })
+    }
+
+    /// First `limit` LIVE keys with the given prefix at snapshot `ts`, in
+    /// ascending key order — the `Scan_σ(I, ℓ)` the range certificate
+    /// seals. Tombstones and post-snapshot keys never consume limit slots.
+    pub fn read_prefix_live(
+        &self,
+        tenant: &str,
+        deployment: &str,
+        prefix: &str,
+        limit: usize,
+        ts: Timestamp,
+    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
+        self.block_on(async {
+            let client = self.client().await?;
+            let pattern = format!("{}%", escape_like(prefix));
+            let rows = client
+                .query(
+                    "SELECT key, ts, document FROM (
+                         SELECT DISTINCT ON (key) key, ts, document
+                         FROM aster.log
+                         WHERE tenant = $1 AND deployment = $2
+                           AND ts <= $3 AND key LIKE $4 ESCAPE '\\'
+                         ORDER BY key, ts DESC
+                     ) latest
+                     WHERE document IS NOT NULL
+                     ORDER BY key
+                     LIMIT $5",
+                    &[
+                        &tenant,
+                        &deployment,
+                        &as_i64(ts)?,
+                        &pattern,
+                        &(limit as i64),
+                    ],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("read_prefix_live: {err}")))?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok((
+                        DocumentId::new(row.get::<_, String>(0)),
+                        VersionedDocument {
+                            version: Some(row.get::<_, i64>(1) as u64),
+                            document: decode_document(row.get::<_, Option<String>>(2))?,
+                        },
+                    ))
+                })
+                .collect()
+        })
+    }
+
+    /// The commit fence — the theorem's `CommitFence(ctx, Cap, R, W)` as
+    /// one Postgres transaction. See the module docs for the assumption
+    /// map; the inline step numbers follow §1.8.
+    pub fn commit(&self, input: &FenceInput<'_>) -> Result<CommitOutcome, StoreError> {
+        if input.writes.is_empty() {
+            return Ok(CommitOutcome::EmptyWriteSet);
+        }
+        let snapshot = as_i64(input.snapshot)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|err| StoreError::Backend(format!("begin fence: {err}")))?;
+
+            // Fence entry: every commit serializes on the lease row lock.
+            let lease = tx
+                .query_opt(
+                    "SELECT epoch FROM aster.lease
+                     WHERE tenant = $1 AND deployment = $2 FOR UPDATE",
+                    &[&input.tenant, &input.deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("fence lease lock: {err}")))?;
+            let lease_epoch = match lease {
+                None => {
+                    return Err(StoreError::Backend(
+                        "no lease acquired for this deployment".into(),
+                    ))
+                }
+                Some(row) => row.get::<_, i64>(0) as u64,
+            };
+            // V2: both the committer and the capsule context must match the
+            // live lease epoch.
+            if lease_epoch != input.committer_epoch || input.context_epoch != lease_epoch {
+                return Ok(CommitOutcome::StaleEpoch { lease_epoch });
+            }
+
+            // Stable horizon h, read only after the epoch fence.
+            let h: i64 = tx
+                .query_one(
+                    "SELECT COALESCE(MAX(ts), 0) FROM aster.log
+                     WHERE tenant = $1 AND deployment = $2",
+                    &[&input.tenant, &input.deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("fence horizon: {err}")))?
+                .get(0);
+            if snapshot > h {
+                return Ok(CommitOutcome::SnapshotBeyondHorizon {
+                    horizon: h as u64,
+                });
+            }
+
+            // V3 (coverage form) + retention pin: lock the watermark row so
+            // GC cannot advance past s while we validate (Lemma R).
+            let g: i64 = tx
+                .query_one(
+                    "SELECT low_watermark FROM aster.retention
+                     WHERE tenant = $1 AND deployment = $2 FOR UPDATE",
+                    &[&input.tenant, &input.deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("fence retention pin: {err}")))?
+                .get(0);
+            if snapshot < g {
+                return Ok(CommitOutcome::RetentionViolated {
+                    low_watermark: g as u64,
+                });
+            }
+
+            // V4: no committed write in (s, h] may intersect a declared
+            // observation — point keys first, then range windows.
+            if !input.read_points.is_empty() {
+                let keys: Vec<&str> = input
+                    .read_points
+                    .iter()
+                    .map(|key| key.0.as_str())
+                    .collect();
+                let conflict = tx
+                    .query_opt(
+                        "SELECT key FROM aster.log
+                         WHERE tenant = $1 AND deployment = $2
+                           AND ts > $3 AND ts <= $4 AND key = ANY($5)
+                         LIMIT 1",
+                        &[&input.tenant, &input.deployment, &snapshot, &h, &keys],
+                    )
+                    .await
+                    .map_err(|err| StoreError::Backend(format!("fence point scan: {err}")))?;
+                if let Some(row) = conflict {
+                    return Ok(CommitOutcome::Conflict {
+                        key: DocumentId::new(row.get::<_, String>(0)),
+                    });
+                }
+            }
+            if !input.read_windows.is_empty() {
+                let rows = tx
+                    .query(
+                        "SELECT DISTINCT key FROM aster.log
+                         WHERE tenant = $1 AND deployment = $2
+                           AND ts > $3 AND ts <= $4",
+                        &[&input.tenant, &input.deployment, &snapshot, &h],
+                    )
+                    .await
+                    .map_err(|err| StoreError::Backend(format!("fence window scan: {err}")))?;
+                for row in rows {
+                    let key = DocumentId::new(row.get::<_, String>(0));
+                    if input.read_windows.iter().any(|window| window.contains(&key)) {
+                        return Ok(CommitOutcome::Conflict { key });
+                    }
+                }
+            }
+
+            // Atomic append at fresh c = h + 1; timestamp assignment is part
+            // of the same transaction as the epoch check.
+            let ts_new = h + 1;
+            for (key, document) in input.writes {
+                let encoded = document
+                    .as_ref()
+                    .map(|document| {
+                        serde_json::to_string(document).map_err(|err| {
+                            StoreError::Backend(format!("encode document: {err}"))
+                        })
+                    })
+                    .transpose()?;
+                tx.execute(
+                    "INSERT INTO aster.log (tenant, deployment, ts, key, epoch, document)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[
+                        &input.tenant,
+                        &input.deployment,
+                        &ts_new,
+                        &key.0,
+                        &(input.committer_epoch as i64),
+                        &encoded,
+                    ],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("fence append: {err}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|err| StoreError::Backend(format!("fence commit: {err}")))?;
+            Ok(CommitOutcome::Committed { ts: ts_new as u64 })
+        })
+    }
+
+    /// GC: raise the retention low-watermark (never lowers) and compact
+    /// revisions at or below it that are shadowed by a newer revision of
+    /// the same key. Serialized with in-flight fences via the retention
+    /// row lock — this is the sweeper half of Lemma R's pin.
+    pub fn advance_retention(
+        &self,
+        tenant: &str,
+        deployment: &str,
+        low_watermark: Timestamp,
+    ) -> Result<Timestamp, StoreError> {
+        let requested = as_i64(low_watermark)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|err| StoreError::Backend(format!("begin retention: {err}")))?;
+            let current: i64 = tx
+                .query_one(
+                    "SELECT low_watermark FROM aster.retention
+                     WHERE tenant = $1 AND deployment = $2 FOR UPDATE",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("retention lock: {err}")))?
+                .get(0);
+            let effective = current.max(requested);
+            tx.execute(
+                "UPDATE aster.retention SET low_watermark = $3
+                 WHERE tenant = $1 AND deployment = $2",
+                &[&tenant, &deployment, &effective],
+            )
+            .await
+            .map_err(|err| StoreError::Backend(format!("retention update: {err}")))?;
+            tx.execute(
+                "DELETE FROM aster.log l
+                 WHERE l.tenant = $1 AND l.deployment = $2 AND l.ts <= $3
+                   AND EXISTS (
+                       SELECT 1 FROM aster.log n
+                       WHERE n.tenant = l.tenant AND n.deployment = l.deployment
+                         AND n.key = l.key AND n.ts > l.ts AND n.ts <= $3
+                   )",
+                &[&tenant, &deployment, &effective],
+            )
+            .await
+            .map_err(|err| StoreError::Backend(format!("retention compact: {err}")))?;
+            tx.commit()
+                .await
+                .map_err(|err| StoreError::Backend(format!("retention commit: {err}")))?;
+            Ok(effective as u64)
+        })
+    }
+}
+
+fn as_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Backend(format!("timestamp {value} exceeds i64 range")))
+}
+
+fn decode_document(raw: Option<String>) -> Result<Option<Document>, StoreError> {
+    raw.map(|json| {
+        serde_json::from_str(&json)
+            .map_err(|err| StoreError::Backend(format!("decode document: {err}")))
+    })
+    .transpose()
+}
+
+/// Escape `%`, `_`, and `\` so a caller-supplied prefix is matched
+/// literally by `LIKE ... ESCAPE '\'`.
+fn escape_like(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_like;
+
+    #[test]
+    fn escape_like_neutralizes_wildcards() {
+        assert_eq!(escape_like("docs/"), "docs/");
+        assert_eq!(escape_like("do%cs_"), "do\\%cs\\_");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+    }
+}
