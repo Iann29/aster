@@ -401,10 +401,11 @@ impl UdsCapsuleBrokerClient {
         })?;
         match response {
             IpcResponse::Commit(result) => {
-                // Every rejection this client can produce is issued at or
-                // past the session gate, where the broker has already
-                // closed the session — holding onto the id would only set
-                // up an unknown_session surprise later.
+                // Every structured Commit answer leaves no live broker-side
+                // session: the broker closes a table-registered session even
+                // when the gate rejects the attempt (context mismatch), and
+                // the other gate rejections mean nothing was registered —
+                // so dropping the held id here can never orphan one.
                 self.clear_session();
                 result.map_err(|error| {
                     IpcError::Protocol(format!(

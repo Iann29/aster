@@ -840,3 +840,47 @@ fn retention_watermark_clamps_to_log_tip() {
         CommitOutcome::Committed { .. }
     ));
 }
+
+/// Review B4: the plane's own MVCC read API enforces the retention floor —
+/// a snapshot below `low_watermark` may observe a compacted history, and a
+/// false absence there is exactly the evidence class the C3 guard killed on
+/// the capsule store. The plane must refuse, not answer.
+#[test]
+fn reads_below_the_retention_floor_are_stale() {
+    use aster_broker::StoreError;
+
+    let plane = fresh_plane();
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire");
+    let t1 = match commit_blind(&plane, epoch, 0, "docs/a", 1) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    let t2 = match commit_blind(&plane, epoch, t1, "docs/a", 2) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    let floor = plane
+        .advance_retention(TENANT, DEPLOYMENT, t2)
+        .expect("advance");
+    assert_eq!(floor, t2);
+
+    // At the floor the view is intact — reads still answer.
+    plane
+        .read_point(TENANT, DEPLOYMENT, &DocumentId::new("docs/a"), t2)
+        .expect("read at floor");
+    plane
+        .read_prefix_live(TENANT, DEPLOYMENT, "docs/", 10, t2)
+        .expect("scan at floor");
+
+    // Below the floor the shadowed revision may already be compacted:
+    // refusing is mandatory — false absence is worse than no answer.
+    let point = plane.read_point(TENANT, DEPLOYMENT, &DocumentId::new("docs/a"), t1);
+    assert!(
+        matches!(point, Err(StoreError::Stale { .. })),
+        "got {point:?}"
+    );
+    let scan = plane.read_prefix_live(TENANT, DEPLOYMENT, "docs/", 10, t1);
+    assert!(matches!(scan, Err(StoreError::Stale { .. })), "got {scan:?}");
+}

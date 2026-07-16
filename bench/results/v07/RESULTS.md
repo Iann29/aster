@@ -14,7 +14,9 @@ is projected.
 - **Toolchain**: rustc 1.94.1, cargo 1.94.1, all binaries `--release`.
 - **Postgres**: `postgres:16.14` (Debian) in container `aster-pg-dev`,
   port-mapped to `127.0.0.1:5433`; stock durability config
-  (`synchronous_commit=on`, `fsync=on`, `shared_buffers=128MB`). A fresh
+  (`synchronous_commit=on`, `fsync=on`, `shared_buffers=128MB` — asserted
+  at campaign time, verified live and appended to `machine.log` on
+  2026-07-16 post-review; `run-v07.sh` now records the GUCs itself). A fresh
   `aster_bench` database is dropped and recreated per run: Convex-schema
   fixtures (`crates/store-postgres/tests/fixtures/{schema,seed}.sql`) +
   1,000 extra bench documents at ts=150, and the `aster` write-plane
@@ -29,9 +31,13 @@ is projected.
   includes request serialization and UDS connect, i.e. what a cell pays.
   B1 uses `date +%s%N` around whole one-shot processes with 1 ms
   granularity (the derived marginals divide by K−1=199, giving ~5 µs
-  resolution). Warmup samples are discarded everywhere; reported stats
-  are median / p95 / min / max over the stated N; full chronological
-  per-sample series are in the `RAW` lines of each log.
+  resolution). Warmup samples are discarded where a warmup pass exists
+  (blind fence 100, point-validation 30 per case, e2e 30); the
+  window-validation and conflict-abort phases run un-warmed — after hot
+  earlier phases in the same process, but their cold first samples show
+  in the max column — and B1's one-shot processes have no warmup by
+  design. Reported stats are median / p95 / min / max over the stated N;
+  full chronological per-sample series are in the `RAW` lines of each log.
 
 Reproduce: `bash bench/run-v07.sh` (optionally `--only=b1,b2,b3,b4`),
 with a postgres:16 container named `aster-pg-dev` on :5433.
@@ -58,8 +64,8 @@ changed the semantics the old TK measured:
 | T1 — 1 read | 390 ms (min 362, p95 400) | 6 ms (min 6, p95 7) |
 | TK same key ×200 | 458 ms, **200 traps** | 7 ms, **1 trap** |
 | TK distinct keys ×200 | not measured | 191 ms, 200 traps (min 183, p95 208) |
-| First-trap cost (T1−T0) | below ±10 ms noise | ~1 ms |
-| Same-key marginal | 0.34 ms/**trap** | 0.005 ms/**warm read** (timer floor) |
+| First-trap cost (T1−T0) | below ±10 ms noise | 1–2 ms (1 ms timer granularity) |
+| Same-key marginal | 0.34 ms/**trap** | ≤0.005 ms/**warm read** (timer floor) |
 | Distinct-key marginal ((TK−T1)/199) | — | 0.93 ms/trap (capsule grows 1→200) |
 
 **The warm-hit fix is proven on the production path**: 200 reads of one
@@ -68,6 +74,13 @@ capsule inside V8 at ≈5 µs per read (timer-resolution bound — the true
 cost is a JS loop iteration plus a capsule lookup). Under the old
 behavior this exact workload cost 200 traps ≈ 68 ms of trap time.
 Asserted by the harness (`"traps":1`), not just timed.
+
+**Median-convention note (review A3):** B1's per-process stats are
+computed bash-side with the lower-of-two-middles median over N=12 at
+1 ms granularity, while the Rust benches take the upper middle; T1's
+series straddles 6/7 ms, so B1's *derived* numbers carry ±1 ms — hence
+"1–2 ms" and "≤" above. The Rust-side tables are unaffected (large N,
+sub-millisecond spreads).
 
 **The 0.93 ms/trap distinct-key marginal is NOT comparable to the old
 0.34 ms** headline: the old number was same-key (constant 1-entry
@@ -114,7 +127,11 @@ At n=1000 the whole-capsule reseal still costs *less per trap than one
 Postgres point read leg* (compare B1), so the quadratic is real but not
 yet the bottleneck at realistic read-set sizes; incremental/Merkle-ized
 sealing remains the known remedy if capsules grow past ~10³ entries or
-entries get fat.
+entries get fat. One harness honesty note (review A4): the timed closure
+clones the capsule client-side before each call — an O(n) `BTreeMap`
+copy a real cell doesn't pay per trap — so the 0.66 µs/entry slope is a
+slight upper bound on the apparatus itself (order of tens of µs inside
+the 0.697 ms n=1000 sample).
 
 ## B3 — commit fence isolated (EQ3)
 
@@ -139,9 +156,9 @@ and rolls back on drop — ~6 round trips, **no WAL flush**.
 | (b) +10 points | 4.29 ms | 4.78 | |
 | (b) +50 points | 4.28 ms | 4.61 | |
 | (b) +200 points | 3.90 ms | 4.18 | |
-| (c) +1 window, ~1k-event log | 4.59 ms | 4.91 | window = `(s,h]` populated with 1000→1200 events |
-| (c) +10 windows | 5.81 ms | 6.39 | |
-| (c) +50 windows | 6.61 ms | 7.21 | one 66 ms outlier in max |
+| (c) +1 window | 4.59 ms | 4.91 | `(s,h]` population ~1,000→1,200 events |
+| (c) +10 windows | 5.81 ms | 6.39 | population ~1,200→1,400 (each committed sample appends) |
+| (c) +50 windows | 6.61 ms | 7.21 | population ~1,400→1,600; one 66 ms outlier in max |
 | (d) conflict-abort | **1.75 ms** | 1.98 | N=100; no append, no COMMIT flush |
 
 **Interpretation.** The fence is durability-bound, not validation-bound:
@@ -152,8 +169,12 @@ flush. Point validation is one extra round trip whose cost is flat in p
 (the `= ANY` probe with an empty window barely moves from p=1 to p=200;
 the p=200 median landing *below* p=1 is run-to-run noise, ~0.4 ms).
 Window validation pays one DISTINCT-key scan over the `(s, h]`
-population (~1.1 ms for ~1k events) plus Rust-side interval matching
-that becomes visible as w grows (w=50 over ~1k keys ≈ +2 ms). Sustained
+population (~1.1 ms at ~1k events) plus Rust-side interval matching.
+One caveat the sweep itself creates (review A2): the three w-phases
+share one growing log — each committed sample appends into `(s, h]` —
+so w=50 also scans a ~40% larger population than w=1, and the +2 ms
+from w=1→w=50 is an upper bound that conflates window count with log
+growth rather than isolating interval matching. Sustained
 280 commits/s is the serial, single-connection, fsync-per-commit
 ceiling of this fence on this disk — group commit / batching across
 transactions is the standard lever if it ever matters, and nothing in
@@ -201,7 +222,8 @@ The four benches were also exercised in three earlier same-day shakedown
 runs (same machine, same configs) with medians within run-to-run noise
 of the canonical numbers above (blind commit 3.50 vs 3.51 ms; e2e total
 6.57 vs 6.49 ms; reseal n=1000 0.721 vs 0.697 ms; B1 distinct marginal
-0.930 vs 0.930 ms/trap).
+0.930 vs 0.930 ms/trap). Shakedown logs were not preserved — these are
+summary medians only; the committed raw logs are the canonical run's.
 
 Additionally, the whole campaign was re-run from a **clean `git clone`**
 of branch `v0.7-s10` into a scratch directory with its own empty
@@ -210,6 +232,12 @@ harness runs end-to-end from a fresh checkout. Its medians, canonical
 first / clone second: warm-hit assertion 1 trap / 1 trap; B1 distinct
 marginal 0.93 / 1.03 ms; reseal n=1000 0.697 / 0.674 ms; blind commit
 3.51 / 3.70 ms (280 / 266 commits/s); conflict-abort 1.75 / 2.21 ms;
-e2e total 6.49 / 6.91 ms (153 / 143 tx/s). The clone ran immediately
-after its own cold compile with warmer background load — single-digit
-percent drift, same shapes, same conclusions.
+e2e total 6.49 / 6.91 ms (153 / 143 tx/s). Honest read of that drift
+(review A0): the headline medians moved low single digits (blind +5%,
+e2e +6.5%, reseal −3%), but the small-N un-warmed phases moved more —
+conflict-abort +26% (N=100, no warmup pass) and B1's distinct marginal
++11% (N=12 at 1 ms granularity) — under the clone's warmer background
+load right after its cold compile. Same shapes, same conclusions;
+"within run-to-run noise" holds for the headline metrics, not
+uniformly. The clone run's logs were likewise not preserved: its
+evidence is this summary plus the exit-0 transcript.

@@ -71,7 +71,12 @@ pub enum CommitOutcome {
         horizon: Timestamp,
     },
     /// Validation history below the snapshot is no longer retained
-    /// (Lemma R: coverage `g <= s` failed). Retry from a fresh snapshot.
+    /// (Lemma R: coverage `g <= s` failed). Retry from a fresh snapshot —
+    /// which in the v0.7 prototype means a fresh broker launch: brokerd
+    /// pins its snapshot at boot, and the demo read plane never observes
+    /// `aster.log` commits (the F9 integration decision the paper scopes
+    /// out). The retry contract is the fence's; the prototype's snapshot
+    /// plumbing is what limits how a caller can act on it.
     RetentionViolated {
         low_watermark: Timestamp,
     },

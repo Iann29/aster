@@ -309,6 +309,14 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // cell depends on. Only accept errors remain fatal.
     for stream in listener.incoming() {
         let mut stream = stream?;
+        // The loop is serial: a peer that connects and then goes silent
+        // (never writes a frame, or never drains the response) would wedge
+        // every other cell behind it forever — the same denial the C4
+        // containment closed for errored sockets. Bound both directions;
+        // an expired deadline surfaces as a read/write error and is
+        // contained per-connection like any other I/O failure.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
         let request = read_frame::<IpcRequest>(&mut stream);
         let should_shutdown = match request {
             Ok(request) => {
@@ -490,10 +498,33 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                 lease_epoch: capsule.seal().lease_epoch,
                 session: capsule.seal().session,
             };
-            let result = broker
-                .resolve_bound_context(session, &claimed)
-                .and_then(|bound| {
+            let resolved = broker.resolve_bound_context(session, &claimed);
+            // One session = one commit ATTEMPT, gate rejections included
+            // (adversarial-review C6): a Commit naming a table-registered
+            // session closes it even when the context check refuses the
+            // attempt. The presenter holds the bearer id — they could Abort
+            // it anyway — and the UDS client drops its held id on every
+            // structured Commit answer, so an entry left alive here would
+            // just be orphaned in the table forever.
+            if resolved.is_err() {
+                if let Some(session) = session {
+                    let _ = broker.sessions.remove(&session);
+                }
+            }
+            let result = resolved.and_then(|bound| {
                     let outcome = broker.commit(&bound, capsule, &declared_reads, &writes);
+                    // Fail-closed but never silent (review B1): StaleEpoch
+                    // means the lease moved and every commit this broker
+                    // relays is dead — say so on stderr so the operator
+                    // learns before the cells do.
+                    if let Ok(WireCommitOutcome::StaleEpoch { lease_epoch }) = &outcome {
+                        eprintln!(
+                            "aster-brokerd: fence refused commit — stale lease epoch \
+                             (authority is at epoch {lease_epoch}, this broker holds {}); \
+                             the lease moved, relaunch brokerd to re-acquire",
+                            broker.authority_epoch
+                        );
+                    }
                     // Session end-of-life (the S4 deferred obligation): one
                     // session = one transaction attempt. EVERY answer past
                     // the session gate — Committed, Conflict, or a
@@ -748,6 +779,21 @@ impl ProcessBroker {
                 return Err(WireBrokerError::new(
                     "duplicate_declared_read",
                     format!("declared read {:?} appears more than once", key.0),
+                ));
+            }
+        }
+        // Writes get the same shape discipline: a duplicate write key would
+        // surface as an aster.log primary-key violation deep inside the
+        // fence transaction (an opaque backend error) instead of a
+        // structured rejection here. The cell runtime's write set is a
+        // BTreeMap so it can't produce one — this guards hand-rolled
+        // clients.
+        let mut write_keys = BTreeSet::new();
+        for (key, _) in writes {
+            if !write_keys.insert(key) {
+                return Err(WireBrokerError::new(
+                    "duplicate_write_key",
+                    format!("write key {:?} appears more than once", key.0),
                 ));
             }
         }
@@ -1285,6 +1331,89 @@ mod tests {
         let (mut server, peer) = UnixStream::pair().expect("socketpair");
         drop(peer);
         send_response(&mut server, &IpcResponse::ShutdownAck);
+    }
+
+    /// Adversarial-review C6: a Commit whose claimed context fails the
+    /// session gate still CLOSES the presented (table-registered) session —
+    /// the UDS client drops its held id on every structured answer, so an
+    /// entry left alive would be orphaned in the table forever.
+    #[test]
+    fn commit_context_mismatch_closes_the_presented_session() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let grant_a = initial_grant(&broker, &SealContext::new("cell-a", 1));
+        let grant_b = initial_grant(&broker, &SealContext::new("cell-a", 1));
+
+        // Capsule B's seal names session B — presented on session A's id,
+        // the gate must refuse (claimed binding != presented id).
+        let response = handle_request(
+            &broker,
+            IpcRequest::Commit {
+                session: Some(grant_a.session),
+                capsule: grant_b.capsule,
+                declared_reads: vec![],
+                writes: vec![],
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::Commit(Err(error)) => {
+                assert_eq!(error.code, "session_context_mismatch", "got {error:?}");
+            }
+            other => panic!("expected gate rejection, got {other:?}"),
+        }
+
+        // The presented session died with the attempt...
+        let closed = handle_request(
+            &broker,
+            IpcRequest::Abort {
+                session: grant_a.session,
+            },
+        )
+        .0;
+        match closed {
+            IpcResponse::Abort(Err(error)) => {
+                assert_eq!(error.code, "unknown_session", "got {error:?}");
+            }
+            other => panic!("session A should be closed, got {other:?}"),
+        }
+        // ...and only that one: the session the capsule named is untouched.
+        let alive = handle_request(
+            &broker,
+            IpcRequest::Abort {
+                session: grant_b.session,
+            },
+        )
+        .0;
+        assert!(
+            matches!(alive, IpcResponse::Abort(Ok(()))),
+            "session B must survive"
+        );
+    }
+
+    /// Adversarial-review C4 sibling: duplicate write keys are refused as a
+    /// structured error at the broker — not an opaque aster.log primary-key
+    /// violation (Postgres fence) or a silent last-wins dedup (memory fence).
+    #[test]
+    fn commit_rejects_duplicate_write_keys() {
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+        let grant = initial_grant(&broker, &SealContext::new("cell-a", 1));
+        let key = DocumentId::new("docs/dup");
+        let response = handle_request(
+            &broker,
+            IpcRequest::Commit {
+                session: Some(grant.session),
+                capsule: grant.capsule,
+                declared_reads: vec![],
+                writes: vec![(key.clone(), None), (key, None)],
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::Commit(Err(error)) => {
+                assert_eq!(error.code, "duplicate_write_key", "got {error:?}");
+            }
+            other => panic!("expected duplicate_write_key, got {other:?}"),
+        }
     }
 
     #[test]

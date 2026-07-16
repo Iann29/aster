@@ -19,3 +19,6 @@ synapse-convex-dashboard-proxy	0.00%	15.77MiB / 31.19GiB
 synapse-convex-dashboard	0.00%	5.566MiB / 31.19GiB
 synapse-postgres	3.01%	58.75MiB / 31.19GiB
 jumpy-engine-caddy-dev-1	0.29%	37.34MiB / 31.19GiB
+
+# appended 2026-07-16 (adversarial review A6): durability GUCs verified live
+postgres GUCs: synchronous_commit=on, fsync=on, shared_buffers=128MB

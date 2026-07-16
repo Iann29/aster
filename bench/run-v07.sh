@@ -81,6 +81,9 @@ psql_in() { docker exec -i "${PG_CONTAINER}" psql -U aster -d "$1"; }
     echo "rustc: $(rustc -V)"
     echo "cargo: $(cargo -V)"
     echo "postgres: $(psql_c postgres 'SELECT version()')"
+    # Durability GUCs the EQ3 interpretation rests on (review A6): record
+    # them, don't assert them.
+    echo "postgres GUCs: synchronous_commit=$(psql_c postgres 'SHOW synchronous_commit'), fsync=$(psql_c postgres 'SHOW fsync'), shared_buffers=$(psql_c postgres 'SHOW shared_buffers')"
     echo "pg container: ${PG_CONTAINER} on 127.0.0.1:${PG_PORT}"
     echo
     echo "background load (this is a developer workstation — a docker dev"

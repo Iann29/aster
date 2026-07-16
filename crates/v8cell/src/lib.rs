@@ -95,6 +95,12 @@ impl PendingTrap {
 struct V8CellState {
     capsule: Option<SnapshotCapsule>,
     traps: VecDeque<PendingTrap>,
+    /// Review-C3 gate: true for a query invocation — the four mutating
+    /// syscalls refuse with a catchable JS error, mirroring upstream
+    /// Convex's "db writes are not allowed in queries". The legacy script
+    /// path and `Default` stay permissive (their harnesses predate
+    /// invocation kinds); `execute_module_core` arms this per invocation.
+    deny_writes: bool,
     /// Variante B consumption ledger (referee finding F7): every key the JS
     /// actually observed through a get — warm hits, post-trap reads, and
     /// absence reads all count; prewarm the function never touched does not.
@@ -194,16 +200,23 @@ impl V8CellState {
 
     /// Legacy `Aster.read` warm probe through the invocation view. A key the
     /// invocation wrote answers from the write set un-ledgered (ORDERING
-    /// RULE); a live capsule field answers consumed; `None` means trap.
+    /// RULE); any HELD entry answers consumed (absence serves `Null`);
+    /// `None` means trap.
     fn legacy_warm_read(&mut self, key: &DocumentId, field: &str) -> Option<Value> {
         if let Some(pending) = self.writes.get(key) {
             return Some(pending_field_value(pending.as_ref(), field));
         }
-        let value = self.read_field(key, field);
-        if value.is_some() {
+        // A held entry is warm whatever it holds (review C7): a hydrated
+        // absence, a tombstone, and a live doc without the field all pin
+        // what a trap would observe — re-trapping would hydrate, land in
+        // this same state, and re-trap forever. Absence is still a consumed
+        // read (an absence flip must conflict at commit). Only an unheld
+        // key traps.
+        if self.holds(key) {
             self.consumed.insert(key.clone());
+            return Some(self.read_field(key, field).unwrap_or(Value::Null));
         }
-        value
+        None
     }
 
     /// Legacy `Aster.read` answer after the host hydrated `key`: the view
@@ -217,6 +230,21 @@ impl V8CellState {
         }
         self.consumed.insert(key.clone());
         self.read_field(key, field).unwrap_or(Value::Null)
+    }
+
+    /// Upstream Convex rejects db writes inside query invocations (review
+    /// C3); the module entry point arms `deny_writes` per invocation kind
+    /// before any JS runs. `Some` is the typed JS-visible rejection the
+    /// four mutating verbs return unchanged — a catchable `Error`,
+    /// upstream-shaped, not a host abort.
+    fn write_gate(&self) -> Option<SyscallAnswer> {
+        self.deny_writes.then(|| {
+            SyscallAnswer::Reject(
+                "aster-v8cell: db write syscalls are not allowed in a query invocation \
+                 (upstream Convex parity)"
+                    .to_string(),
+            )
+        })
     }
 
     /// The single dispatch point for every `Convex.asyncSyscall` name the
@@ -271,6 +299,9 @@ impl V8CellState {
     /// consumption), so colliding with an existing doc is an authorized
     /// blind overwrite the fence orders like any other write (T2).
     fn syscall_insert(&mut self, args_json: &str) -> Result<SyscallAnswer, V8CellError> {
+        if let Some(reject) = self.write_gate() {
+            return Ok(reject);
+        }
         let args = parse_syscall_args("1.0/insert", args_json)?;
         let Some(value) = args.get("value").and_then(|v| v.as_object()) else {
             return Err(V8CellError::Run(
@@ -307,6 +338,9 @@ impl V8CellState {
     /// the syscall hydrates it first (upstream's implicit read), and that
     /// snapshot observation is consumed like any read.
     fn syscall_patch(&mut self, args_json: &str) -> Result<SyscallAnswer, V8CellError> {
+        if let Some(reject) = self.write_gate() {
+            return Ok(reject);
+        }
         let args = parse_syscall_args("1.0/shallowMerge", args_json)?;
         let id = require_id("1.0/shallowMerge", &args)?;
         let Some(patch) = args.get("value").and_then(|v| v.as_object()) else {
@@ -315,7 +349,7 @@ impl V8CellState {
             ));
         };
         let key = DocumentId::new(id.clone());
-        let (mut base, from_capsule) = match self.mutation_base(&key) {
+        let (mut base, from_capsule) = match self.mutation_base(&key)? {
             MutationBase::Unheld => return Ok(SyscallAnswer::NeedsHydration(key)),
             MutationBase::PendingDeleted => {
                 return Ok(SyscallAnswer::Reject(nonexistent_doc_message("patch", &id)));
@@ -356,6 +390,9 @@ impl V8CellState {
     /// document like upstream; the existence check consumes the key when it
     /// was answered from the snapshot (same rule as patch).
     fn syscall_replace(&mut self, args_json: &str) -> Result<SyscallAnswer, V8CellError> {
+        if let Some(reject) = self.write_gate() {
+            return Ok(reject);
+        }
         let args = parse_syscall_args("1.0/replace", args_json)?;
         let id = require_id("1.0/replace", &args)?;
         let Some(value) = args.get("value").and_then(|v| v.as_object()) else {
@@ -364,7 +401,7 @@ impl V8CellState {
             ));
         };
         let key = DocumentId::new(id.clone());
-        let (base, from_capsule) = match self.mutation_base(&key) {
+        let (base, from_capsule) = match self.mutation_base(&key)? {
             MutationBase::Unheld => return Ok(SyscallAnswer::NeedsHydration(key)),
             MutationBase::PendingDeleted => {
                 return Ok(SyscallAnswer::Reject(nonexistent_doc_message(
@@ -401,10 +438,13 @@ impl V8CellState {
     /// upstream — deleting requires the doc to exist, and that existence
     /// check consumes the key when answered from the snapshot.
     fn syscall_remove(&mut self, args_json: &str) -> Result<SyscallAnswer, V8CellError> {
+        if let Some(reject) = self.write_gate() {
+            return Ok(reject);
+        }
         let args = parse_syscall_args("1.0/remove", args_json)?;
         let id = require_id("1.0/remove", &args)?;
         let key = DocumentId::new(id.clone());
-        let (base, from_capsule) = match self.mutation_base(&key) {
+        let (base, from_capsule) = match self.mutation_base(&key)? {
             MutationBase::Unheld => return Ok(SyscallAnswer::NeedsHydration(key)),
             MutationBase::PendingDeleted => {
                 return Ok(SyscallAnswer::Reject(nonexistent_doc_message("delete", &id)));
@@ -427,20 +467,20 @@ impl V8CellState {
     /// Resolve the document a mutating verb builds on, through the
     /// invocation view: the pending write wins, then the capsule entry;
     /// no entry anywhere is `Unheld` (hydrate first).
-    fn mutation_base(&self, key: &DocumentId) -> MutationBase {
+    fn mutation_base(&self, key: &DocumentId) -> Result<MutationBase, V8CellError> {
         if let Some(pending) = self.writes.get(key) {
-            return match pending {
-                Some(doc) => MutationBase::PendingLive(raw_json_object(doc)),
+            return Ok(match pending {
+                Some(doc) => MutationBase::PendingLive(raw_json_object(doc)?),
                 None => MutationBase::PendingDeleted,
-            };
+            });
         }
         let Some(versioned) = self.capsule.as_ref().and_then(|capsule| capsule.get(key)) else {
-            return MutationBase::Unheld;
+            return Ok(MutationBase::Unheld);
         };
-        match versioned.document.as_ref() {
-            Some(doc) => MutationBase::CapsuleLive(raw_json_object(doc)),
+        Ok(match versioned.document.as_ref() {
+            Some(doc) => MutationBase::CapsuleLive(raw_json_object(doc)?),
             None => MutationBase::CapsuleAbsent,
-        }
+        })
     }
 }
 
@@ -468,13 +508,20 @@ fn pending_field_value(pending: Option<&Document>, field: &str) -> Value {
 /// Postgres adapter's upstream JSON bytes — see `consume_get_raw_json`);
 /// a live doc without one (legacy hand-seeded typed docs) merges from an
 /// empty base rather than failing, keeping the toy fixtures runnable.
-fn raw_json_object(doc: &Document) -> serde_json::Map<String, serde_json::Value> {
+/// A PRESENT but unparseable/non-object `_raw` is a different animal: it
+/// means the store handed us a corrupt envelope, and silently merging from
+/// an empty base would let a patch replace the whole document — error out.
+fn raw_json_object(doc: &Document) -> Result<serde_json::Map<String, serde_json::Value>, V8CellError> {
     match doc.get("_raw") {
         Some(Value::Text(raw)) => serde_json::from_str::<serde_json::Value>(raw)
             .ok()
             .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default(),
-        _ => serde_json::Map::new(),
+            .ok_or_else(|| {
+                V8CellError::Run(
+                    "convex mutation: document `_raw` envelope is not a JSON object".to_string(),
+                )
+            }),
+        _ => Ok(serde_json::Map::new()),
     }
 }
 
@@ -695,6 +742,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial.capsule().clone()),
             traps: VecDeque::new(),
+            deny_writes: false,
             consumed: BTreeSet::new(),
             writes: BTreeMap::new(),
         }));
@@ -746,6 +794,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial_capsule),
             traps: VecDeque::new(),
+            deny_writes: false,
             consumed: BTreeSet::new(),
             writes: BTreeMap::new(),
         }));
@@ -908,6 +957,7 @@ impl V8SandboxCell {
         let boxed_state = Box::new(Mutex::new(V8CellState {
             capsule: Some(initial.capsule().clone()),
             traps: VecDeque::new(),
+            deny_writes: false,
             consumed: BTreeSet::new(),
             writes: BTreeMap::new(),
         }));
@@ -1156,6 +1206,15 @@ impl V8SandboxCell {
         invocation: ModuleInvocation,
         mut hydrate: impl FnMut(&DocumentId) -> Result<(), V8CellError>,
     ) -> Result<V8ExecutionResult, V8CellError> {
+        // Arm the query/mutation write gate before any JS runs (review C3):
+        // upstream Convex rejects db writes inside queries, and the export
+        // marker alone doesn't stop a hand-written `isQuery` export from
+        // reaching the mutating syscalls through `invokeQuery`.
+        {
+            let state = unsafe { &*state_ptr };
+            state.lock().expect("v8 state mutex poisoned").deny_writes =
+                matches!(invocation, ModuleInvocation::Query);
+        }
         let create_params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(create_params);
         // Same explicit microtask policy as the legacy path. ESM evaluation
@@ -1544,6 +1603,13 @@ unsafe fn run_trap_pump_loop(
     traps: &mut usize,
     hydrate: &mut dyn FnMut(&DocumentId) -> Result<(), V8CellError>,
 ) -> Result<(), V8CellError> {
+    // Two counters since the review-C5 fix: `pumped` bounds pump dispatches
+    // (the anti-runaway guard must count every parked syscall, warm or not,
+    // or a warm re-dispatch loop would pump forever), while the
+    // caller-visible `traps` counts broker round trips only — incremented
+    // at the hydrate sites, which is the semantics the module header
+    // promises and the S10 bench asserts.
+    let mut pumped = 0usize;
     loop {
         scope.perform_microtask_checkpoint();
         let promise = v8::Local::new(scope, target);
@@ -1565,14 +1631,15 @@ unsafe fn run_trap_pump_loop(
                 let Some(pending) = pending else {
                     return Err(V8CellError::PendingWithoutTrap);
                 };
-                if *traps >= max_traps {
+                if pumped >= max_traps {
                     return Err(V8CellError::TooManyTraps { limit: max_traps });
                 }
-                *traps += 1;
+                pumped += 1;
 
                 let resolver = v8::Local::new(scope, pending.resolver());
                 match &pending {
                     PendingTrap::AsterRead { key, field, .. } => {
+                        *traps += 1;
                         hydrate(key)?;
                         let value = {
                             let state = &*state_ptr;
@@ -1601,6 +1668,7 @@ unsafe fn run_trap_pump_loop(
                             state.dispatch_convex_syscall(name, args_json)?
                         };
                         if let SyscallAnswer::NeedsHydration(key) = &answer {
+                            *traps += 1;
                             hydrate(key)?;
                             answer = {
                                 let state = &*state_ptr;
@@ -1938,6 +2006,71 @@ mod tests {
         V8_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Review C3: a query invocation must never reach the mutating
+    /// syscalls — upstream Convex rejects db writes inside queries.
+    #[test]
+    fn query_invocation_write_gate_rejects_mutation_syscalls() {
+        let mut state = V8CellState {
+            deny_writes: true,
+            ..Default::default()
+        };
+        for (name, args) in [
+            ("1.0/insert", r#"{"table":"docs","value":{"_id":"docs/aa"}}"#),
+            ("1.0/shallowMerge", r#"{"id":"docs/aa","value":{}}"#),
+            ("1.0/replace", r#"{"id":"docs/aa","value":{}}"#),
+            ("1.0/remove", r#"{"id":"docs/aa"}"#),
+        ] {
+            match state.dispatch_convex_syscall(name, args) {
+                Ok(SyscallAnswer::Reject(message)) => {
+                    assert!(message.contains("query invocation"), "{name}: {message}");
+                }
+                other => panic!("{name} must die at the write gate, got {other:?}"),
+            }
+        }
+        // The gate is write-only: a read passes through untouched.
+        let get = state.dispatch_convex_syscall("1.0/get", r#"{"id":"docs/aa"}"#);
+        assert!(
+            !matches!(&get, Ok(SyscallAnswer::Reject(message)) if message.contains("query invocation")),
+            "reads must not be write-gated: {get:?}"
+        );
+    }
+
+    /// Review C2 sentinel: a PRESENT but non-object `_raw` envelope is an
+    /// error — merging from an empty base would let a patch silently
+    /// replace the whole document.
+    #[test]
+    fn malformed_raw_envelope_is_an_error_not_an_empty_base() {
+        let mut doc = Document::new();
+        doc.insert("_raw".to_string(), Value::Text("{not json".to_string()));
+        assert!(raw_json_object(&doc).is_err());
+        // Raw-less docs (legacy hand-seeded fixtures) still merge from an
+        // empty base — that keeps the toy paths runnable.
+        let clean = doc_with_i64("n", 1);
+        assert!(raw_json_object(&clean).expect("raw-less doc").is_empty());
+    }
+
+    /// Review C7: a held-but-valueless entry (hydrated absence) is WARM
+    /// for the legacy read — it answers Null, consumes, and never re-traps.
+    #[test]
+    fn legacy_read_of_held_absence_is_warm_and_consumed() {
+        let mut capsule = SnapshotCapsule::empty(
+            TenantId::new("tenant-a"),
+            DeploymentId::new("dep-a"),
+            7,
+        );
+        let key = DocumentId::new("k/absent");
+        capsule.hydrate_point(key.clone(), aster_capsule::VersionedDocument::missing());
+        let mut state = V8CellState {
+            capsule: Some(capsule),
+            ..Default::default()
+        };
+        assert_eq!(state.legacy_warm_read(&key, "f"), Some(Value::Null));
+        assert!(
+            state.consumed.contains(&key),
+            "absence read must be ledgered"
+        );
     }
 
     #[test]

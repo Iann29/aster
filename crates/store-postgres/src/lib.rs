@@ -57,6 +57,16 @@
 //! everything else. Garbage falls through to a clear error message
 //! that mentions both forms.
 //!
+//! ALIASING CAVEAT (review C1): the two forms are two spellings of the
+//! same row, but every layer above keys by the raw string — the cell's
+//! view/ledger/write set and the fence's conflict scan treat
+//! `"<hex>/<hex>"` and the IDv6 as different keys. A transaction that
+//! mixes forms for one document can miss read-your-own-writes and
+//! pairwise conflict detection across the spellings. A real Convex
+//! bundle cannot do this (JS only ever holds IDv6 strings); the hazard
+//! is confined to hand-rolled native callers, and the fix — broker-side
+//! canonicalization at the hydrate/commit seam — is named future work.
+//!
 //! Why not `sqlx`: its `query!` macro requires a live database at
 //! compile time, which CI cannot satisfy without a service container
 //! and a checked-in offline-query-data file. We hand-write the SQL

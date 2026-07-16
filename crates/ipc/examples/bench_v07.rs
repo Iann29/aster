@@ -29,7 +29,11 @@
 //! Every phase prints one `RESULT {json}` line (machine-readable, kept in
 //! the committed raw logs) plus a human summary. Timings are captured with
 //! `Instant` around the client-side call, so a sample includes request
-//! serialization and UDS connect — exactly what a cell pays per trap.
+//! serialization and UDS connect — what a cell pays per trap, plus, in
+//! the reseal phase only, a client-side clone of the capsule the harness
+//! makes before each call (review A4): a real cell never pays that O(n)
+//! copy, so the fitted per-entry slope is a slight upper bound (order of
+//! tens of µs inside the n=1000 sample).
 
 use std::time::Instant;
 
@@ -122,8 +126,11 @@ impl Flags {
 // ----------------------------------------------------------------- stats --
 
 /// Order statistics over raw per-sample nanoseconds. Median interpolates
-/// nothing (lower-median for even n — samples are plentiful enough that
-/// the distinction is noise); p95 takes the ceil-indexed order statistic.
+/// nothing (UPPER-median for even n — `samples[count / 2]`; samples are
+/// plentiful enough here that the distinction is noise). B1's bash-side
+/// stats use the LOWER median over N=12 at 1 ms granularity — the
+/// campaign report carries that convention caveat (review A3); p95 takes
+/// the ceil-indexed order statistic.
 struct Stats {
     count: usize,
     min_ns: u128,

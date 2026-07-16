@@ -294,6 +294,27 @@ impl WritePlane {
                 )
                 .await
                 .map_err(|err| StoreError::Backend(format!("read_point: {err}")))?;
+            // Post-read retention guard for the plane's own MVCC reads —
+            // the C3-class rule one seam over (review B4): the floor never
+            // lowers, so `floor <= ts` observed AFTER the query proves
+            // coverage held throughout it. A snapshot below the floor may
+            // have had shadowed revisions compacted away — its absences are
+            // not evidence — so refuse as Stale rather than answer.
+            let floor: i64 = client
+                .query_one(
+                    "SELECT COALESCE((SELECT low_watermark FROM aster.retention
+                      WHERE tenant = $1 AND deployment = $2), 0)",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("read_point floor: {err}")))?
+                .get(0);
+            if as_i64(ts)? < floor {
+                return Err(StoreError::Stale {
+                    requested: ts,
+                    latest: floor.max(0) as u64,
+                });
+            }
             match row {
                 None => Ok(VersionedDocument::missing()),
                 Some(row) => Ok(VersionedDocument {
@@ -340,6 +361,24 @@ impl WritePlane {
                 )
                 .await
                 .map_err(|err| StoreError::Backend(format!("read_prefix_live: {err}")))?;
+            // Same post-read retention guard as `read_point` (review B4):
+            // a snapshot below the floor may scan a compacted history —
+            // the certificate-shaped result would be false evidence.
+            let floor: i64 = client
+                .query_one(
+                    "SELECT COALESCE((SELECT low_watermark FROM aster.retention
+                      WHERE tenant = $1 AND deployment = $2), 0)",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("read_prefix_live floor: {err}")))?
+                .get(0);
+            if as_i64(ts)? < floor {
+                return Err(StoreError::Stale {
+                    requested: ts,
+                    latest: floor.max(0) as u64,
+                });
+            }
             rows.into_iter()
                 .map(|row| {
                     Ok((
