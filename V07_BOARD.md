@@ -67,17 +67,38 @@ testes / 14 provas do fence), CLAIMS.md reconciliado + linha do addendum
 TLC. Suítes no HEAD: workspace 23 suítes ok, v8cell ok, postgres-it
 33+25+14 ok.
 
-**Próximo: S9 (commit verb IPC)** — fecha célula→broker→fence: capsule +
-`consumed_reads` (Variante B) + write set no wire; sessões fecham no
-commit/abort; época REAL da lease authority no read path (mata a obrigação
-C-CHANNEL restante #2); considerar launch-token pro mint (obrigação #1).
-Depois **S10 (bench write path)**: re-run read bench pós-fixes (warm-hit),
-fence isolado, fim-a-fim, curva de reseal EQ2. Depois: re-referee externo
-(GPT) com errata teorema↔código.
+**Round 4 CONCLUÍDO (16/07 ~13h, commit `ac3ac50`) — review final do delta
+S9+S10, aplicado INLINE (freio de custo do Ian — sem mais tribunal de
+agentes):** 17 achados de 3 lentes + 16 vereditos de céticos herdados do
+workflow parado (wf_af32f1dc). Código: brokerd timeouts anti-wedge no accept
+loop (B2), Commit fecha a sessão mesmo em rejeição do gate (C6),
+`duplicate_write_key` estruturado (C4b), log alto de stale epoch (B1);
+v8cell write gate em query — paridade upstream (C3), held-absence warm no
+legacy read (C7), `traps` = broker round trips com budget de pump separado
+(C5), `_raw` malformado erra em vez de base vazia (C2 sentinela); write
+plane recusa leitura abaixo do retention floor — Stale, nunca ausência
+falsa (B4). Zombie-broker REFUTADO 2-1 pelos céticos (fail-closed por
+design). Honestidade dos benchs A0–A6: drift por métrica (+26% nas caudas
+small-N declarado), window sweep rotulado upper bound (população cresce
+1,0k→1,6k), convenções de mediana, clone overhead do reseal, warmup por
+fase, GUCs capturados em machine.log + run-v07.sh. Seams B3 (snapshot
+boot-pinned → retry = relançar broker) e C1 (aliasing IDv6/wire form,
+confinado a callers nativos) documentados no paper §8 + docs de código.
++6 testes sentinela. Re-stamp: **18.801 LOC / 260 testes / 16 provas do
+fence**. Suítes: workspace 23 ok, v8cell 18, postgres-it 33+25+16, ipc
+gated 31.
 
-**Se uma iteração de cron pegar este arquivo com round em andamento:** NÃO
-iniciar fatia nova; checar task notifications; se workflow ainda roda, só
-reportar status e encerrar o turno.
+**v0.7 COMPLETO — 13/13 fatias + 4 rounds de review adversarial.** Próximo
+passo é DO IAN: colar `paper/rereferee-v07-prompt.md` no GPT Pro (re-referee
+externo da implementação + paper — o xeque-mate combinado). Depois do
+veredito: aplicar achados → LaTeX/BibTeX (venue/ano das citações ainda por
+confirmar, ver CLAIMS) → arXiv. Obrigação C-CHANNEL #1 (launch token no
+mint) segue future work documentado.
+
+**Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
+Iterações de cron: NADA a construir — reportar status em uma linha e
+encerrar o turno imediatamente. O cron do loop (15min, id `5ce96300`) já
+pode ser desligado.
 
 ## Operacional
 
