@@ -32,9 +32,28 @@ modelo TLA e TLC re-rodado, `885ef9b`). Suítes: workspace 0 falhas, v8cell
 8/8 rodadas verdes, postgres-it 21+11 verdes. Worktrees e branches de fatia
 removidos.
 
-**Round 2 em andamento: review adversarial multi-lente** do diff completo
-`815ed0a..HEAD` (workflow em background). Depois: aplicar achados
-confirmados → S9 → S10.
+**Round 2 CONCLUÍDO — review adversarial (wf_8f0f1dfc-538):** 29 achados
+brutos de 5 lentes → 24 verificados por 3 céticos cada → **16 confirmados**
+(2 por mutation testing real). Código: C2 fence sem
+idle_in_transaction_session_timeout/keepalive = wedge indefinido; C3
+scan/read_point sem check do retention floor do Convex
+(min_document_snapshot_ts) = evidência selada FALSA possível; C4 brokerd
+morre com 1 conexão hostil (EPIPE/FrameTooLarge) e perde a session table.
+Testes: C6 session-no-MAC sem teste semântico (mutação passa!); C7 metade
+fence do pin Lemma R sem teste; C8 hydrate-at-capsule.ts sem pin (mutação
+passa!). Paper: cluster seal v2→v3 (C1/C9), cluster C-CHANNEL overclaim
+(C0/C5/C10/C11 — sessão é broker-minted mas cid/epoch self-asserted no
+mint; epoch do read path vem de env), números stale (C12/C14/C15), CLAIMS.md
+dessincronizado (C13). 8 sem verificação (limite de sessão): R0/R2/R5/R7
+plausíveis → verificar-e-corrigir no round 3; R1/R3/R6 duplicatas de
+confirmados; R4 = escopo S9 aceito. Overflow U2/U3/U4 = paper minors.
+
+**Round 3 EM ANDAMENTO (wf_fd6697e3-e31):** 3 agentes em worktrees —
+A) store-postgres: C2+C3+C7+R0+R2+R5+R7 (único usando aster-pg-dev);
+B) ipc/seal/broker: C4+C6+C8; C) paper: reconciliação completa
+(C0/C1/C5/C9-C15 + U2/U3/U4). Merge: A,B,C (paths disjuntos) + re-stamp
+dos counts do paper pós-merge (agentes A/B adicionam testes). Depois:
+S9 → S10 → re-referee externo (GPT) com errata.
 
 **Se uma iteração de cron pegar este arquivo com round em andamento:** NÃO
 iniciar fatia nova; checar task notifications; se workflow ainda roda, só
