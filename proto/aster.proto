@@ -70,8 +70,10 @@ message CapsuleEntry {
 }
 
 message CapsuleSeal {
-  // v0.2: "aster-blake3-keyed-v1". This is not a TLS substitute; it is the
-  // bearer-capability seal over the canonical capsule bytes and cell context.
+  // v0.7: "aster-blake3-keyed-v2" — direct MAC over the full framed canonical
+  // capsule bytes (Capsule Transaction Theorem, Remark 3.4), so forgery
+  // reduces to keyed-MAC security alone. This is not a TLS substitute; it is
+  // the bearer-capability seal over the canonical capsule bytes and context.
   string algorithm = 1;
   bytes digest = 2;
   bytes mac = 3;
