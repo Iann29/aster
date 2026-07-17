@@ -108,6 +108,29 @@ launch token F3 + deployment A12 F12). F18 tem ERRO FACTUAL de datas
 prehash, não o v3 — round 3 do GPT = reemitir o report. Fork A (preprint
 honesto agora) vs B (v0.8 primeiro) — decisão do Ian.
 
+**Round 6 — KIT DE REPARO APLICADO (17/07, Path A escolhido pelo Ian).**
+Código: F4 sessão consumida ANTES do fence (consume-first atômico); F7
+alias raw-wire rejeitado no broker (`noncanonical_document_id`) + ordem
+bytewise `COLLATE "C"` nos scans do write plane (regressão locale-vs-bytes);
+F10 mutante `AsterFenceNoAtomic` — TLC reproduz o write skew do CE 3.9
+(I4 violado, 1.484 estados) + escopo do modelo declarado honesto + jar
+pinado por sha256; F11 invariante R0 — floor acima do tip reparado no
+acquire_lease (regressão); F15 rollback explícito aguardado nos 5 caminhos
+de rejeição do fence. Texto: TODAS as replacement sentences do round 2
+adotadas — leitura de duas-histórias (F1), policy deployment-wide (F2),
+bearer-session (F3), C1 arquitetural (F4), transcript leakage + module
+bundles (F5), Variante B híbrida (F6), datas de incidente corrigidas (F18),
+"this paper governs v3" (F9), eval estreitada (F13-F16), §8 com 4 seams.
+Re-stamp: **18.992 LOC / 263 testes / 18 provas do fence**. Suítes:
+workspace 23 ok, v8cell 18, postgres-it 33+25+18, ipc gated 32.
+
+**PRÓXIMOS PASSOS (nesta ordem):** (1) Ian roda o round 3 no GPT Pro —
+`paper/rereferee-round3-report-reissue-prompt.md` (reemitir o report formal
+pro seal v3; fecha F9 de verdade e devolve o "report governs"); (2) LaTeX +
+BibTeX com as citações confirmadas → arXiv (preprint honesto, timestamp);
+(3) v0.8 = a campanha do venue (integração committer/uma história F1,
+policy fina F2, launch token F3, deployment A12 F12, eval fatorial F16).
+
 **Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
 Iterações de cron: NADA a construir — reportar status em uma linha e
 encerrar o turno imediatamente. O cron do loop (15min, id `5ce96300`) já

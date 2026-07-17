@@ -159,7 +159,7 @@ and rolls back on drop — ~6 round trips, **no WAL flush**.
 | (c) +1 window | 4.59 ms | 4.91 | `(s,h]` population ~1,000→1,200 events |
 | (c) +10 windows | 5.81 ms | 6.39 | population ~1,200→1,400 (each committed sample appends) |
 | (c) +50 windows | 6.61 ms | 7.21 | population ~1,400→1,600; one 66 ms outlier in max |
-| (d) conflict-abort | **1.75 ms** | 1.98 | N=100; no append, no COMMIT flush |
+| (d) conflict-abort | **1.75 ms** | 1.98 | N=100; no append, no COMMIT flush; decision latency — measured before the fence gained its awaited rollback (re-referee F15), re-measure next campaign |
 
 **Interpretation.** The fence is durability-bound, not validation-bound:
 the blind commit's ~3.5 ms is dominated by the synchronous WAL flush at
@@ -175,14 +175,18 @@ share one growing log — each committed sample appends into `(s, h]` —
 so w=50 also scans a ~40% larger population than w=1, and the +2 ms
 from w=1→w=50 is an upper bound that conflates window count with log
 growth rather than isolating interval matching. Sustained
-280 commits/s is the serial, single-connection, fsync-per-commit
-ceiling of this fence on this disk — group commit / batching across
-transactions is the standard lever if it ever matters, and nothing in
-the fence design forbids it.
+280 commits/s is the observed throughput of this implementation and
+configuration, consistent with an fsync-per-commit regime — no ceiling
+claimed, and no durability-off control was run to isolate the cause.
+Cross-transaction group commit is NOT a drop-in lever here (re-referee
+F15): the lease-row lock is held until COMMIT completes, so batching
+several logical transactions would require a modified fence.
 
 ## B4 — write path end-to-end (EQ3/EQ4)
 
-`bench_v07 e2e`: the full theorem loop per transaction, serial —
+`bench_v07 e2e`: the full plumbing loop per transaction (the read adapter
+and the commit log are separate histories — the paper's Section 5 states
+how to read this), serial —
 `InitialCapsule` (session mint) → fresh V8 isolate compiles + runs real
 JS (`Convex.asyncSyscall`: one `1.0/get` that traps and hydrates the
 capsule from the Convex-schema fixture via Postgres, one `1.0/insert`
@@ -204,17 +208,19 @@ amortized — the honest analog of a warm cell pool, stated as such).
 
 **Sustained: 152.9 tx/s serial** (500 committed transactions in 3.27 s).
 
-**Interpretation.** The commit leg (4.03 ms) is statistically the same
-as the isolated fence with one point validation (B3: 4.29 ms) — the
-entire capability apparatus on the write path (UDS round trip, session
-gate, seal verification, B-SUBSET declaration check) adds nothing
-measurable on top of the fence's own Postgres cost, consistent with B2's
-0.035 ms apparatus floor at small capsules. The exec leg (2.44 ms) buys
-a fresh isolate, ESM compile, one authenticated read (two fixture
-queries + reseal), and the in-cell write set. End to end, an
-authenticated, fenced, strictly-serializable mutation from inside an
-untrusted V8 cell costs ~6.5 ms on stock Postgres — about 1.9× a blind
-fence append and well inside the fsync-dominated regime.
+**Interpretation.** The commit leg (4.03 ms) lands close to the isolated
+fence with one point validation (B3: 4.29 ms). This campaign has no
+paired A/B control (re-referee F15), so the supportable claim is that no
+write-path apparatus overhead (UDS round trip, session gate, seal
+verification, B-SUBSET declaration check) was isolated by this
+comparison — not that it is zero — consistent with B2's 0.035 ms
+apparatus floor at small capsules; policy and launch-security mechanisms
+contribute no cost because they do not exist yet. The exec leg (2.44 ms)
+buys a fresh isolate, ESM compile, one authenticated read (two fixture
+queries + reseal), and the in-cell write set. End to end, a fenced
+mutation from inside an untrusted V8 cell costs ~6.5 ms warm-process on
+stock Postgres against Aster's own log — about 1.9× a blind fence
+append, consistent with a synchronous-commit-dominated regime.
 
 ## Cross-run stability and clean-checkout reproducibility
 

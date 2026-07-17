@@ -884,3 +884,67 @@ fn reads_below_the_retention_floor_are_stale() {
     let scan = plane.read_prefix_live(TENANT, DEPLOYMENT, "docs/", 10, t1);
     assert!(matches!(scan, Err(StoreError::Stale { .. })), "got {scan:?}");
 }
+
+/// Re-referee F7: one total key order end-to-end. Under the postgres image
+/// default locale collation "docs/a" sorts before "docs/B"; the certificate
+/// window logic orders by Rust bytes, where 'B' (0x42) < 'a' (0x61). The
+/// scan must use byte order or a Boundary certificate protects the wrong
+/// prefix.
+#[test]
+fn prefix_scan_order_is_bytewise() {
+    let plane = fresh_plane();
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire");
+    let t1 = match commit_blind(&plane, epoch, 0, "docs/a", 1) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    let t2 = match commit_blind(&plane, epoch, t1, "docs/B", 2) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    let rows = plane
+        .read_prefix_live(TENANT, DEPLOYMENT, "docs/", 10, t2)
+        .expect("scan");
+    let keys: Vec<&str> = rows.iter().map(|(key, _)| key.0.as_str()).collect();
+    assert_eq!(keys, vec!["docs/B", "docs/a"], "scan must sort bytewise");
+    let mut rust_sorted = keys.clone();
+    rust_sorted.sort();
+    assert_eq!(keys, rust_sorted, "SQL order must equal Rust str order");
+}
+
+/// Re-referee F11: invariant R0 (0 <= g <= tip). A floor stranded above the
+/// tip (pre-clamp binary, manual writes) would refuse every future snapshot
+/// forever; lease acquisition repairs it to the tip — safe, because no
+/// event above the tip ever existed to be compacted.
+#[test]
+fn retention_floor_above_tip_is_repaired_at_lease_acquisition() {
+    let plane = fresh_plane();
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire");
+    let tip = match commit_blind(&plane, epoch, 0, "docs/r0", 1) {
+        CommitOutcome::Committed { ts } => ts,
+        other => panic!("expected committed, got {other:?}"),
+    };
+    raw_exec(&format!(
+        "UPDATE aster.retention SET low_watermark = {} \
+         WHERE tenant = '{TENANT}' AND deployment = '{DEPLOYMENT}'",
+        tip + 500
+    ));
+
+    // The wedged state refuses a tip snapshot...
+    assert!(matches!(
+        commit_blind(&plane, epoch, tip, "docs/r0b", 2),
+        CommitOutcome::RetentionViolated { .. }
+    ));
+    // ...re-acquiring the lease repairs R0 and admission resumes.
+    let epoch2 = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("re-acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch2, tip, "docs/r0b", 2),
+        CommitOutcome::Committed { .. }
+    ));
+}

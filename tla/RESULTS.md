@@ -222,10 +222,14 @@ Model checking here is against the DESIGN abstracted from
 ```
 cd tla
 curl -L -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+# Pinned toolchain (re-referee F17): verify before running —
+#   sha256sum tla2tools.jar
+#   936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFence.cfg -workers auto -deadlock            # PASS, ~80s
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceReuse.cfg -workers auto -deadlock       # I3 violation, <1s
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceNoPin.cfg -workers auto -deadlock       # I2 violation, <1s
 java -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceNoPinSound.cfg -workers auto -deadlock  # PASS, ~104s
+java -cp tla2tools.jar tlc2.TLC AsterFenceNoAtomic -workers auto -deadlock                           # I4 violation, <1s
 ```
 
 ---
@@ -252,3 +256,33 @@ State counts shrank versus the first pass (e.g. positive 14.9M→14.8M
 generated, NoPinSound 29.8M→22.2M) exactly as expected: the Tip guard removes
 the above-tip GC branches from the reachable space. Both negatives still
 produce their violations, so the model kept its teeth after the change.
+
+---
+
+## Addendum 2026-07-17: the A-ATOMIC mutant + honest model scope (re-referee F10)
+
+**Scope, stated exactly.** `AsterFence` encodes the lease-row lock as "at
+most one in-flight fence" (`FenceBegin` requires `inflight = None`). TLC on
+the positive model therefore checks the safety CONSEQUENCES of that
+serialization — it does not verify that Rust/Postgres establish the
+serialization itself; the SQL integration tests
+(`write_plane_it.rs`) carry that weight. Any paper sentence claiming TLC
+"checks validation/append atomicity" of the implementation is too strong
+and has been corrected.
+
+**The missing mutant, now present.** `AsterFenceNoAtomic.tla` removes the
+mutual exclusion: up to two fences validate concurrently, each against the
+horizon it captured at BEGIN, with the aster.log primary key `(pos, key)`
+modeled faithfully (a same-position same-key second append is refused, as
+the real INSERT would die on the PK; different keys at one position both
+land). Run (TLC 2.19, same jar, `-workers auto -deadlock`):
+
+| Config | Result | States generated / distinct |
+|---|---|---|
+| AsterFenceNoAtomic (A-ATOMIC negative) | **Invariant I4_NoWriteSkew violated** — the Counterexample 3.9 write skew, exactly as required | 1,484 / 1,231 |
+
+Trace shape: both fences begin at the same tip with crossing declared
+reads, the first append lands above the second fence's captured `h`, so the
+second conflict scan cannot see it, and both commit. This is the anomaly
+the lease-row lock exists to kill; the model now demonstrates the kill is
+load-bearing rather than assuming it.

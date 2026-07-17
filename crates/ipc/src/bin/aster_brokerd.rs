@@ -414,6 +414,11 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                     false,
                 );
             }
+            for key in &prewarm {
+                if let Err(error) = reject_noncanonical_point_id(key) {
+                    return (IpcResponse::InitialCapsule(Err(error)), false);
+                }
+            }
             let session = broker
                 .sessions
                 .mint(&context.cell_id, broker.authority_epoch);
@@ -439,6 +444,7 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
         } => (
             IpcResponse::HydratePoint(broker.resolve_bound_context(session, &context).and_then(
                 |bound| {
+                    reject_noncanonical_point_id(&key)?;
                     broker
                         .hydrate_point(&bound, capsule, key)
                         .map_err(WireBrokerError::from)
@@ -499,17 +505,18 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                 session: capsule.seal().session,
             };
             let resolved = broker.resolve_bound_context(session, &claimed);
-            // One session = one commit ATTEMPT, gate rejections included
-            // (adversarial-review C6): a Commit naming a table-registered
-            // session closes it even when the context check refuses the
-            // attempt. The presenter holds the bearer id — they could Abort
-            // it anyway — and the UDS client drops its held id on every
-            // structured Commit answer, so an entry left alive here would
-            // just be orphaned in the table forever.
-            if resolved.is_err() {
-                if let Some(session) = session {
-                    let _ = broker.sessions.remove(&session);
-                }
+            // One session = one commit ATTEMPT, and the attempt SPENDS the
+            // session BEFORE the fence runs (review C6 + re-referee F4):
+            // consumption is keyed to presenting a registered id, not to
+            // the outcome — gate rejections close it too, and a parallel
+            // broker could never double-spend one session into two fence
+            // executions. The presenter holds the bearer id (they could
+            // Abort it anyway), and the UDS client drops its held id on
+            // every structured Commit answer. Replay of the ISSUED capsule
+            // bytes is inevitable under bearer semantics (theorem CE2.1);
+            // spending the session here is what bounds it.
+            if let Some(session) = session {
+                let _ = broker.sessions.remove(&session);
             }
             let result = resolved.and_then(|bound| {
                     let outcome = broker.commit(&bound, capsule, &declared_reads, &writes);
@@ -524,17 +531,6 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                              the lease moved, relaunch brokerd to re-acquire",
                             broker.authority_epoch
                         );
-                    }
-                    // Session end-of-life (the S4 deferred obligation): one
-                    // session = one transaction attempt. EVERY answer past
-                    // the session gate — Committed, Conflict, or a
-                    // structured rejection — closes the session; only
-                    // transport failures (which never reach this point)
-                    // leave it open. Replay of the ISSUED capsule bytes is
-                    // inevitable under bearer semantics (theorem CE2.1);
-                    // closing the session here is what bounds it.
-                    if let Some(session) = session {
-                        let _ = broker.sessions.remove(&session);
                     }
                     outcome
                 });
@@ -766,6 +762,7 @@ impl ProcessBroker {
         // anyone else's safety.
         let mut declared = BTreeSet::new();
         for key in declared_reads {
+            reject_noncanonical_point_id(key)?;
             if !capsule.docs.contains_key(key) {
                 return Err(WireBrokerError::new(
                     "declared_read_not_in_capsule",
@@ -790,6 +787,7 @@ impl ProcessBroker {
         // clients.
         let mut write_keys = BTreeSet::new();
         for (key, _) in writes {
+            reject_noncanonical_point_id(key)?;
             if !write_keys.insert(key) {
                 return Err(WireBrokerError::new(
                     "duplicate_write_key",
@@ -827,6 +825,36 @@ impl ProcessBroker {
             .map(WireCommitOutcome::from)
             .map_err(|error| WireBrokerError::from(BrokerError::from(error)))
     }
+}
+
+/// Re-referee F7: the postgres store resolves BOTH the Convex IDv6
+/// spelling and the raw wire form `<table_hex>/<id_hex>` to the same row,
+/// while every layer above — capsule keys, consumption ledger, write set,
+/// conflict scan — keys by the raw string. Two spellings of one document
+/// would evade read-your-own-writes and pairwise conflict detection, and
+/// the threat model's executor speaks this wire protocol directly (a
+/// Byzantine cell IS a hand-rolled native caller), so the broker seam
+/// rejects the alias outright: IDv6 is the only point-document spelling a
+/// cell may use. Table prefixes (`<table_hex>/`) are unaffected — they
+/// name tables, not documents, and have no alias.
+fn reject_noncanonical_point_id(key: &DocumentId) -> Result<(), WireBrokerError> {
+    let raw = key.0.as_str();
+    let is_raw_wire_form = raw.len() == 65
+        && raw.as_bytes()[32] == b'/'
+        && raw
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 32 || b.is_ascii_hexdigit());
+    if is_raw_wire_form {
+        return Err(WireBrokerError::new(
+            "noncanonical_document_id",
+            format!(
+                "point id {raw:?} uses the raw wire spelling; document ids must be \
+                 the canonical Convex IDv6 form"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl CapsuleBrokerClient for ProcessBroker {
@@ -1413,6 +1441,54 @@ mod tests {
                 assert_eq!(error.code, "duplicate_write_key", "got {error:?}");
             }
             other => panic!("expected duplicate_write_key, got {other:?}"),
+        }
+    }
+
+    /// Re-referee F7: the raw wire spelling `<table_hex>/<id_hex>` aliases
+    /// the IDv6 form at the store — the broker seam must refuse it for
+    /// point documents so one logical document has exactly one protocol
+    /// spelling.
+    #[test]
+    fn raw_wire_form_point_ids_are_rejected_at_the_broker_seam() {
+        let raw = format!("{}/{}", "a".repeat(32), "b".repeat(32));
+        let broker = test_broker(Arc::new(FakeModuleSource::new(None)));
+
+        // Hydrate refuses it...
+        let grant_h = initial_grant(&broker, &SealContext::new("cell-a", 1));
+        let response = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context: SealContext::new("cell-a", 1),
+                session: Some(grant_h.session),
+                capsule: grant_h.capsule,
+                key: DocumentId::new(raw.clone()),
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::HydratePoint(Err(error)) => {
+                assert_eq!(error.code, "noncanonical_document_id", "got {error:?}");
+            }
+            other => panic!("expected noncanonical rejection, got {other:?}"),
+        }
+
+        // ...and so does a Commit write key.
+        let grant_c = initial_grant(&broker, &SealContext::new("cell-a", 1));
+        let response = handle_request(
+            &broker,
+            IpcRequest::Commit {
+                session: Some(grant_c.session),
+                capsule: grant_c.capsule,
+                declared_reads: vec![],
+                writes: vec![(DocumentId::new(raw), None)],
+            },
+        )
+        .0;
+        match response {
+            IpcResponse::Commit(Err(error)) => {
+                assert_eq!(error.code, "noncanonical_document_id", "got {error:?}");
+            }
+            other => panic!("expected noncanonical rejection, got {other:?}"),
         }
     }
 

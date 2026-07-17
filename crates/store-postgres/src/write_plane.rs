@@ -236,6 +236,31 @@ impl WritePlane {
                 )
                 .await
                 .map_err(|err| StoreError::Backend(format!("seed retention: {err}")))?;
+            // R0 repair at authority boot (re-referee F11): the invariant
+            // 0 <= g <= tip(L) is what makes "retry from a fresh snapshot"
+            // admissible. The clamp keeps NEW advances below the tip, but a
+            // floor already above it (pre-clamp binary, manual writes)
+            // would refuse every future snapshot forever — and lowering it
+            // to the tip un-protects nothing: no event above the tip ever
+            // existed, so none was compacted.
+            let repaired = client
+                .execute(
+                    "UPDATE aster.retention AS r SET low_watermark = t.tip
+                     FROM (SELECT COALESCE(MAX(ts), 0) AS tip FROM aster.log
+                           WHERE tenant = $1 AND deployment = $2) AS t
+                     WHERE r.tenant = $1 AND r.deployment = $2
+                       AND r.low_watermark > t.tip",
+                    &[&tenant, &deployment],
+                )
+                .await
+                .map_err(|err| StoreError::Backend(format!("retention R0 repair: {err}")))?;
+            if repaired > 0 {
+                eprintln!(
+                    "aster-write-plane: retention floor was above the log tip for \
+                     {tenant}/{deployment} — repaired to the tip at lease acquisition \
+                     (invariant R0)"
+                );
+            }
             Ok(row.get::<_, i64>(0) as u64)
         })
     }
@@ -341,15 +366,21 @@ impl WritePlane {
             let pattern = format!("{}%", escape_like(prefix));
             let rows = client
                 .query(
+                    // Bytewise order contract (re-referee F7): a range
+                    // certificate's interval semantics assume ONE total key
+                    // order, shared by this scan and Rust's `str` ordering.
+                    // COLLATE "C" pins the SQL side to byte order — under a
+                    // locale collation (the postgres image default) a
+                    // Boundary certificate could protect the wrong prefix.
                     "SELECT key, ts, document FROM (
-                         SELECT DISTINCT ON (key) key, ts, document
+                         SELECT DISTINCT ON (key COLLATE \"C\") key, ts, document
                          FROM aster.log
                          WHERE tenant = $1 AND deployment = $2
                            AND ts <= $3 AND key LIKE $4 ESCAPE '\\'
-                         ORDER BY key, ts DESC
+                         ORDER BY key COLLATE \"C\", ts DESC
                      ) latest
                      WHERE document IS NOT NULL
-                     ORDER BY key
+                     ORDER BY key COLLATE \"C\"
                      LIMIT $5",
                     &[
                         &tenant,
@@ -428,6 +459,15 @@ impl WritePlane {
             // V2: both the committer and the capsule context must match the
             // live lease epoch.
             if lease_epoch != input.committer_epoch || input.context_epoch != lease_epoch {
+                // Every rejection path rolls back EXPLICITLY and awaited
+                // (re-referee F15): dropping the transaction also rolls
+                // back, but detached — the awaited form confirms the
+                // server released the lease/retention row locks before the
+                // caller sees the outcome, so a measured rejection latency
+                // includes completed rollback.
+                tx.rollback()
+                    .await
+                    .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
                 return Ok(CommitOutcome::StaleEpoch { lease_epoch });
             }
 
@@ -442,6 +482,9 @@ impl WritePlane {
                 .map_err(|err| StoreError::Backend(format!("fence horizon: {err}")))?
                 .get(0);
             if snapshot > h {
+                tx.rollback()
+                    .await
+                    .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
                 return Ok(CommitOutcome::SnapshotBeyondHorizon {
                     horizon: h as u64,
                 });
@@ -459,6 +502,9 @@ impl WritePlane {
                 .map_err(|err| StoreError::Backend(format!("fence retention pin: {err}")))?
                 .get(0);
             if snapshot < g {
+                tx.rollback()
+                    .await
+                    .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
                 return Ok(CommitOutcome::RetentionViolated {
                     low_watermark: g as u64,
                 });
@@ -483,9 +529,11 @@ impl WritePlane {
                     .await
                     .map_err(|err| StoreError::Backend(format!("fence point scan: {err}")))?;
                 if let Some(row) = conflict {
-                    return Ok(CommitOutcome::Conflict {
-                        key: DocumentId::new(row.get::<_, String>(0)),
-                    });
+                    let key = DocumentId::new(row.get::<_, String>(0));
+                    tx.rollback()
+                        .await
+                        .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
+                    return Ok(CommitOutcome::Conflict { key });
                 }
             }
             if !input.read_windows.is_empty() {
@@ -501,6 +549,9 @@ impl WritePlane {
                 for row in rows {
                     let key = DocumentId::new(row.get::<_, String>(0));
                     if input.read_windows.iter().any(|window| window.contains(&key)) {
+                        tx.rollback()
+                            .await
+                            .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
                         return Ok(CommitOutcome::Conflict { key });
                     }
                 }
