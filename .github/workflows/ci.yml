@@ -1,155 +1,256 @@
 name: CI
 
-# Hard-stops after 30 minutes per job: a v8 dependency build is the
-# slow path and shouldn't take more than ~10 of those even on a cold
-# cache; longer means the runner is wedged and we want a fast fail.
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
   CARGO_NET_RETRY: "10"
   RUST_BACKTRACE: "1"
+  ASTER_RUST_TOOLCHAIN: "1.94.1"
+  RUSTFLAGS: -D warnings
 
 jobs:
   rust:
     name: Rust workspace
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: |
-          # The repo pins rust-version 1.75 in workspace.package; we use
-          # stable so we automatically pick up patch updates the team has
-          # been validating against. fmt + clippy live on the same toolchain.
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
+          rustup toolchain install "$ASTER_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup default "$ASTER_RUST_TOOLCHAIN"
 
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
+      - name: Cache Cargo inputs and outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/.rusty_v8
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+            target
+          key: rust-${{ runner.os }}-${{ env.ASTER_RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'crates/**') }}
+          restore-keys: rust-${{ runner.os }}-${{ env.ASTER_RUST_TOOLCHAIN }}-
 
-      - name: Cache cargo target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: target-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/**') }}
-          restore-keys: target-${{ runner.os }}-
+      - name: Shell script static analysis
+        run: shellcheck docker/*.sh docker/aster-invoke docker/aster-init bench/run-v07.sh paper/sources/aster-bench.sh
 
-      - name: cargo fmt --check
+      - name: Formatting
         run: cargo fmt --all -- --check
 
-      - name: cargo build --workspace
-        run: cargo build --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: cargo test --workspace
+      - name: Unit and process-boundary tests
         run: cargo test --workspace --locked
 
-      - name: cargo run aster_bench (smoke)
+      - name: Benchmark harness smoke
         run: cargo run --release --locked -p aster-host --bin aster_bench -- 1000 8
 
-  docker:
-    name: Docker images + smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # The Docker job builds its own copy of the workspace inside the
-    # builder stage; it does NOT depend on `rust:` so that a transient
-    # rustfmt nit doesn't block the image smoke. Both jobs must pass
-    # for a PR to land — branch protection enforces that.
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build aster-brokerd image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: runtime-broker
-          tags: aster-brokerd:0.4
-          load: true
-          cache-from: type=gha,scope=brokerd
-          cache-to: type=gha,scope=brokerd,mode=max
-
-      - name: Build aster-v8cell image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: runtime-v8cell
-          tags: aster-v8cell:0.4
-          load: true
-          cache-from: type=gha,scope=v8cell
-          cache-to: type=gha,scope=v8cell,mode=max
-
-      - name: docker/smoke.sh — brokerd + v8cell over UDS
-        run: ./docker/smoke.sh 0.4
-
   postgres-it:
-    name: aster-store-postgres integration tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # Independent lane so the existing Rust + Docker jobs don't slow
-    # down on a Postgres service container we don't otherwise need.
-    # The `postgres-it` cargo feature gates the integration tests; when
-    # absent (default CI on PRs that don't touch the store crate), the
-    # crate's unit tests still run as part of the `rust:` lane.
+    name: Authoritative Postgres integration
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
-        # GitHub Actions services don't have a healthcheck DSL of their
-        # own; we set --health-cmd via options so the runner gates step
-        # execution on Postgres being ready, not just the container
-        # being up.
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
+          --health-interval 2s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 15
     env:
       ASTER_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$ASTER_RUST_TOOLCHAIN" --profile minimal
+          rustup default "$ASTER_RUST_TOOLCHAIN"
 
-      - name: Cache cargo registry + git
-        uses: actions/cache@v4
+      - name: Cache Cargo inputs and outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-postgres-it-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+            target
+          key: postgres-${{ runner.os }}-${{ env.ASTER_RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'crates/broker/**', 'crates/ipc/**', 'crates/store-postgres/**') }}
+          restore-keys: postgres-${{ runner.os }}-${{ env.ASTER_RUST_TOOLCHAIN }}-
 
-      - name: cargo test postgres-it
-        # Only this crate's gated tests; we don't want to recompile v8 for a
-        # database test. --features postgres-it flips on tests/postgres_it.rs.
-        # --test-threads=1 because the integration tests share a schema —
-        # parallel runs race on `CREATE SCHEMA convex_dev` and one of them
-        # gets a unique-violation on pg_namespace_nspname_index.
+      - name: Store and fence integration suite
         run: cargo test --locked -p aster-store-postgres --features postgres-it -- --test-threads=1
+
+      - name: Broker-to-cell authoritative-history suite
+        run: cargo test --locked -p aster-ipc --features postgres-it -- --test-threads=1
+
+  docker:
+    name: Hardened images and smoke
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@6ff44f8e5255f9d8aa31ef22f7e57a2d926b7da0 # v1.11.0
+        with:
+          nofallback: "true"
+
+      - name: Build broker image
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-broker
+          tags: aster-brokerd:0.8
+          load: true
+          sbom: true
+          provenance: mode=max
+
+      - name: Build cell image
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-v8cell
+          tags: aster-v8cell:0.8
+          load: true
+          sbom: true
+          provenance: mode=max
+      - name: Scan broker image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: aster-brokerd:0.8
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan cell image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: aster-v8cell:0.8
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Broker and cell smoke over UDS
+        run: ./docker/smoke.sh 0.8
+
+      - name: Authoritative Postgres container smoke
+        run: ./docker/smoke-postgres.sh 0.8
+
+      - name: Production Compose bundle query, mutation, and readback
+        env:
+          ASTER_PRODUCTION_COMPOSE_SMOKE: "1"
+        run: ./docker/smoke-bundle.sh 0.8
+
+      - name: Validate hardened production topology
+        env:
+          ASTER_DB_URL_FILE: /tmp/db-url
+          ASTER_SEAL_KEY_FILE: /tmp/seal-key
+          ASTER_LAUNCH_KEY_FILE: /tmp/launch-key
+          ASTER_POLICY_FILE: /tmp/policy.json
+          ASTER_MODULES_DIR: /tmp/modules
+          ASTER_RUNTIME_DIR: /tmp/aster-run
+          ASTER_RUNTIME_UID: "1000"
+          ASTER_RUNTIME_GID: "1000"
+          ASTER_TENANT: tenant-ci
+          ASTER_DEPLOYMENT: deployment-ci
+          ASTER_CELL_ID: cell-ci
+          ASTER_MODULE_PATH: messages.js
+          ASTER_FUNCTION_NAME: getById
+          ASTER_DATABASE_NETWORK: database-ci
+        run: docker compose -f docker/compose.production.yml config --quiet
+
+  tla:
+    name: TLA+ positive model and mutants
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Java 21
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Fetch pinned TLA+ tools
+        working-directory: tla
+        run: |
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --output tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3  tla2tools.jar" | sha256sum --check
+
+      - name: Exhaustive positive model
+        working-directory: tla
+        run: java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFence.cfg -workers auto -deadlock
+
+      - name: Shadowed-only compaction remains sound
+        working-directory: tla
+        run: java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC AsterFence -config AsterFenceNoPinSound.cfg -workers auto -deadlock
+
+      - name: Mutants must produce their named counterexamples
+        working-directory: tla
+        run: |
+          set -euo pipefail
+          expect_violation() {
+            module=$1
+            config=$2
+            invariant=$3
+            output=$(mktemp)
+            config_args=()
+            if [[ "$config" != "-" ]]; then
+              config_args=(-config "$config")
+            fi
+            if java -XX:+UseParallelGC -Xmx2g -cp tla2tools.jar tlc2.TLC \
+                "$module" "${config_args[@]}" -workers auto -deadlock >"$output" 2>&1; then
+              cat "$output"
+              echo "mutant unexpectedly passed: $module $config" >&2
+              exit 1
+            fi
+            cat "$output"
+            grep -F "Invariant $invariant is violated" "$output"
+          }
+          expect_violation AsterFence AsterFenceReuse.cfg I3_EpochBlockOrder
+          expect_violation AsterFence AsterFenceNoPin.cfg I2_NoValidationAgainstPruned
+          expect_violation AsterFenceNoAtomic - I4_NoWriteSkew
+
+  security:
+    name: Dependency security
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: RustSec advisory audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull-request dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
