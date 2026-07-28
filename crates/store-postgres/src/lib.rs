@@ -1,8 +1,7 @@
-//! Postgres-backed implementation of `aster_broker::CapsuleStore`.
-//!
-//! Reads from the same Postgres database the Convex backend writes to.
-//! The schema is captured verbatim in `docs/CONVEX_POSTGRES_REFERENCE.md`
-//! — this module follows its DDL and SQL templates.
+//! Postgres storage for Aster's authoritative history and Convex deployment
+//! inputs. Mainline transaction reads use [`AuthoritativeCapsuleStore`] over
+//! the same `aster.log` as the commit fence. `PostgresCapsuleStore` remains
+//! the module/table-metadata source and a legacy direct Convex-read adapter.
 //!
 //! Design pillars:
 //!
@@ -18,7 +17,7 @@
 //!    `db.get(id)`. `resolve_document_id` dispatches between them; the
 //!    IDv6 path consults a `_tables`-backed mapping cache.
 //!
-//! Coverage today (v0.5):
+//! Legacy Convex-read adapter coverage:
 //! - `snapshot_ts()` — `max(latest documents.ts, persistence_globals['max_repeatable_ts'])`.
 //! - `read_point()` — direct `documents` query with `DISTINCT ON (id)`,
 //!   `ORDER BY ts DESC LIMIT 1`. Skips the by_id index for now (gotcha
@@ -26,7 +25,14 @@
 //!   path and the integration tests. The IDv6 table-mapping cache exists;
 //!   moving point reads through the by_id index is a later performance and
 //!   retention-correctness slice.
-//! - `read_prefix()` — bounded `DISTINCT ON (id)` table scan.
+//! - `scan_prefix()` — certified bounded live scan (`DISTINCT ON (id)`
+//!   visibility subquery, tombstones filtered outside it so they never
+//!   consume limit slots) returning the `RangeCertificate` evidence.
+//! - Certified reads enforce Convex's retention floor: `read_point` and
+//!   `scan_prefix` re-check `persistence_globals['min_document_snapshot_ts']`
+//!   on the same connection and surface `StoreError::Stale` for pinned
+//!   snapshots below it (reference doc gotcha #10) — a stale snapshot
+//!   must fail loudly, never mint half-vacuumed evidence.
 //! - Document body is currently passed through as raw JSON bytes under
 //!   a `_raw` field. The ConvexValue codec exists for metadata and future
 //!   typed value handling; the current v8cell `1.0/get` shim intentionally
@@ -34,7 +40,7 @@
 //!
 //! ## DocumentId formats
 //!
-//! The adapter accepts two forms on the `read_point` / `read_prefix`
+//! The adapter accepts two forms on the `read_point` / `scan_prefix`
 //! interfaces, dispatched at parse time:
 //!
 //! 1. **Aster wire form** — `"<table_hex>/<id_hex>"` (32 hex + slash +
@@ -50,16 +56,25 @@
 //! everything else. Garbage falls through to a clear error message
 //! that mentions both forms.
 //!
+//! ALIASING NOTE: this low-level adapter accepts both spellings for direct
+//! integration tests, but the production broker rejects raw wire-form point
+//! IDs before dispatch. Transaction capsules, ledgers, write sets, and
+//! conflict scans therefore admit only canonical Convex IDv6 keys.
+//!
 //! Why not `sqlx`: its `query!` macro requires a live database at
 //! compile time, which CI cannot satisfy without a service container
 //! and a checked-in offline-query-data file. We hand-write the SQL
 //! against the Convex reference doc instead.
 
+mod authoritative;
 mod module_index;
 mod modules_storage;
 mod table_mapping;
+pub mod write_plane;
 
+pub use authoritative::AuthoritativeCapsuleStore;
 pub use module_index::ModuleDescriptor;
+pub use write_plane::{CommitOutcome, FenceInput, WritePlane, WritePlaneConfig};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,7 +82,8 @@ use std::time::Duration;
 
 use aster_broker::{CapsuleStore, StoreError};
 use aster_capsule::{
-    DeploymentId, DocumentId, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
+    DeploymentId, DocumentId, KeyInterval, RangeCertificate, RangeCertificateError, ScanDirection,
+    ScanStop, SnapshotCapsule, TenantId, Timestamp, VersionedDocument,
 };
 use aster_convex_codec::DocumentIdV6;
 use deadpool_postgres::{
@@ -103,9 +119,8 @@ pub struct PostgresConfig {
     /// access to Convex's module storage on disk.
     pub modules_dir: Option<PathBuf>,
 
-    /// Hard cap on connections. Each in-flight cell hydrate may take
-    /// one. Default 16 — sized against the `ASTER_MAX_CONNECTIONS=1024`
-    /// brokerd cap; raise if you increase that.
+    /// Hard cap on pooled Postgres connections. Each in-flight cell
+    /// hydrate may take one. Default 16.
     pub pool_max_size: usize,
 
     /// Per-checkout `SET statement_timeout`. Prevents a slow query from
@@ -281,6 +296,10 @@ impl CapsuleStore for PostgresCapsuleStore {
         })
     }
 
+    fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        PostgresCapsuleStore::mint_document_id(self, table)
+    }
+
     fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
         // Aster's DocumentId is opaque to Convex: callers send either
         // the Aster wire form `"<table_hex>/<id_hex>"` (used by tests
@@ -288,10 +307,10 @@ impl CapsuleStore for PostgresCapsuleStore {
         // IDv6 string (the JS bundle's `db.get(id)` path). Dispatching
         // on the form lives inside the async block so the IDv6 case
         // can refresh the table-mapping cache via Postgres on a miss.
+        let ts_signed = as_i64(ts)?;
         self.block_on(async {
             let (table_id, doc_id) = self.resolve_document_id(key).await?;
             let client = self.checkout().await?;
-            let ts_signed = ts as i64;
             let row = client
                 .query_opt(
                     &format!(
@@ -305,6 +324,10 @@ impl CapsuleStore for PostgresCapsuleStore {
                 )
                 .await
                 .map_err(|err| StoreError::Backend(format!("read_point: {err}")))?;
+
+            // Retention gate BEFORE interpreting the row (a missing row
+            // below the floor is exactly the false-absence case).
+            self.check_retention_floor(&client, ts, ts_signed).await?;
 
             let Some(row) = row else {
                 return Ok(VersionedDocument::missing());
@@ -333,77 +356,112 @@ impl CapsuleStore for PostgresCapsuleStore {
         })
     }
 
-    fn read_prefix(
+    fn scan_prefix(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Result<Vec<(DocumentId, VersionedDocument)>, StoreError> {
-        // Convex's read_prefix is normally an INDEX_QUERIES range scan;
-        // for v0.5 we accept the simpler form: prefix is "<table_hex>/"
-        // and we list every document under that table. Bounded by
-        // `limit` to keep capsule size predictable.
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
+        // Convex's prefix scan is normally an INDEX_QUERIES range scan;
+        // like the old read_prefix we accept the simpler form: prefix is
+        // "<table_hex>/" and the interval is every document under that
+        // table. Arbitrary string prefixes need index-range support.
         let table_id = match prefix.strip_suffix('/') {
             Some(s) => decode_hex(s).ok_or_else(|| {
                 StoreError::Backend(format!(
-                    "read_prefix: prefix {prefix:?} is not '<table_hex>/'"
+                    "scan_prefix: prefix {prefix:?} is not '<table_hex>/'"
                 ))
             })?,
             None => {
                 return Err(StoreError::Backend(format!(
-                    "read_prefix: prefix {prefix:?} must end with '/'"
+                    "scan_prefix: prefix {prefix:?} must end with '/'"
                 )))
             }
         };
         if limit == 0 {
-            return Ok(Vec::new());
+            // A limit-0 scan can never carry a valid certificate
+            // (Definition 1.1 requires ℓ >= 1) — same rejection the
+            // in-memory blanket impl surfaces.
+            return Err(StoreError::Backend(format!(
+                "scan_prefix: {}",
+                RangeCertificateError::ZeroLimit
+            )));
         }
+        let ts_signed = as_i64(ts)?;
+        // Canonicalize the prefix for the certificate: `decode_hex`
+        // accepts case-insensitive hex (same liberal posture as
+        // `read_point`), but returned keys re-encode as LOWERCASE hex —
+        // DocumentId's canonical wire form. Built from the raw caller
+        // string, an uppercase-but-valid prefix would make every
+        // returned key fail `interval.contains`, and the broker would
+        // seal a structurally invalid capsule (KeyOutsideInterval at
+        // verify time). Re-encoding from the decoded bytes pins the
+        // interval to the exact form the keys carry.
+        let canonical_prefix = format!("{}/", encode_hex(&table_id));
 
         self.block_on(async {
             let client = self.checkout().await?;
-            let ts_signed = ts as i64;
             let limit_i64 = limit.min(i64::MAX as usize) as i64;
+            // Visibility (latest revision <= ts per id) resolves in the
+            // inner DISTINCT ON; tombstones are dropped OUTSIDE it so a
+            // deleted key never consumes a limit slot — Scan_σ(I, ℓ)
+            // counts live keys only. Hex encoding is order-preserving,
+            // so `id ASC` is ascending DocumentId order.
             let rows = client
                 .query(
                     &format!(
-                        "SELECT DISTINCT ON (id) id, ts, json_value, deleted \
-                         FROM {schema}.documents \
-                         WHERE table_id = $1 AND ts <= $2 \
-                         ORDER BY id ASC, ts DESC \
+                        "SELECT id, ts, json_value FROM ( \
+                             SELECT DISTINCT ON (id) id, ts, json_value, deleted \
+                             FROM {schema}.documents \
+                             WHERE table_id = $1 AND ts <= $2 \
+                             ORDER BY id ASC, ts DESC \
+                         ) latest \
+                         WHERE deleted IS DISTINCT FROM TRUE \
+                         ORDER BY id ASC \
                          LIMIT $3",
                         schema = self.schema
                     ),
                     &[&table_id, &ts_signed, &limit_i64],
                 )
                 .await
-                .map_err(|err| StoreError::Backend(format!("read_prefix: {err}")))?;
+                .map_err(|err| StoreError::Backend(format!("scan_prefix: {err}")))?;
 
-            let mut out = Vec::with_capacity(rows.len());
+            // Retention gate BEFORE building the certificate — an
+            // Exhausted certificate over half-vacuumed history is false
+            // absence evidence.
+            self.check_retention_floor(&client, ts, ts_signed).await?;
+
+            let mut entries = Vec::with_capacity(rows.len());
             for row in rows {
                 let id_bytes: Vec<u8> = row.get(0);
                 let row_ts: i64 = row.get(1);
                 let bytes: Vec<u8> = row.get(2);
-                let deleted: Option<bool> = row.try_get(3).ok();
-
                 let doc_id = DocumentId::new(format!(
                     "{}/{}",
                     encode_hex(&table_id),
                     encode_hex(&id_bytes)
                 ));
-                let value = if deleted.unwrap_or(false) {
-                    VersionedDocument {
-                        version: Some(row_ts as u64),
-                        document: None,
-                    }
-                } else {
+                entries.push((
+                    doc_id,
                     VersionedDocument {
                         version: Some(row_ts as u64),
                         document: Some(raw_document(bytes)),
-                    }
-                };
-                out.push((doc_id, value));
+                    },
+                ));
             }
-            Ok(out)
+            let stop = if entries.len() == limit {
+                ScanStop::Boundary
+            } else {
+                ScanStop::Exhausted
+            };
+            let certificate = RangeCertificate {
+                interval: KeyInterval::Prefix(canonical_prefix),
+                direction: ScanDirection::Ascending,
+                limit: limit as u64,
+                keys: entries.iter().map(|(key, _)| key.clone()).collect(),
+                stop,
+            };
+            Ok((certificate, entries))
         })
     }
 
@@ -434,6 +492,57 @@ impl PostgresCapsuleStore {
             .get()
             .await
             .map_err(|err| StoreError::Unavailable(format!("pool checkout: {err}")))
+    }
+
+    /// Refuse certified reads below Convex's document-retention floor
+    /// (`persistence_globals['min_document_snapshot_ts']`) — reference
+    /// doc gotcha #10. The vacuum deletes superseded revisions below the
+    /// floor lazily, so a snapshot pinned under it can silently observe
+    /// half-vacuumed history and mint FALSE sealed evidence (absence
+    /// certificates for keys whose old revisions were deleted). Convex's
+    /// own readers run a retention_validator with the same rule.
+    ///
+    /// Checked on the SAME connection, AFTER the data query: the floor
+    /// only moves up, so `floor <= ts` observed here proves it held for
+    /// the whole query — checking before would race a concurrent vacuum.
+    /// A missing row/key means retention has never advanced: floor 0
+    /// (fixtures may not set it).
+    async fn check_retention_floor(
+        &self,
+        client: &deadpool_postgres::Object,
+        ts: Timestamp,
+        ts_signed: i64,
+    ) -> Result<(), StoreError> {
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT json_value FROM {schema}.persistence_globals \
+                     WHERE key = 'min_document_snapshot_ts'",
+                    schema = self.schema
+                ),
+                &[],
+            )
+            .await
+            .map_err(|err| StoreError::Backend(format!("retention floor: {err}")))?;
+        let floor: i64 = match row {
+            None => 0,
+            Some(row) => {
+                let bytes: Vec<u8> = row.get(0);
+                let s = std::str::from_utf8(&bytes).map_err(|err| {
+                    StoreError::Backend(format!("min_document_snapshot_ts utf8: {err}"))
+                })?;
+                s.trim().parse::<i64>().map_err(|err| {
+                    StoreError::Backend(format!("min_document_snapshot_ts parse: {err}"))
+                })?
+            }
+        };
+        if ts_signed < floor {
+            return Err(StoreError::Stale {
+                requested: ts,
+                latest: floor.max(0) as u64,
+            });
+        }
+        Ok(())
     }
 
     /// Resolve a `DocumentId` to the `(table_id, id)` byte pair the
@@ -491,6 +600,32 @@ impl PostgresCapsuleStore {
         let client = self.checkout().await?;
         self.table_mapping.refresh(&client, &self.schema).await?;
         Ok(self.table_mapping.lookup(table_number))
+    }
+
+    /// Emit a real Convex IDv6 for a user-table insert. The table number
+    /// comes from the same `_tables` mapping used to decode reads; the
+    /// 128-bit internal id is generated from OS entropy.
+    pub fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        let table_number = self.block_on(async {
+            if let Some(number) = self.table_mapping.lookup_number_by_name(table) {
+                return Ok(number);
+            }
+            let client = self.checkout().await?;
+            self.table_mapping.refresh(&client, &self.schema).await?;
+            self.table_mapping
+                .lookup_number_by_name(table)
+                .ok_or_else(|| {
+                    StoreError::Backend(format!(
+                    "cannot mint document id: active table {table:?} is not present in `_tables`"
+                ))
+                })
+        })?;
+        let mut internal_id = [0_u8; 16];
+        getrandom::fill(&mut internal_id)
+            .map_err(|error| StoreError::Unavailable(format!("document id entropy: {error}")))?;
+        Ok(DocumentId::new(
+            DocumentIdV6::new(table_number, internal_id).encode(),
+        ))
     }
 
     /// Resolve a Convex module path (e.g. `"messages.js"`,
@@ -577,7 +712,7 @@ impl PostgresCapsuleStore {
 }
 
 /// Parse the Aster wire form `"<table_hex>/<id_hex>"` into raw bytes.
-/// Standalone so callers in `read_prefix` can reuse it without
+/// Standalone so callers in `scan_prefix` can reuse it without
 /// borrowing `&self` (no Postgres roundtrip needed for this form).
 fn parse_aster_document_id(raw: &str) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
     let (t, i) = raw.split_once('/').ok_or_else(|| {
@@ -593,8 +728,18 @@ fn parse_aster_document_id(raw: &str) -> Result<(Vec<u8>, Vec<u8>), StoreError> 
     Ok((table_id, doc_id))
 }
 
+/// u64 → i64 for SQL binds — mirrors `write_plane::as_i64`. A snapshot
+/// past `i64::MAX` would otherwise wrap negative under `as`, match no
+/// rows, and mint a structurally VALID empty result (a missing point /
+/// an Exhausted certificate) — false absence evidence instead of an
+/// error.
+fn as_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Backend(format!("timestamp {value} exceeds i64 range")))
+}
+
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -604,11 +749,13 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    s
+    encoded
 }
 
 /// Wrap raw Convex `json_value` bytes in an Aster `Document` so the
@@ -694,6 +841,45 @@ mod tests {
         match store.read_point(&key, 200) {
             Err(StoreError::Unavailable(_)) => {}
             other => panic!("expected Unavailable(...) on dead Postgres, got {other:?}"),
+        }
+    }
+
+    /// Snapshots past i64::MAX must be a typed error BEFORE any Postgres
+    /// roundtrip — the dead-PG store would surface Unavailable if the
+    /// checked conversion ran after checkout, and the old `ts as i64`
+    /// wrapped negative and returned a false "missing" instead.
+    #[test]
+    fn read_point_rejects_timestamp_beyond_i64() {
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let key =
+            DocumentId::new("0123456789abcdef0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        match store.read_point(&key, u64::MAX) {
+            Err(StoreError::Backend(msg)) => {
+                assert!(msg.contains("exceeds i64 range"), "got {msg:?}")
+            }
+            other => panic!("expected Backend(exceeds i64 range), got {other:?}"),
+        }
+    }
+
+    /// Same guard on the scan path — a wrapped bound would yield a
+    /// structurally valid Exhausted certificate falsely attesting an
+    /// empty prefix.
+    #[test]
+    fn scan_prefix_rejects_timestamp_beyond_i64() {
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        match store.scan_prefix("0123456789abcdef0123456789abcdef/", 10, u64::MAX) {
+            Err(StoreError::Backend(msg)) => {
+                assert!(msg.contains("exceeds i64 range"), "got {msg:?}")
+            }
+            other => panic!("expected Backend(exceeds i64 range), got {other:?}"),
         }
     }
 
@@ -789,6 +975,30 @@ mod tests {
             .expect("cache hit");
         assert_eq!(table_id, tablet.to_vec());
         assert_eq!(doc_id, internal.to_vec());
+    }
+
+    #[test]
+    fn mint_document_id_uses_cached_table_number_and_os_entropy() {
+        use std::collections::BTreeMap;
+
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let tablet = [0xAB; 16];
+        store.table_mapping.install_named_for_test(
+            BTreeMap::from([(10_001, tablet)]),
+            BTreeMap::from([("messages".to_string(), tablet)]),
+        );
+
+        let first = store.mint_document_id("messages").expect("mint");
+        let second = store.mint_document_id("messages").expect("mint");
+        let first = DocumentIdV6::decode(&first.0).expect("canonical IDv6");
+        let second = DocumentIdV6::decode(&second.0).expect("canonical IDv6");
+        assert_eq!(first.table_number, 10_001);
+        assert_eq!(second.table_number, 10_001);
+        assert_ne!(first.internal_id, second.internal_id);
     }
 
     /// Module index hot path: pre-installed descriptor returns

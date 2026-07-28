@@ -37,11 +37,13 @@
 //!   thing.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use aster_broker::StoreError;
 
 use crate::module_index::ModuleDescriptor;
+const MAX_STORED_BUNDLE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Trait every backend implements. Sync-only because the broker's
 /// async island already adapts at the `PostgresCapsuleStore` level —
@@ -75,30 +77,34 @@ impl LocalDirModulesStorage {
         }
     }
 
-    /// Resolve the on-disk path for a storage key. Convex's
-    /// LocalDirStorage puts files at `<base>/modules/<key>.blob`
-    /// (`<base>` already has `/modules` appended via
-    /// `for_use_case(StorageUseCase::Modules)` upstream). Aster's
-    /// adapter takes the `<base>/modules` directory directly so
-    /// the operator can mount only the modules subdir without
-    /// exposing user-uploaded files via the same handle.
-    fn path_for(&self, storage_key: &str) -> PathBuf {
-        // Convex's storage_key isn't constrained beyond "valid
-        // filename"; it's a UUID-shaped string in practice. We don't
-        // try to sanitise it because every byte that lands in
-        // `_source_packages.storageKey` was written by the trusted
-        // committer, not a tenant.
-        self.base_dir.join(format!("{storage_key}.blob"))
+    /// Resolve a storage key without letting a database row escape the
+    /// read-only modules root. Nested object keys are valid; absolute,
+    /// parent, and current-directory components are not.
+    fn path_for(&self, storage_key: &str) -> Result<PathBuf, StoreError> {
+        use std::path::Component;
+
+        if storage_key.is_empty() || storage_key.len() > 1_024 {
+            return Err(StoreError::Backend(
+                "modules storage: storage key is empty or exceeds 1024 bytes".into(),
+            ));
+        }
+        let relative = Path::new(storage_key);
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(StoreError::Backend(format!(
+                "modules storage: non-canonical storage key {storage_key:?}"
+            )));
+        }
+        Ok(self.base_dir.join(format!("{storage_key}.blob")))
     }
 }
 
 impl ModulesStorage for LocalDirModulesStorage {
     fn fetch(&self, descriptor: &ModuleDescriptor) -> Result<Vec<u8>, StoreError> {
-        let path = self.path_for(&descriptor.storage_key);
-        let bytes = fs::read(&path).map_err(|err| {
-            // Distinguish "missing file" (operator misconfigured the
-            // mount) from other I/O errors. The former gets a
-            // clearer message because it's the most common foot-gun.
+        let path = self.path_for(&descriptor.storage_key)?;
+        let file = fs::File::open(&path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 StoreError::Backend(format!(
                     "modules storage: bundle not found at {} for path {:?}; \
@@ -108,9 +114,29 @@ impl ModulesStorage for LocalDirModulesStorage {
                     descriptor.path
                 ))
             } else {
-                StoreError::Backend(format!("modules storage read {}: {err}", path.display()))
+                StoreError::Backend(format!("modules storage open {}: {err}", path.display()))
             }
         })?;
+        let declared = file
+            .metadata()
+            .map_err(|err| StoreError::Backend(format!("modules storage stat: {err}")))?
+            .len();
+        if declared > MAX_STORED_BUNDLE_BYTES {
+            return Err(StoreError::Backend(format!(
+                "modules storage: bundle is {declared} bytes; cap is {MAX_STORED_BUNDLE_BYTES}"
+            )));
+        }
+        let mut bytes = Vec::with_capacity(declared as usize);
+        file.take(MAX_STORED_BUNDLE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                StoreError::Backend(format!("modules storage read {}: {err}", path.display()))
+            })?;
+        if bytes.len() as u64 > MAX_STORED_BUNDLE_BYTES {
+            return Err(StoreError::Backend(
+                "modules storage: bundle grew beyond the configured cap while reading".into(),
+            ));
+        }
 
         verify_sha256(&bytes, &descriptor.source_package_sha256, &path)?;
         Ok(bytes)
@@ -355,7 +381,52 @@ mod tests {
             source_package_unzipped_size: None,
         };
         let err = storage.fetch(&descriptor).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(ref msg) if msg.contains("mismatch")));
+        assert!(matches!(&err, StoreError::Backend(msg) if msg.contains("mismatch")));
+    }
+
+    #[test]
+    fn local_dir_rejects_storage_key_traversal() {
+        let tmp = tempdir();
+        let storage = LocalDirModulesStorage::new(tmp.path());
+        for key in ["", "/absolute", "../secret", "nested/../secret", "./secret"] {
+            let error = storage.path_for(key).expect_err("non-canonical key");
+            assert!(
+                matches!(&error, StoreError::Backend(message) if message.contains("storage key")),
+                "{key:?}: {error}"
+            );
+        }
+        assert_eq!(
+            storage
+                .path_for("nested/object")
+                .expect("nested object key"),
+            tmp.path().join("nested/object.blob")
+        );
+    }
+
+    #[test]
+    fn local_dir_rejects_oversized_bundle_before_reading_it() {
+        let tmp = tempdir();
+        let key = "oversized";
+        let path = tmp.path().join(format!("{key}.blob"));
+        fs::File::create(&path)
+            .expect("create sparse bundle")
+            .set_len(MAX_STORED_BUNDLE_BYTES + 1)
+            .expect("size sparse bundle");
+        let storage = LocalDirModulesStorage::new(tmp.path());
+        let descriptor = ModuleDescriptor {
+            path: "oversized.js".into(),
+            source_package_internal_id: [0_u8; 16],
+            storage_key: key.into(),
+            environment: "isolate".into(),
+            module_sha256_base64: "x".into(),
+            source_package_sha256: vec![0_u8; 32],
+            source_package_unzipped_size: None,
+        };
+        let error = storage.fetch(&descriptor).expect_err("bundle cap");
+        assert!(matches!(
+            &error,
+            StoreError::Backend(message) if message.contains("cap")
+        ));
     }
 
     // Cheap stand-in for `tempfile::TempDir` — we don't have the

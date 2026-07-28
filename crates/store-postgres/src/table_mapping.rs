@@ -91,6 +91,15 @@ impl TableMappingCache {
         guard.by_name.get(name).copied()
     }
 
+    pub(crate) fn lookup_number_by_name(&self, name: &str) -> Option<u32> {
+        let guard = self.inner.read().expect("table mapping rwlock poisoned");
+        let tablet = guard.by_name.get(name)?;
+        guard
+            .by_number
+            .iter()
+            .find_map(|(number, candidate)| (candidate == tablet).then_some(*number))
+    }
+
     /// Refresh the cache from Postgres. Acquires the write lock for
     /// the duration of the SQL — short by design (two queries, one
     /// indexed lookup, one full-tablet scan).

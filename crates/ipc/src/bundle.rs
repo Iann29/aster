@@ -27,10 +27,23 @@
 
 use std::io::Read;
 
+pub const MAX_MODULE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BUNDLE_ENTRIES: usize = 4_096;
+const MAX_MODULE_PATH_BYTES: usize = 512;
+
 /// Errors `extract_module_source` can surface. Typed because the
 /// cell's main loop maps these into actionable startup messages.
 #[derive(Debug)]
 pub enum BundleError {
+    InvalidPath(String),
+    TooManyEntries {
+        actual: usize,
+        maximum: usize,
+    },
+    TooLarge {
+        actual: u64,
+        maximum: usize,
+    },
     /// The bytes don't look like a ZIP at all (e.g. truncated download
     /// or wrong storage key on disk).
     Open(String),
@@ -52,6 +65,15 @@ pub enum BundleError {
 impl std::fmt::Display for BundleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidPath(msg) => write!(f, "bundle: invalid module path: {msg}"),
+            Self::TooManyEntries { actual, maximum } => write!(
+                f,
+                "bundle: {actual} entries exceeds the {maximum}-entry cap"
+            ),
+            Self::TooLarge { actual, maximum } => write!(
+                f,
+                "bundle: module source is {actual} bytes; cap is {maximum}"
+            ),
             Self::Open(msg) => write!(f, "bundle: open zip failed: {msg}"),
             Self::EntryNotFound { tried, available } => write!(
                 f,
@@ -78,20 +100,41 @@ impl std::error::Error for BundleError {}
 /// present so an operator looking at the error can spot a casing or
 /// trailing-slash mismatch immediately.
 pub fn extract_module_source(zip_bytes: &[u8], module_path: &str) -> Result<String, BundleError> {
+    validate_module_path(module_path)?;
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|err| BundleError::Open(err.to_string()))?;
+    if archive.len() > MAX_BUNDLE_ENTRIES {
+        return Err(BundleError::TooManyEntries {
+            actual: archive.len(),
+            maximum: MAX_BUNDLE_ENTRIES,
+        });
+    }
 
     let candidates = candidate_names(module_path);
 
     // First pass: try the candidates in priority order so callers can
     // override our `.js` heuristic by passing the explicit name.
     for candidate in &candidates {
-        if let Ok(mut entry) = archive.by_name(candidate) {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
+        if let Ok(entry) = archive.by_name(candidate) {
+            let declared = entry.size();
+            if declared > MAX_MODULE_SOURCE_BYTES as u64 {
+                return Err(BundleError::TooLarge {
+                    actual: declared,
+                    maximum: MAX_MODULE_SOURCE_BYTES,
+                });
+            }
+            let mut buf = Vec::with_capacity(declared as usize);
             entry
+                .take(MAX_MODULE_SOURCE_BYTES as u64 + 1)
                 .read_to_end(&mut buf)
                 .map_err(|err| BundleError::Read(err.to_string()))?;
+            if buf.len() > MAX_MODULE_SOURCE_BYTES {
+                return Err(BundleError::TooLarge {
+                    actual: buf.len() as u64,
+                    maximum: MAX_MODULE_SOURCE_BYTES,
+                });
+            }
             return String::from_utf8(buf).map_err(|err| BundleError::NotUtf8(err.to_string()));
         }
     }
@@ -107,6 +150,32 @@ pub fn extract_module_source(zip_bytes: &[u8], module_path: &str) -> Result<Stri
         tried: candidates,
         available,
     })
+}
+
+fn validate_module_path(module_path: &str) -> Result<(), BundleError> {
+    if module_path.is_empty() {
+        return Err(BundleError::InvalidPath("path is empty".into()));
+    }
+    if module_path.len() > MAX_MODULE_PATH_BYTES {
+        return Err(BundleError::InvalidPath(format!(
+            "{} bytes exceeds {MAX_MODULE_PATH_BYTES}-byte cap",
+            module_path.len()
+        )));
+    }
+    if module_path.starts_with('/') || module_path.contains('\\') {
+        return Err(BundleError::InvalidPath(
+            "absolute paths and backslashes are forbidden".into(),
+        ));
+    }
+    if module_path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(BundleError::InvalidPath(
+            "empty, '.' and '..' path segments are forbidden".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// What we will look up inside the ZIP, in priority order.
@@ -287,5 +356,37 @@ mod tests {
         assert_eq!(messages, "// nested");
         let api = extract_module_source(&bundle, "convex/_generated/api.js").expect("api");
         assert_eq!(api, "// gen");
+    }
+
+    #[test]
+    fn extract_rejects_noncanonical_module_paths_before_zip_access() {
+        for path in [
+            "",
+            "/messages",
+            "../messages",
+            "a/../messages",
+            "a//messages",
+            r"a\messages",
+        ] {
+            let error = extract_module_source(b"not a zip", path).expect_err("invalid path");
+            assert!(
+                matches!(error, BundleError::InvalidPath(_)),
+                "{path:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_rejects_compressed_module_bomb_before_allocating_declared_size() {
+        let payload = vec![b'x'; MAX_MODULE_SOURCE_BYTES + 1];
+        let bundle = build_bundle(&[("modules/bomb.js", &payload)]);
+        let error = extract_module_source(&bundle, "bomb").expect_err("oversized source");
+        assert!(matches!(
+            error,
+            BundleError::TooLarge {
+                actual,
+                maximum: MAX_MODULE_SOURCE_BYTES
+            } if actual == (MAX_MODULE_SOURCE_BYTES + 1) as u64
+        ));
     }
 }

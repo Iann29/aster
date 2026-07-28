@@ -16,10 +16,13 @@
 //! `seal::SealedCapsule`, a BLAKE3 keyed capability seal suitable for the
 //! broker/cell boundary.
 
+pub mod canon;
 pub mod seal;
 
+pub use canon::{decode_capsule_bytes, encode_capsule_bytes, DecodeError};
 pub use seal::{
     capsule_digest, CapsuleSeal, CapsuleSealKey, SealContext, SealError, SealedCapsule,
+    SessionBinding,
 };
 
 use serde::{Deserialize, Serialize};
@@ -193,6 +196,221 @@ pub enum ReadTrap {
     Prefix { prefix: String, limit: usize },
 }
 
+/// One endpoint of a general key range.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum IntervalEndpoint {
+    Unbounded,
+    Inclusive(DocumentId),
+    Exclusive(DocumentId),
+}
+
+/// The key interval `I` a limited scan observed.
+///
+/// `Prefix` is kept as its own semantic form (not desugared to a `Range`)
+/// because computing a prefix's exclusive upper bound requires byte-level
+/// successor surgery that can leave UTF-8 — binding "all keys starting with
+/// p" directly is exact and decidable.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum KeyInterval {
+    Prefix(String),
+    Range {
+        start: IntervalEndpoint,
+        end: IntervalEndpoint,
+    },
+}
+
+impl KeyInterval {
+    pub fn contains(&self, key: &DocumentId) -> bool {
+        match self {
+            Self::Prefix(prefix) => key.0.starts_with(prefix.as_str()),
+            Self::Range { start, end } => {
+                let after_start = match start {
+                    IntervalEndpoint::Unbounded => true,
+                    IntervalEndpoint::Inclusive(bound) => key >= bound,
+                    IntervalEndpoint::Exclusive(bound) => key > bound,
+                };
+                let before_end = match end {
+                    IntervalEndpoint::Unbounded => true,
+                    IntervalEndpoint::Inclusive(bound) => key <= bound,
+                    IntervalEndpoint::Exclusive(bound) => key < bound,
+                };
+                after_start && before_end
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ScanDirection {
+    Ascending,
+    Descending,
+}
+
+/// Why the scan stopped. `Boundary` means the limit was hit at the last
+/// returned key; `Exhausted` means the whole interval had no further live
+/// key — the suffix after the last key is an observed exhaustion gap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ScanStop {
+    Exhausted,
+    Boundary,
+}
+
+/// Sealed evidence of one limited scan (Capsule Transaction Theorem,
+/// Definition 1.1 + Repair R-RANGE): interval semantics, direction, positive
+/// limit, the ordered returned keys, and the exhausted-versus-boundary stop.
+/// This is the minimal certificate from which the phantom-safe conflict
+/// window can be reconstructed at commit time.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct RangeCertificate {
+    pub interval: KeyInterval,
+    pub direction: ScanDirection,
+    pub limit: u64,
+    pub keys: Vec<DocumentId>,
+    pub stop: ScanStop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RangeCertificateError {
+    ZeroLimit,
+    TooManyKeys,
+    KeysNotMonotonic,
+    KeyOutsideInterval(DocumentId),
+    StopInconsistent,
+}
+
+impl fmt::Display for RangeCertificateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroLimit => write!(f, "range certificate limit must be >= 1"),
+            Self::TooManyKeys => write!(f, "range certificate returned more keys than its limit"),
+            Self::KeysNotMonotonic => {
+                write!(f, "range certificate keys are not strictly ordered")
+            }
+            Self::KeyOutsideInterval(key) => {
+                write!(
+                    f,
+                    "range certificate key {:?} is outside its interval",
+                    key.0
+                )
+            }
+            Self::StopInconsistent => write!(
+                f,
+                "range certificate stop variant does not match key count vs limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RangeCertificateError {}
+
+impl RangeCertificate {
+    pub fn validate(&self) -> Result<(), RangeCertificateError> {
+        if self.limit == 0 {
+            return Err(RangeCertificateError::ZeroLimit);
+        }
+        if self.keys.len() as u64 > self.limit {
+            return Err(RangeCertificateError::TooManyKeys);
+        }
+        for pair in self.keys.windows(2) {
+            let ordered = match self.direction {
+                ScanDirection::Ascending => pair[0] < pair[1],
+                ScanDirection::Descending => pair[0] > pair[1],
+            };
+            if !ordered {
+                return Err(RangeCertificateError::KeysNotMonotonic);
+            }
+        }
+        for key in &self.keys {
+            if !self.interval.contains(key) {
+                return Err(RangeCertificateError::KeyOutsideInterval(key.clone()));
+            }
+        }
+        let hit_limit = self.keys.len() as u64 == self.limit;
+        let is_boundary = matches!(self.stop, ScanStop::Boundary);
+        if hit_limit != is_boundary {
+            return Err(RangeCertificateError::StopInconsistent);
+        }
+        Ok(())
+    }
+
+    /// The observed window the committer must check for conflicting writes
+    /// (Theorem, Definition 1.1): the whole interval when the scan exhausted
+    /// it, and the prefix through the last returned key when the scan
+    /// stopped at its limit. A write strictly past the boundary cannot
+    /// change the first-ℓ answer, so it is deliberately outside the window.
+    pub fn window(&self) -> ObservedWindow {
+        let boundary = match self.stop {
+            ScanStop::Exhausted => None,
+            ScanStop::Boundary => self.keys.last().cloned(),
+        };
+        ObservedWindow {
+            interval: self.interval.clone(),
+            direction: self.direction,
+            boundary,
+        }
+    }
+}
+
+/// A validated conflict window: `contains` answers "could a write to this
+/// key invalidate the certified scan result?".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedWindow {
+    pub interval: KeyInterval,
+    pub direction: ScanDirection,
+    pub boundary: Option<DocumentId>,
+}
+
+impl ObservedWindow {
+    pub fn contains(&self, key: &DocumentId) -> bool {
+        if !self.interval.contains(key) {
+            return false;
+        }
+        match (&self.boundary, self.direction) {
+            (None, _) => true,
+            (Some(bound), ScanDirection::Ascending) => key <= bound,
+            (Some(bound), ScanDirection::Descending) => key >= bound,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapsuleStructureError {
+    Range {
+        index: usize,
+        error: RangeCertificateError,
+    },
+    RangeKeyNotInDocs {
+        index: usize,
+        key: DocumentId,
+    },
+    RangeKeyNotLive {
+        index: usize,
+        key: DocumentId,
+    },
+}
+
+impl fmt::Display for CapsuleStructureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Range { index, error } => {
+                write!(f, "range certificate {index} is invalid: {error}")
+            }
+            Self::RangeKeyNotInDocs { index, key } => write!(
+                f,
+                "range certificate {index} returned key {:?} missing from docs",
+                key.0
+            ),
+            Self::RangeKeyNotLive { index, key } => write!(
+                f,
+                "range certificate {index} returned key {:?} that is not a live document",
+                key.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleStructureError {}
+
 /// The immutable capability passed into a sandbox cell.
 ///
 /// `root_hash` is recomputed whenever the broker hydrates more data. A worker
@@ -204,6 +422,10 @@ pub struct SnapshotCapsule {
     pub deployment: DeploymentId,
     pub ts: Timestamp,
     pub docs: BTreeMap<DocumentId, VersionedDocument>,
+    /// Ordered sequence of limited-scan observations. Position is part of
+    /// the canonical content; repeated scans are legal.
+    #[serde(default)]
+    pub ranges: Vec<RangeCertificate>,
     pub root_hash: u64,
 }
 
@@ -214,6 +436,7 @@ impl SnapshotCapsule {
             deployment,
             ts,
             docs: BTreeMap::new(),
+            ranges: Vec::new(),
             root_hash: 0,
         };
         capsule.root_hash = capsule.compute_root_hash();
@@ -233,12 +456,58 @@ impl SnapshotCapsule {
         self.root_hash = self.compute_root_hash();
     }
 
+    /// Merge one certified scan: every returned entry lands in `docs` and the
+    /// certificate is appended to the ordered `ranges` sequence.
+    pub fn hydrate_range(
+        &mut self,
+        certificate: RangeCertificate,
+        entries: Vec<(DocumentId, VersionedDocument)>,
+    ) {
+        for (key, value) in entries {
+            self.docs.insert(key, value);
+        }
+        self.ranges.push(certificate);
+        self.root_hash = self.compute_root_hash();
+    }
+
+    /// Structural validity of the observation set (W-CANON for ranges):
+    /// every certificate is internally valid and every returned key
+    /// cross-references a live entry in the document map. Issued capsules
+    /// satisfy this by construction; verification rejects anything else
+    /// before it can reach conflict validation.
+    pub fn validate_structure(&self) -> Result<(), CapsuleStructureError> {
+        for (index, certificate) in self.ranges.iter().enumerate() {
+            certificate
+                .validate()
+                .map_err(|error| CapsuleStructureError::Range { index, error })?;
+            for key in &certificate.keys {
+                match self.docs.get(key) {
+                    None => {
+                        return Err(CapsuleStructureError::RangeKeyNotInDocs {
+                            index,
+                            key: key.clone(),
+                        })
+                    }
+                    Some(value) if value.version.is_none() || value.document.is_none() => {
+                        return Err(CapsuleStructureError::RangeKeyNotLive {
+                            index,
+                            key: key.clone(),
+                        })
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn compute_root_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.tenant.hash(&mut hasher);
         self.deployment.hash(&mut hasher);
         self.ts.hash(&mut hasher);
         self.docs.hash(&mut hasher);
+        self.ranges.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -291,24 +560,66 @@ impl MvccStore {
         Self::read_at_inner(&inner, key, ts)
     }
 
-    pub fn prefix_at(
+    /// Certified ascending prefix scan at snapshot `ts` — the theorem's
+    /// `Scan_σs(I, ℓ)` for `I = Prefix(prefix)` (Definition 1.1).
+    ///
+    /// Visibility is the latest revision with `rev.ts <= ts`. Keys whose
+    /// visible state is a tombstone or that do not exist yet at `ts` are
+    /// skipped and do NOT consume limit slots; keys created after `ts` are
+    /// invisible. The scan collects until `limit` live entries:
+    /// `stop == Boundary` iff exactly `limit` were collected, `Exhausted`
+    /// otherwise (`RangeCertificate::validate` couples the two by design).
+    ///
+    /// Referee finding F2 — completeness is a CALLER contract: a `Boundary`
+    /// certificate only proves the first-`limit` answer, so a caller that
+    /// wants to assert "this is the whole prefix" must request `limit + 1`
+    /// (or otherwise check for an `Exhausted` stop) instead of treating a
+    /// full-limit result as complete.
+    ///
+    /// `limit == 0` cannot produce a valid certificate and is rejected with
+    /// `RangeCertificateError::ZeroLimit` before scanning.
+    pub fn scan_prefix_at(
         &self,
         prefix: &str,
         limit: usize,
         ts: Timestamp,
-    ) -> Vec<(DocumentId, VersionedDocument)> {
+    ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), RangeCertificateError>
+    {
+        if limit == 0 {
+            return Err(RangeCertificateError::ZeroLimit);
+        }
         let inner = self.inner.lock().expect("mvcc mutex poisoned");
-        inner
-            .docs
-            .keys()
-            .filter(|key| key.0.starts_with(prefix))
-            .take(limit)
-            .cloned()
-            .map(|key| {
-                let value = Self::read_at_inner(&inner, &key, ts);
-                (key, value)
-            })
-            .collect()
+        let mut entries = Vec::new();
+        // Keys sharing a prefix form one contiguous BTreeMap run starting
+        // at the prefix itself.
+        for key in inner.docs.range(DocumentId::new(prefix)..).map(|(k, _)| k) {
+            if !key.0.starts_with(prefix) {
+                break;
+            }
+            // Reuse the point-read visibility rule so scan and point can
+            // never disagree about what a snapshot contains.
+            let value = Self::read_at_inner(&inner, key, ts);
+            if value.version.is_none() || value.document.is_none() {
+                continue;
+            }
+            entries.push((key.clone(), value));
+            if entries.len() == limit {
+                break;
+            }
+        }
+        let stop = if entries.len() == limit {
+            ScanStop::Boundary
+        } else {
+            ScanStop::Exhausted
+        };
+        let certificate = RangeCertificate {
+            interval: KeyInterval::Prefix(prefix.to_string()),
+            direction: ScanDirection::Ascending,
+            limit: limit as u64,
+            keys: entries.iter().map(|(key, _)| key.clone()).collect(),
+            stop,
+        };
+        Ok((certificate, entries))
     }
 
     pub fn build_capsule(
@@ -370,6 +681,25 @@ impl MvccStore {
                 document: revision.document.clone(),
             })
             .unwrap_or_else(VersionedDocument::missing)
+    }
+
+    /// Keys with at least one write event in `(after, up_to]` — the
+    /// theorem's `Changed(K; (s, h])` enumeration a commit fence needs to
+    /// test declared range windows against the committed suffix. Tombstone
+    /// writes are write events too (they carry a revision), so a delete in
+    /// the window is reported exactly like a put.
+    pub fn changed_keys_in(&self, after: Timestamp, up_to: Timestamp) -> Vec<DocumentId> {
+        let inner = self.inner.lock().expect("mvcc mutex poisoned");
+        inner
+            .docs
+            .iter()
+            .filter(|(_, revisions)| {
+                revisions
+                    .iter()
+                    .any(|revision| revision.ts > after && revision.ts <= up_to)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 }
 
@@ -436,6 +766,284 @@ mod tests {
         assert!(matches!(
             store.commit(base_ts, &read_set, &second),
             Err(CommitError::Conflict { .. })
+        ));
+    }
+
+    fn live_doc(version: Timestamp, value: i64) -> VersionedDocument {
+        VersionedDocument {
+            version: Some(version),
+            document: Some(doc_with_i64("value", value)),
+        }
+    }
+
+    fn asc_cert(
+        interval: KeyInterval,
+        limit: u64,
+        keys: &[&str],
+        stop: ScanStop,
+    ) -> RangeCertificate {
+        RangeCertificate {
+            interval,
+            direction: ScanDirection::Ascending,
+            limit,
+            keys: keys.iter().map(|key| DocumentId::new(*key)).collect(),
+            stop,
+        }
+    }
+
+    #[test]
+    fn boundary_window_covers_prefix_through_last_key_only() {
+        let cert = asc_cert(
+            KeyInterval::Prefix("docs/".into()),
+            3,
+            &["docs/a", "docs/b", "docs/c"],
+            ScanStop::Boundary,
+        );
+        cert.validate().expect("valid certificate");
+        let window = cert.window();
+        // Inserts between returned keys are phantoms and must be caught.
+        assert!(window.contains(&DocumentId::new("docs/a")));
+        assert!(window.contains(&DocumentId::new("docs/b2")));
+        assert!(window.contains(&DocumentId::new("docs/c")));
+        // Referee finding F2: a full-limit scan observes only the prefix
+        // through its last key. Writes strictly past the boundary cannot
+        // change the first-ℓ answer and are deliberately outside the window.
+        assert!(!window.contains(&DocumentId::new("docs/d")));
+        assert!(!window.contains(&DocumentId::new("other/x")));
+    }
+
+    #[test]
+    fn exhausted_window_covers_the_entire_interval() {
+        let cert = asc_cert(
+            KeyInterval::Prefix("docs/".into()),
+            7,
+            &["docs/a"],
+            ScanStop::Exhausted,
+        );
+        cert.validate().expect("valid certificate");
+        let window = cert.window();
+        // The exhaustion gap: an insert anywhere in the interval — even far
+        // past the last returned key — would add a live key the scan proved
+        // absent, so the whole interval is the conflict window.
+        assert!(window.contains(&DocumentId::new("docs/zzz")));
+        assert!(!window.contains(&DocumentId::new("other/x")));
+    }
+
+    #[test]
+    fn descending_boundary_window_mirrors_ascending() {
+        let cert = RangeCertificate {
+            interval: KeyInterval::Prefix("docs/".into()),
+            direction: ScanDirection::Descending,
+            limit: 2,
+            keys: vec![DocumentId::new("docs/c"), DocumentId::new("docs/b")],
+            stop: ScanStop::Boundary,
+        };
+        cert.validate().expect("valid certificate");
+        let window = cert.window();
+        assert!(window.contains(&DocumentId::new("docs/b")));
+        assert!(window.contains(&DocumentId::new("docs/bb")));
+        assert!(!window.contains(&DocumentId::new("docs/a")));
+    }
+
+    #[test]
+    fn range_interval_bounds_are_respected() {
+        let interval = KeyInterval::Range {
+            start: IntervalEndpoint::Inclusive(DocumentId::new("docs/b")),
+            end: IntervalEndpoint::Exclusive(DocumentId::new("docs/e")),
+        };
+        assert!(!interval.contains(&DocumentId::new("docs/a")));
+        assert!(interval.contains(&DocumentId::new("docs/b")));
+        assert!(interval.contains(&DocumentId::new("docs/d")));
+        assert!(!interval.contains(&DocumentId::new("docs/e")));
+    }
+
+    #[test]
+    fn certificate_validation_rejects_malformed_shapes() {
+        let prefix = || KeyInterval::Prefix("docs/".into());
+        assert_eq!(
+            asc_cert(prefix(), 0, &[], ScanStop::Exhausted).validate(),
+            Err(RangeCertificateError::ZeroLimit)
+        );
+        assert_eq!(
+            asc_cert(prefix(), 1, &["docs/a", "docs/b"], ScanStop::Boundary).validate(),
+            Err(RangeCertificateError::TooManyKeys)
+        );
+        assert_eq!(
+            asc_cert(prefix(), 3, &["docs/b", "docs/a"], ScanStop::Exhausted).validate(),
+            Err(RangeCertificateError::KeysNotMonotonic)
+        );
+        assert_eq!(
+            asc_cert(prefix(), 3, &["docs/a", "docs/a"], ScanStop::Exhausted).validate(),
+            Err(RangeCertificateError::KeysNotMonotonic)
+        );
+        assert_eq!(
+            asc_cert(prefix(), 3, &["other/x"], ScanStop::Exhausted).validate(),
+            Err(RangeCertificateError::KeyOutsideInterval(DocumentId::new(
+                "other/x"
+            )))
+        );
+        // The stop variant is derivable from |keys| vs limit; carrying an
+        // inconsistent explicit tag is a forged certificate shape.
+        assert_eq!(
+            asc_cert(prefix(), 3, &["docs/a"], ScanStop::Boundary).validate(),
+            Err(RangeCertificateError::StopInconsistent)
+        );
+        assert_eq!(
+            asc_cert(prefix(), 1, &["docs/a"], ScanStop::Exhausted).validate(),
+            Err(RangeCertificateError::StopInconsistent)
+        );
+    }
+
+    #[test]
+    fn scan_prefix_skips_tombstones_without_consuming_limit() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+        store.seed(DocumentId::new("docs/c"), doc_with_i64("value", 3)); // ts=3
+        let mut deletion = WriteSet::default();
+        deletion.delete(DocumentId::new("docs/b"));
+        store
+            .commit(store.snapshot_ts(), &ReadSet::default(), &deletion)
+            .expect("tombstone commit"); // ts=4
+
+        // The buggy prefix_at counted docs/b toward the limit and returned
+        // its tombstone; the certified scan must return the 2 live keys.
+        let (cert, entries) = store
+            .scan_prefix_at("docs/", 2, store.snapshot_ts())
+            .expect("scan");
+        cert.validate().expect("valid certificate");
+        assert_eq!(
+            cert.keys,
+            vec![DocumentId::new("docs/a"), DocumentId::new("docs/c")]
+        );
+        assert_eq!(cert.stop, ScanStop::Boundary);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1.version, Some(1));
+        assert_eq!(entries[1].1.version, Some(3));
+    }
+
+    #[test]
+    fn scan_prefix_hides_keys_created_after_snapshot() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        let snapshot = store.snapshot_ts();
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+
+        let (cert, entries) = store.scan_prefix_at("docs/", 10, snapshot).expect("scan");
+        cert.validate().expect("valid certificate");
+        // docs/b exists in the key space but not at the snapshot — it must
+        // be invisible, and the scan proves the rest of the interval empty.
+        assert_eq!(cert.keys, vec![DocumentId::new("docs/a")]);
+        assert_eq!(cert.stop, ScanStop::Exhausted);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn scan_prefix_stop_is_boundary_iff_limit_hit() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        let ts = store.snapshot_ts();
+
+        // Exactly limit live keys → Boundary, even though nothing follows.
+        // Completeness needs limit+1 (referee F2) — this is the footgun case.
+        let (boundary, _) = store.scan_prefix_at("docs/", 2, ts).expect("scan");
+        assert_eq!(boundary.stop, ScanStop::Boundary);
+        boundary.validate().expect("valid boundary certificate");
+
+        let (exhausted, _) = store.scan_prefix_at("docs/", 3, ts).expect("scan");
+        assert_eq!(exhausted.stop, ScanStop::Exhausted);
+        assert_eq!(exhausted.keys.len(), 2);
+        exhausted.validate().expect("valid exhausted certificate");
+    }
+
+    #[test]
+    fn changed_keys_in_reports_write_events_including_tombstones() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1)); // ts=1
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2)); // ts=2
+        let mut deletion = WriteSet::default();
+        deletion.delete(DocumentId::new("docs/a"));
+        store
+            .commit(store.snapshot_ts(), &ReadSet::default(), &deletion)
+            .expect("tombstone commit"); // ts=3
+
+        // Window (1, 3]: docs/b's put at 2 and docs/a's DELETE at 3 are
+        // both write events; docs/a's original put at 1 is outside.
+        let mut changed = store.changed_keys_in(1, 3);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![DocumentId::new("docs/a"), DocumentId::new("docs/b")]
+        );
+        assert_eq!(store.changed_keys_in(3, 3), Vec::<DocumentId>::new());
+        assert_eq!(store.changed_keys_in(2, 3), vec![DocumentId::new("docs/a")]);
+    }
+
+    #[test]
+    fn scan_prefix_rejects_zero_limit() {
+        let store = MvccStore::new();
+        assert_eq!(
+            store.scan_prefix_at("docs/", 0, 1),
+            Err(RangeCertificateError::ZeroLimit)
+        );
+    }
+
+    #[test]
+    fn scan_prefix_hydrates_capsule_that_validates() {
+        let store = MvccStore::new();
+        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        store.seed(DocumentId::new("docs/b"), doc_with_i64("value", 2));
+        let ts = store.snapshot_ts();
+
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), ts);
+        let (cert, entries) = store.scan_prefix_at("docs/", 2, ts).expect("scan");
+        capsule.hydrate_range(cert, entries);
+        capsule
+            .validate_structure()
+            .expect("issued capsules satisfy structure by construction");
+        assert_eq!(capsule.ranges.len(), 1);
+        assert!(capsule.get(&DocumentId::new("docs/a")).is_some());
+    }
+
+    #[test]
+    fn validate_structure_requires_live_crossreferenced_range_keys() {
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 10);
+        capsule.hydrate_point(DocumentId::new("docs/live"), live_doc(3, 1));
+        capsule.hydrate_range(
+            asc_cert(
+                KeyInterval::Prefix("docs/".into()),
+                5,
+                &["docs/live"],
+                ScanStop::Exhausted,
+            ),
+            Vec::new(),
+        );
+        capsule.validate_structure().expect("valid structure");
+
+        // Certificate returning a key the docs map does not contain.
+        let mut missing = capsule.clone();
+        missing.ranges[0].keys = vec![DocumentId::new("docs/ghost")];
+        assert!(matches!(
+            missing.validate_structure(),
+            Err(CapsuleStructureError::RangeKeyNotInDocs { .. })
+        ));
+
+        // Certificate returning a key whose docs entry is a tombstone.
+        let mut dead = capsule.clone();
+        dead.hydrate_point(
+            DocumentId::new("docs/dead"),
+            VersionedDocument {
+                version: Some(4),
+                document: None,
+            },
+        );
+        dead.ranges[0].keys = vec![DocumentId::new("docs/dead")];
+        assert!(matches!(
+            dead.validate_structure(),
+            Err(CapsuleStructureError::RangeKeyNotLive { .. })
         ));
     }
 }

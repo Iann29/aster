@@ -43,6 +43,9 @@ docker network create "${NETWORK}" >/dev/null
 docker volume create "${VOLUME}" >/dev/null
 
 echo "==> starting brokerd (image: ${BROKERD_IMAGE})"
+# ASTER_LEASE_EPOCH on the BROKER: memory-mode prototype stand-in for the
+# lease authority (S9a). The broker only mints sessions for contexts
+# claiming its own epoch, so this must match the cell's value below.
 docker run -d \
     --name "${BROKER}" \
     --network "${NETWORK}" \
@@ -52,7 +55,7 @@ docker run -d \
     -e ASTER_DEPLOYMENT=dep-smoke \
     -e ASTER_SEED_I64='counters/a:value:20,counters/b:value:22' \
     -e ASTER_SEAL_SEED=smoke-seed \
-    -e ASTER_MAX_CONNECTIONS=8 \
+    -e ASTER_LEASE_EPOCH=7 \
     "${BROKERD_IMAGE}" >/dev/null
 
 # The broker logs "ready socket=..." on stderr the moment it binds.

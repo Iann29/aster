@@ -3,3 +3,8 @@
 .DS_Store
 .idea/
 .vscode/
+
+# TLA+ model checking (tla/): the TLC jar is downloaded, never committed;
+# states/ is TLC scratch metadata.
+tla/tla2tools.jar
+tla/states/

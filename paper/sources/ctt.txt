@@ -1,0 +1,1384 @@
+   The Capsule Transaction Theorem
+                            A repaired proof for Aster v0.7
+
+
+Byzantine executors, broker-authenticated snapshots, backward-validation OCC, and lease
+                                         fencing
+
+
+
+
+  Status. Conditional proof, suitable as a protocol specification but not as a substitute for
+  code-level verification. The core composition is sound after the repairs stated in Section 2.
+  The repairs comprise theorem-scope corrections, concrete protocol and implementation
+  requirements, one additional cryptographic assumption required by the implemented prehash
+  construction, and the already-planned sealed range-certificate extension.
+
+  Central verdict. Both Variant A and Variant B provide strict serializability for the
+  authenticated observations that the committer actually validates. Neither variant, while
+  the broker remains stateless, proves that those observations are the complete causal read-
+  dependencies of Byzantine JavaScript: an executor can replay or fork an earlier broker-issued
+  capsule. This does not break history-level isolation. It fixes the exact honesty boundary: the
+  executor may choose an authorized blind or under-declared write, but it cannot fabricate
+  snapshot data, cross policy, evade a real conflict on a declared observation, or append through
+  a stale lease epoch.
+
+
+
+
+                                           July 2026
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+Contents
+Executive verdict                                                                                          3
+
+1 Model                                                                                                    3
+  1.1 Trust, principals, and the meaning of statelessness . . . . . . . . . . . . . . . . . . . . .        3
+  1.2 Reality ledger: current code and proved protocol . . . . . . . . . . . . . . . . . . . . . .         4
+  1.3 Commit log, state, and versioned absence . . . . . . . . . . . . . . . . . . . . . . . . . .         4
+  1.4 Point and limited-range observations . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       5
+  1.5 Capsules and canonical content . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       6
+  1.6 Seal construction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    6
+  1.7 Read issuance relation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     7
+  1.8 Commit protocol and the commit fence . . . . . . . . . . . . . . . . . . . . . . . . . . .           7
+  1.9 Retention notation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     8
+  1.10 What the history records . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    8
+  1.11 Notation table . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    9
+
+2 Repairs and final theorem statements                                                                     9
+  2.1 T1a – issued-capsule authenticity . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     11
+  2.2 T1b – confinement and explicit leakage . . . . . . . . . . . . . . . . . . . . . . . . . . . .      11
+  2.3 T2 – Byzantine strict serializability . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   12
+  2.4 T3 – Byzantine equivalence and the honesty boundary . . . . . . . . . . . . . . . . . . .           12
+  2.5 Lemma R – retention safety . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      13
+  2.6 C1 – read-plane scale-out . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     13
+  2.7 Out-of-scope properties . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     13
+
+3 Proofs                                                                                                  13
+  3.1 Canonical encoding and outer-message injectivity . . . . . . . . . . . . . . . . . . . . . .        13
+  3.2 Proof of T1a . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    15
+  3.3 Proof of T1b . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    16
+  3.4 Read-stability lemmas . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     16
+  3.5 Retention safety . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    17
+  3.6 Atomicity of validation and append . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      18
+  3.7 Epoch fencing across failover . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     18
+  3.8 Proof of T2 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   18
+  3.9 Proof of T3 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .   19
+  3.10 Proof of C1 and obstruction-freedom remark . . . . . . . . . . . . . . . . . . . . . . . .         20
+
+4 Attack appendix: all thirteen enumerated obligations                                                    20
+
+5 Assumptions ledger                                                                             22
+  5.1 Implementation obligations recorded but not proved . . . . . . . . . . . . . . . . . . . . 24
+
+6 Variant verdict                                                                                         24
+
+7 Prior-art position and exact delta                                                                      25
+
+8 Open problems                                                                                           26
+  8.1 Reactive subscriptions over capsules . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      26
+  8.2 Learned prewarming (“dream capsules”) . . . . . . . . . . . . . . . . . . . . . . . . . . .         26
+  8.3 Zero-knowledge compliance transcripts . . . . . . . . . . . . . . . . . . . . . . . . . . . .       26
+
+                                                  1 of 27
+The Capsule Transaction Theorem                                                          Aster v0.7
+
+
+   8.4 Actual-dependency completeness without trusting V8 . . . . . . . . . . . . . . . . . . . . 26
+
+9 Confidence report                                                                              26
+
+Concluding statement                                                                             27
+
+
+
+
+                                              2 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+Executive verdict
+The theorem the system needs is reachable, but not literally in every sentence of the briefing. The
+repaired result is stronger where it matters and narrower where the stateless protocol cannot carry the
+requested meaning.
+ 1. The keyed seal authenticates an entire broker-issued capsule for one context. It prevents substitution,
+    cross-context transplant, and splice construction. It does not prove that the submitted capsule was
+    the latest capsule issued to that physical invocation. Earlier capsules are valid bearer objects.
+ 2. The implemented two-stage seal, which MACs an unkeyed BLAKE3 digest rather than the canonical
+    capsule bytes, cannot be reduced to keyed-BLAKE3 PRF security alone. The proof additionally
+    needs collision resistance of unkeyed BLAKE3, or a future seal version must MAC the full canonical
+    encoding directly.
+ 3. Backward validation is sound only when validation and append share one stable log horizon.
+    Commits must be serialized through a commit fence; lease epoch, write policy, retention floor,
+    conflict validation, and append must be tied to the same logical decision. A check-then-append
+    implementation with an interposing commit is false.
+ 4. Limited scans require a sealed certificate that distinguishes “stopped at the limit” from “exhausted
+    the interval” and binds the ordered returned keys. The conflict window is the prefix through the
+    last returned key in the first case, and the whole requested interval in the second.
+ 5. The requested read-plane non-interference theorem is true. A full-protocol simulator additionally
+    needs the commit control transcript, because a conflict abort reveals one bit about whether an
+    authorized observation window changed after the snapshot. No unauthorized payload is revealed,
+    but the bit exists and must be named.
+ 6. Strict serializability holds for committed mutations in commit-timestamp order. Read-only invo-
+    cations obtain a single, possibly stale, snapshot. A Byzantine cell may lie in its application-level
+    return value; only the broker-served grant transcript is guaranteed to equal the snapshot.
+ 7. Variant B is recommended for v0.7. It has the same Byzantine authority boundary and the same
+    T2/T3 theorem class as Variant A, while avoiding aborts on unused prewarm. Variant A is useful
+    as an honest-client safety belt, not as a Byzantine completeness proof.
+The result therefore matches the project’s risk register: the high-risk boundary is authority, not
+arithmetic integrity. The executor may compute nonsense. It may not acquire database authority that
+the broker did not grant.
+
+
+1     Model
+1.1   Trust, principals, and the meaning of statelessness
+There is a trusted storage system, a trusted broker/committer role, and arbitrarily many probabilistic
+polynomial-time Byzantine cells. Every process that possesses the capsule key is part of the trusted
+computing base. Storage is assumed to implement the MVCC and lease contracts stated below; a
+Byzantine database server is outside this model.
+A cell context is
+                                  ctx = (tenant, deployment, cid, e, s).
+
+
+
+                                                 3 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+Here s is the fixed snapshot timestamp and e is the lease epoch placed in the cell’s context. All integer
+fields are canonical unsigned 64-bit integers; the abstract timestamp and epoch spaces are therefore
+restricted to [0, 264 − 1] in the encoded protocol.
+[REPAIR C-CHANNEL] The request-supplied context is not authoritative. A broker handler
+obtains an immutable expected context ctxc from trusted launch or channel metadata and verifies against
+ctx. A serialized context in a request is either omitted or required to equal ctx.
+ c                                                                            c This is the minimum
+condition under which binding the MAC to cid means “wrong-cell rejection” rather than merely “a
+bearer object carrying someone else’s public cid.” It requires no evolving capsule state: a per-socket
+immutable label, an OS credential mapped to launch metadata, or an equivalent non-forgeable channel
+binding is sufficient.
+“Stateless broker” means that the broker need not remember the latest capsule digest, a read list, or
+a per-invocation sequence number. It may retain immutable connection/launch metadata and global
+state such as policy, lease, log, and key material. Because the broker accepts any valid prior capsule,
+the issuance structure for a Byzantine cell is a branching tree, not necessarily one monotone chain.
+A coalition of cells may share arbitrary data out of band. The channel binding prevents one cell from
+relabeling a request as another live context on its own channel; a cooperating holder of the other context
+can of course exercise that other context’s authority. No protocol can stop principals from sharing data
+they were each authorized to receive.
+
+1.2   Reality ledger: current code and proved protocol
+Implemented and tested today: the point-entry capsule seal and canonical encoding described in
+Section 1; the grow-and-reseal read protocol over a Unix-domain socket; point and prefix reads against
+the production-shaped Postgres schema, including tombstones; and an in-memory single-writer commit
+function that performs backward OCC validation but is not wired to V8 or the broker. The running
+prototype pins one broker-startup snapshot and its read gate is effectively “any key within the pinned
+tenant/deployment”; the seal format already binds a snapshot per capsule. The current wire capsule
+contains point entries only. A prefix result can populate point entries, but it does not yet carry the
+sealed range certificate required for phantom-safe mutation validation.
+Proposed and covered conditionally by this proof: per-invocation snapshot selection; context
+and epoch obtained from trusted launch and storage-lease authority rather than cell assertion; per-range
+read policy and commit-time write policy; sealed range certificates; and the end-to-end commit fence
+that couples lease, retention, policy, conflict validation, and append. The theorem is a specification
+for that repaired v0.7 protocol, not a claim that the present read-only code already implements it.
+Constant-time tag comparison and production secret provisioning remain implementation obligations
+rather than mathematical lemmas.
+
+1.3   Commit log, state, and versioned absence
+Let K be a totally ordered key space. A commit log is a finite or infinite sequence
+
+                                 L = (C1 , C2 , . . .),    Ci = (ci , ei , Wi ),
+
+where c1 < c2 < · · · are globally unique commit timestamps and
+
+                                 Wi : K ⇀ {Put(d) : d ∈ D} ∪ {Delete}
+
+is a finite map. Applying Put(d) at timestamp ci stores record (ci , d); applying Delete stores tombstone
+(ci , ⊥). The state σt is the result of applying the prefix with ci ≤ t.
+
+
+                                                     4 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+The point-read function is
+                           
+                           (None, None),     if no record for k exists at or before t,
+                           
+                           
+             Readσt (k) = (Some(v), Some(d)), if the latest record is a put at v,
+                         
+                         (Some(v), None),
+                         
+                                              if the latest record is a tombstone at v.
+
+Thus nonexistence and deletion are both explicit, and a later insertion, deletion, or update is a write
+event on the point key.
+For J ⊆ K and timestamp interval (a, b], define
+
+                                                 Changed(J; (a, b])
+
+to mean that there is a committed Ci with a < ci ≤ b and dom(Wi ) ∩ J ̸= ∅. A put of the same
+document and a delete of an already absent key still count as writes. This is conservative and is the
+predicate the log can check.
+[REPAIR S-SNAPSHOT] Every context snapshot s denotes an actually committed prefix, satisfies
+s ≤ tip(L) at issuance, and every read trap for that context is evaluated against the same immutable
+MVCC snapshot σs . If storage can no longer serve s, the broker aborts the invocation rather than
+silently advancing the snapshot.
+
+1.4    Point and limited-range observations
+A normalized prefix or index query is represented as an interval I ⊆ K and a positive finite limit
+ℓ ≥ 1. This document formalizes ascending scans. A descending scan is obtained by the symmetric
+construction and must carry the direction bit in its certificate.
+Let
+                           Liveσ (I) = ⟨k ∈ I : Readσ (k) = (Some(v), Some(d))⟩
+be the live keys in increasing order. Then
+
+                                                      Scanσ (I, ℓ)
+
+is the first min(ℓ, |Liveσ (I)|) keys, each paired with its versioned read result.
+Definition 1.1 (Range certificate). A range certificate is
+
+                                          ρ = (I, ℓ, ⟨k1 , . . . , km ⟩, stop),
+
+where 0 ≤ m ≤ ℓ, the keys are strictly increasing and in I, and
+                                                (
+                                                    Exhausted,          m < ℓ,
+                                     stop =
+                                                    Boundary(km ),      m = ℓ.
+
+The certificate is semantically valid at s when the listed keys and their values are exactly Scanσs (I, ℓ).
+The associated observed window is
+
+                                                                  stop = Exhausted,
+                                     (
+                                         I,
+                          Win(ρ) =
+                                         {k ∈ I : k ≤ km },       stop = Boundary(km ).
+
+The whole interval is observed when fewer than ℓ results are returned: the suffix after the last key is an
+exhaustion gap certifying that no additional live key existed at s. When exactly ℓ are returned, only
+
+                                                        5 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+the prefix through km determines the first-ℓ answer. A write strictly after km cannot enter before those
+results.
+[REPAIR R-RANGE] A sealed range descriptor must bind the normalized interval with endpoint
+inclusivity, direction, positive limit, ordered returned-key sequence, and either an exhaustion bit or
+a terminal boundary. A tuple containing only an interval and an untyped boundary is insufficient to
+distinguish limit-stop from exhaustion. Returned keys must cross-reference exact entries in the capsule’s
+document map. This is the minimal certificate from which the correct next-key conflict window can be
+reconstructed.
+The model assumes scans are key-interval scans. If a secondary-index update moves a document into or
+out of an interval, the commit log must expose the corresponding delete/insert in the index key space.
+A predicate over document fields that is not represented as key-space mutations is not covered by this
+range proof.
+
+1.5   Capsules and canonical content
+A capsule is
+                              Cap = (tenant, deployment, s, docs, ranges),
+where docs : K ⇀ vd is a finite map and ranges is a finite ordered sequence of range certificates. The
+sequence permits repeated scans; its position is part of the canonical content. Every returned key in
+every range certificate must occur in docs with the exact returned versioned value. A repeated point
+read at the fixed snapshot must agree with any existing map entry.
+The semantic observation set is
+      Obs(Cap) = {Point(k, docs[k]) : k ∈ dom(docs)} ∪ {Range(j, ranges[j]) : j is a valid index}.
+The point atoms intentionally include prewarmed documents and range-returned documents. This may
+duplicate conflict coverage, but duplication is safe and makes Variant A faithful to “entire capsule
+content.”
+[REPAIR W-CANON] The wire decoder is a canonical decoder, not a permissive map deserializer. It
+rejects duplicate map keys, duplicate fields, contradictory entries, invalid range certificates, nonminimal
+integer forms, trailing bytes, and any byte string that is not exactly the canonical encoding of the
+parsed value. A valid write set and a valid declared subset are likewise canonical finite maps/sets with
+no duplicate key. This is necessary because “last duplicate wins” parsing would let attacker-controlled
+bytes have two meanings across parsing and MAC recomputation.
+
+1.6   Seal construction
+Let E(Cap) be the canonical capsule encoding beginning with the fixed domain string
+aster-capsule-v2\0. Let H be unkeyed BLAKE3 with 32-byte output and Fκ keyed BLAKE3
+with a 32-byte key and full 32-byte output. Define
+                                             d = H(E(Cap))
+and
+                   M (ctx, Cap) = aster-blake3-keyed-v1 ∥ lp(cid) ∥ le64(e) ∥ lp(d)
+                                  ∥ lp(tenant) ∥ lp(deployment) ∥ le64(s),
+with the capsule header required to equal the corresponding context fields. The tag is
+                                          τ = Fκ (M (ctx, Cap)).
+
+                                                 6 of 27
+The Capsule Transaction Theorem                                                               Aster v0.7
+
+
+Verification accepts only the exact algorithm identifier, an exact 32-byte tag, a canonical capsule,
+header/context equality, a recomputed digest, and tag equality.
+The requested literal injectivity claim for the full MAC input is impossible: canonical capsule encod-
+ings range over more than 2256 values, while d has only 2256 possible outputs, so distinct capsules
+with one context must collide by the pigeonhole principle. The proof obligation must therefore be
+computational—no PPT adversary can find such a pair—rather than mathematical injectivity of
+(ctx, Cap) 7→ M (ctx, Cap).
+[REPAIR K-PREHASH] The stated assumption that keyed BLAKE3 is a PRF does not by itself
+authenticate the prehashed capsule. The proof additionally assumes collision resistance of unkeyed
+BLAKE3. Without that assumption, a tag for one capsule can be reused for a different capsule with the
+same unkeyed digest without forging the keyed MAC. The minimum no-code repair is to add collision
+resistance to the assumptions ledger. The cleaner future protocol repair is a new seal version that
+MACs the full framed canonical capsule bytes directly; that version needs only the keyed PRF/MAC
+assumption.
+The exact, fixed algorithm prefix is safe without a length prefix because the verifier accepts one
+known constant and strips a known number of bytes before parsing the first length-prefixed field. If
+future algorithms share a key, their top-level tags must be exactly dispatched and disjoint (preferably
+length-framed or prefix-free). BLAKE3’s tree construction and the absence of Merkle–Damgård length
+extension do not repair digest aliasing; this proof uses no length-extension argument.
+
+1.7   Read issuance relation
+For each context, Issued(ctx) is the least set satisfying:
+ 1. The trusted broker may issue an initial capsule at s. Every prewarmed point or range observation
+    must pass the same read policy check that a trap would pass, and its choice must not encode data
+    outside the context’s authorized leakage.
+ 2. Given any sealed capsule in Issued(ctx), the broker verifies it, checks P.read before storage access,
+    evaluates the allowed point or scan at σs , merges the exact result, and issues a new seal over the
+    full merged capsule.
+[REPAIR P-PREWARM] Prewarming is an ideal read grant, not an exception to policy. Each
+prewarmed item is policy-checked and included in the grant transcript. A learned prewarm selector
+may depend on public context and prior authorized access patterns, but not encode another tenant’s
+secret state into the choice of entries.
+A transition is monotone relative to its input capsule. Global monotonicity is not enforced: a Byzantine
+cell can replay an earlier capsule and obtain two branches. The broker stores no “latest” digest.
+
+1.8   Commit protocol and the commit fence
+A request contains the channel-bound context, a sealed capsule, a declared subset S when Variant B is
+used, and a canonical write set W .
+Variant A chooses
+                                             RA = Obs(Cap).
+Variant B chooses an exact subset
+                                           RB = S ⊆ Obs(Cap).
+[REPAIR B-SUBSET] A Variant B declaration references exact observation atoms: a point declaration
+must match the sealed key and exact versioned result; a range declaration must identify an exact sealed
+
+                                                  7 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+range-certificate entry, not a narrowed or rewritten interval. The verifier rejects duplicate declarations
+and any atom not structurally present in the capsule.
+The following abstract operation defines the required atomicity. It is implementable by one commit
+mutex plus storage fencing in a single process, but the retention and lease parts must remain valid
+across failover; in Postgres it naturally maps to a transaction/lock over lease and retention metadata
+plus the commit log.
+ CommitFence(ctx, Cap, R, W):
+   enter a storage-visible commit/validation serialization fence
+   require the committer’s epoch e_now was acquired and fenced at storage
+   read log tip h only after that epoch-acquisition fence
+   read monotonic wall/log time Now and retained low-watermark g
+   require ctx.e == e_now
+   require ctx.s <= h
+   require ctx.s >= Now - Delta                 // product max-age rule
+   require g <= ctx.s                           // actual coverage rule
+   pin the retained interval so g cannot advance past ctx.s
+   evaluate P.write(ctx, W) against policy version p
+   require no committed write in (ctx.s, h] intersects any point/window in R
+   atomically append W at fresh c > h iff:
+       the storage lease still accepts ctx.e, and
+       the policy decision/version p is still current
+   release the fence and retention pin
+
+[REPAIR A-ATOMIC] Conflict validation and append must share one stable horizon h. No successful
+commit may interpose after validation and before this request’s append. On failover, the new epoch’s
+storage acquisition/fence must complete before it reads h; every old-epoch append that succeeds is then
+already in that prefix, and every later old-epoch append is rejected. A local precheck followed by an
+unlocked append is unsound even with one nominal committer thread pool.
+[REPAIR G-RETENTION] The age check alone is not race-free. The committer reads the actual
+retained low-watermark g and holds a retention pin or a global commit/GC fence until append or abort.
+GC may not delete an event in (s, h] while it is being validated.
+[REPAIR P-WRITE] “Write policy at commit time wins” means the policy decision is linearized
+with append. If policy can change independently, the append is conditional on the policy version used
+by V5 or holds a policy read lock. A check that can be revoked before append is not commit-time
+authorization.
+The storage append itself performs the epoch check atomically. If failover races the request, either the
+old-epoch append linearizes before the new epoch’s fence, or the append is rejected. Fresh timestamp
+assignment is part of the append.
+
+1.9    Retention notation
+Let g be the greatest timestamp below which validation history is no longer guaranteed available, so
+every write event in (g, h] is available while pinned. The exact safety condition is g ≤ s. The product
+rule s ≥ Now − ∆ is a convenient hard age bound under a storage contract that retains the whole
+interval newer than Now − ∆; it is not a substitute for reading and fencing the actual low-watermark.
+
+1.10    What the history records
+For every successful mutation commit T , record
+                                      T = (RT , WT , sT , cT , ctxT ).
+
+                                                 8 of 27
+The Capsule Transaction Theorem                                                               Aster v0.7
+
+
+The abstract history contains one read operation for each authenticated observation atom in RT ,
+followed by the atomic application of WT . It does not contain undeclared data dependencies inside
+JavaScript and does not assert that WT is the output of correct tenant code. A replayed request that
+commits twice is two transactions. Exactly-once execution is not part of the theorem.
+Read-only invocations do not enter the commit history. Their broker-served grant transcript is a set of
+reads from one state σs . A Byzantine cell’s final application return value is not authenticated and can
+be arbitrary.
+
+1.11      Notation table
+
+    Symbol               Meaning
+    K, D                 Totally ordered key space and document space.
+    L, Ci , ci           Commit log, a commit record, and its globally increasing timestamp.
+    σt                   State after the log prefix through timestamp t.
+    ctx                  Tenant, deployment, cell id, epoch, and fixed snapshot.
+    Cap                  Canonical capsule with document map and range certificates.
+    ρ, Win(ρ)            A limited-range observation and its next-key validation window.
+    R, W                 Validated authenticated observation set and adversary-chosen policy-
+                         authorized write set.
+    s, h, c              Snapshot timestamp, validation horizon/log tip, and fresh commit timestamp.
+    g                    Retained-log low-watermark; all events in (g, h] are available while pinned.
+    Issued(ctx)          Complete capsules actually sealed by a trusted broker for the context.
+    E, H, Fκ             Injective canonical encoding, unkeyed BLAKE3, and keyed BLAKE3.
+
+
+2      Repairs and final theorem statements
+The following table separates protocol repairs from statement repairs. A statement repair narrows a
+claim that the stateless protocol cannot satisfy; it does not weaken the actual isolation result.
+
+ Label            Kind                     Minimal repair and reason
+ C-               Protocol/assumption      Bind every socket or launch capability to an expected con-
+ CHANNEL                                   text not chosen by the cell. Otherwise a copied capsule plus
+                                           copied public context passes V1 on another cell’s channel.
+ S-               Model/protocol           Require s to be an actual committed prefix and keep all
+ SNAPSHOT                                  reads fixed at s. Otherwise the snapshot theorem is unde-
+                                           fined or torn.
+ R-RANGE          Protocol                 Seal interval semantics, direction, positive limit, ordered
+                                           result keys, and exhausted-versus-boundary stop. This is
+                                           exactly the information needed to derive a phantom-safe
+                                           observed window.
+ W-CANON          Protocol                 Canonical-decode before verification; reject duplicates, con-
+                                           tradictory entries, trailing bytes, and malformed ranges.
+                                           This removes parser/MAC ambiguity.
+ K-               Assumption, or future    Add collision resistance of unkeyed BLAKE3 to the imple-
+ PREHASH          protocol                 mented v2 proof. A future seal may instead MAC the full
+                                           framed canonical bytes and remove this extra assumption.
+
+
+
+                                                9 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+ Label          Kind                       Minimal repair and reason
+ P-             Protocol                   Treat every initial prewarm item as a policy-checked read
+ PREWARM                                   grant. Otherwise confinement fails before the first trap.
+ B-SUBSET       Protocol                   Variant B declarations are exact references to sealed atoms,
+                                           not attacker-edited ranges or values. Otherwise “subset”
+                                           has no precise authenticated meaning.
+ A-ATOMIC       Protocol                   Serialize validation and append at one horizon. Without
+                                           this, two requests can both validate against the same prefix
+                                           and append a nonserializable read–write cycle.
+ G-        Protocol                        Check the actual low-watermark and pin it against GC. An
+ RETENTION                                 age check followed by concurrent truncation is a check-then-
+                                           use race.
+ P-WRITE        Protocol                   Tie write-policy authorization/version to append. This
+                                           implements the stated “commit-time policy wins” rule.
+ T1a-           Statement                  “Issued complete capsule,” not “latest capsule” or “all reads
+ SCOPE                                     actually used.” Earlier issued capsules remain valid and
+                                           can be forked.
+ T1b-           Statement                  The grant-transcript simulator applies exactly to the read
+ SCOPE                                     plane. The full protocol additionally exposes commit con-
+                                           trol results, especially conflict bits over authorized windows.
+ Q-SCOPE        Statement                  A query theorem covers broker-served observations, not
+                                           arbitrary application output emitted by a Byzantine execu-
+                                           tor.
+ R-AGE          Statement/protocol         Universal retention safety depends on actual coverage g ≤ s;
+                                           s ≥ Now − ∆ is the chosen hard admission rule under the
+                                           retention contract.
+
+Counterexample 2.1 (Why T1a cannot mean “latest”). Let Cap0 be the initial sealed capsule and
+let the broker issue Cap1 ⊃ Cap0 after a read. The cell computes W from the additional value in Cap1
+but submits the still-valid seal on Cap0 . V1 accepts. No MAC forgery or splice occurred. A stateless
+verifier cannot distinguish this trace from an application that stopped at Cap0 and issued a blind write.
+Preventing it requires stateful anti-rollback or a trusted observable-use mechanism, neither of which is
+in the proposed protocol.
+Counterexample 2.2 (Why keyed-PRF security alone is insufficient). Literal injectivity is impossible
+for any 256-bit prehash over the unbounded set of finite capsules: collisions exist by counting. More
+sharply, the assumptions as originally written permit a hypothetical world in which keyed BLAKE3 is a
+secure PRF while the separately keyed-mode-independent unkeyed hash H maps every capsule encoding
+to one constant. A tag obtained for one capsule would then verify for every other capsule with the same
+context. This is not a claimed practical attack on BLAKE3; it is a proof-theoretic countermodel showing
+that the desired theorem does not follow from the stated assumption. Collision resistance of H, or direct
+MACing of the full encoding, closes the computational gap.
+Counterexample 2.3 (Why T1b needs a control transcript). Consider two executions with the same
+context and the same allowed point-read transcript at snapshot s, returning x = 0. In one execution no
+later write touches x; in the other, another transaction writes x after s. Submitting the same declared
+read and an authorized write succeeds in the first execution and aborts in the second. A simulator given
+only the original grant transcript cannot determine which result to emit. The conflict bit is authorized
+control leakage and must be included in the full ideal functionality.
+
+
+
+                                                10 of 27
+The Capsule Transaction Theorem                                                                  Aster v0.7
+
+
+2.1    T1a – issued-capsule authenticity
+[REPAIR T1a-SCOPE] Stateless verification can prove that an accepted capsule was issued for
+the exact context, but cannot prove that it was the latest branch or that it contains every value the
+executor actually used. This statement repair is minimal because adding freshness alone does not reveal
+prewarm/cache use; the stronger property needs anti-rollback state plus trusted use observation.
+Theorem 2.4 (T1a: read-set unforgeability, repaired). Assume: (i) Fκ is an EUF-CMA-secure MAC
+(equivalently here, a secure PRF used with a full tag); (ii) unkeyed BLAKE3 is collision resistant; (iii)
+canonical encoding and the outer framing are injective as proved in Lemmas 3.1 and 3.2; (iv) verification
+performs the exact canonical and context checks of Section 1; and (v) all key holders are trusted and
+invoke sealing only through the issuance relation.
+For every PPT coalition of cells, the probability that V1 accepts (ctx, Cap, τ ) with Cap ∈
+                                                                                          / Issued(ctx) is
+at most
+                                AdvFeuf−cma (B1 ) + Advcr
+                                                       H (B2 ) + negl(λ).
+The theorem authenticates one complete capsule actually issued for the exact context. It does not assert
+that the capsule is the latest issued capsule, that every branch has been merged, or that its contents are
+the complete causal dependencies of the cell’s computation.
+Immediate consequences are: a capsule for a different cid, epoch, tenant, deployment, or snapshot
+cannot be transplanted without a fresh MAC forgery; entries from two sealed capsules cannot be
+spliced into an unissued union; and payload substitution under a distinct canonical encoding requires
+either a hash collision or a MAC forgery. Replay of an earlier capsule under the exact same context is
+deliberately outside the word “forgery.”
+
+2.2    T1b – confinement and explicit leakage
+[REPAIR T1b-SCOPE] The read plane is simulatable from grants alone. Commit responses
+additionally reveal explicit control predicates, so the whole-protocol ideal transcript must name them.
+This is the minimum statement repair because Counterexample 2.3 uses only one conflict bit.
+Definition 2.5 (Ideal read-grant functionality Fgrant ). For each context, Fgrant fixes σs . On an
+initial prewarm item or adaptive read request q, it evaluates the read policy at that time. If denied,
+it returns only a denial code. If allowed, it returns exactly Readσs (k) or Scanσs (I, ℓ) and records the
+grant. It exposes message framing, result lengths, request identities, and policy outcomes, but no timing,
+cache, scheduler, or other side channel. Policy allow/deny outcomes are therefore part of the explicitly
+authorized leakage; a data-dependent policy cannot be hidden by this protocol.
+Definition 2.6 (Ideal full functionality FAster ). FAster contains Fgrant and an ideal commit operation
+implementing the repaired V2–V5 and atomic append. Its control transcript includes rejection class,
+conflict/no-conflict, stale-snapshot/epoch outcomes, and successful commit timestamp. It never releases
+a document value except through an allowed read grant.
+Theorem 2.7 (T1b: confinement/non-interference, repaired). For every PPT coalition controlling
+contexts J:
+(a) The coalition’s untimed real read-plane view is computationally indistinguishable from a simulation
+    given only the public contexts and the joint ideal grant transcript produced by Fgrant . Therefore it
+    learns nothing beyond that explicit transcript; in particular, it learns no document payload beyond
+    the adaptive transitive closure of the union of its policy-authorized grants.
+(b) The coalition’s untimed whole-protocol view is computationally indistinguishable from a simulation
+    given the contexts and the transcript of FAster . In addition to grants, this transcript explicitly leaks
+    control information about epoch, retention, policy, and whether a declared authorized observation
+    window changed before commit. It leaks no value from an unauthorized key or range.
+
+                                                  11 of 27
+The Capsule Transaction Theorem                                                                  Aster v0.7
+
+
+Colluding cells may share the union of their authorized payloads. T1a remains per context: a capsule
+accepted on context j is an issued capsule for context j, except with negligible probability.
+
+2.3    T2 – Byzantine strict serializability
+[REPAIR Q-SCOPE] For a Byzantine read-only invocation, the authenticated object is the broker-
+served grant transcript, not the cell’s arbitrary outward return value. No protocol element MACs that
+application output, so narrowing the query claim to served observations is necessary.
+Theorem 2.8 (T2: strict serializability of committed mutation summaries). Under the model and
+repairs above, except with the negligible cryptographic failure probability from T1a, every execution with
+arbitrarily many Byzantine cells, arbitrary request interleavings, retries, and lease failovers has the
+following property.
+Let Hc be the set of successful mutation commits, each summarized as (RT , WT , sT , cT ). There exists a
+legal serial history ordered by increasing cT such that, immediately before applying WT , every point and
+range result in RT equals its evaluation in the serial state at that position. This serial order respects
+real time between successful mutation operations whose broker-visible operation intervals do not overlap.
+The atomic append is the linearization point.
+The theorem is deliberately about the validated, authenticated read observations and applied writes. It
+does not claim that JavaScript executed correctly, that RT contains every datum the executor used, or
+that WT satisfies application invariants beyond P.write.
+For a read-only invocation at snapshot s, every broker-served allowed observation equals the corresponding
+read in the single prefix state σs . These reads are never torn and are serializable at s, but they may be
+stale and need not respect real-time freshness. The cell’s final application-level response is not covered.
+Remark 2.9 (Versus FoundationDB). FoundationDB’s client obtains a read version, performs reads,
+and sends read/write conflict ranges at commit; resolvers check the submitted read ranges against recently
+modified ranges, and snapshot reads are omitted from the conflict set. The exact Aster delta proved
+here is provenance authenticity of each submitted observation: the executor cannot fabricate a value,
+version, or sealed range window. The stronger sentence “the server now knows the complete actual read
+set” is false for the stateless protocol because rollback/forking and Variant B omission remain possible.
+Thus Aster removes trust in the contents of the resolver input, not trust in semantic completeness.
+FoundationDB’s architecture and resolver algorithm are described in Zhou et al. [1].
+
+2.4    T3 – Byzantine equivalence and the honesty boundary
+Theorem 2.10 (T3: authorized-client trace equivalence). For every successful transaction request
+produced by a Byzantine cell, except with the negligible failure probability of T1a, there exists a protocol-
+following application client with the same context, the same complete sequence of read grants obtained
+by that cell in the execution, and the same commit-time write authorization that could submit the
+identical accepted summary (R, W, s, c). Here “protocol-following” means honest about wire syntax,
+broker issuance, and policy checks; it does not mean honest application semantics.
+The witness program may retain and replay an earlier issued capsule exactly as the stateless protocol
+permits, may treat any grant as unused, and may contain W as a literal constant. Consequently this is
+an external-trace theorem, not a claim that the Byzantine computation was honestly derived from R.
+If policy has the tenant-confinement property
+
+                        P.write(ctx, W ) = allow =⇒ dom(W ) ⊆ Ktenant,deployment ,
+
+then compromising the executor gives no database effect beyond that of a malicious application already
+confined to the same policy envelope: it may issue garbage, blind writes, retries, and self-conflicting
+
+                                                  12 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+requests to authorized keys, but cannot read unauthorized payloads, write outside policy, forge snapshot
+observations, or break history-level serializability.
+The theorem holds for Variant B even when the Byzantine cell omits a read that actually influenced
+its computation. The omission changes the transaction into an externally indistinguishable authorized
+blind or less-dependent write. It can destroy the malicious tenant’s own semantic invariant, but it does
+not create a new cross-policy or serialization power.
+
+2.5   Lemma R – retention safety
+[REPAIR R-AGE] The exact safety predicate is retained conflict coverage g ≤ s. The age rule
+s ≥ Now − ∆ remains mandatory as the product’s uniform admission rule under its stated retention
+contract, but an implementation must also inspect and pin the actual low-watermark.
+Lemma 2.11 (R: retention coverage and necessity). Fix a validation horizon h. For a validator whose
+decision is based on committed write events, V4 is sound for every possible read set at snapshot s if
+the validator has a complete immutable representation of all write events in (s, h] while it validates.
+Conversely, if an event in (s, h] may be absent from every consulted conflict structure, there is an
+execution and a point read for which V4 accepts a stale observation. Therefore the exact admission
+condition is coverage, represented here by g ≤ s under a retention pin.
+Under the product contract that events older than Now − ∆ may be removed, the hard rule s ≥ Now − ∆ is
+necessary for a uniform no-special-case guarantee based only on that contract. Long-running invocations
+have no commit liveness guarantee after their snapshot ages past ∆ and must retry from a fresh snapshot.
+
+2.6   C1 – read-plane scale-out
+Corollary 2.12 (C1: read-plane scale-out). Any trusted process holding κ, able to read the fixed MVCC
+snapshot, and enforcing the same read policy may verify, grow, and reseal a capsule. It need not hold
+the writer lease. Only the single committer executes the repaired commit fence and storage append.
+Therefore read brokers may scale independently without changing T2, because the committer re-verifies
+every capsule and validates its observations against the authoritative commit history. A read broker
+with stale epoch information can at worst produce a capsule whose later commit aborts under V2.
+
+2.7   Out-of-scope properties
+No liveness is claimed against Byzantine cells: a cell may never submit, may request denial, may
+replay stale capsules, or may intentionally force aborts. Denial-of-service, resource exhaustion, fairness,
+scheduler attacks, timing/cache/speculation side channels, and compromise of a key-holding broker
+are outside the theorem. Exactly-once request execution is also outside scope; a replayed request is
+revalidated and may commit as another serial transaction.
+For an honest cell in a quiescent system, obstruction freedom does hold under ordinary availability
+conditions: if its snapshot remains retained, its epoch stays current, policy remains authorizing, and no
+committed write intersects its declared observations, the commit fence finds no conflict and appends.
+
+
+3     Proofs
+3.1   Canonical encoding and outer-message injectivity
+The proof uses a typed, canonical grammar. Byte strings are encoded as an eight-byte little-endian
+length followed by exactly that many bytes. Fixed-width integers have one representation. Sum types
+carry a fixed variant tag before the variant payload. Finite lists carry a length/count and preserve order.
+
+
+                                                 13 of 27
+The Capsule Transaction Theorem                                                                  Aster v0.7
+
+
+Finite maps carry a length/count, keys in strict canonical order, and no duplicate keys. Documents
+recursively use the same rules for field names and tagged values. The fixed capsule domain string occurs
+at a grammar-known offset zero.
+Lemma 3.1 (Canonical capsule encoding is injective). For every two well-formed capsules C, C ′ , if
+E(C) = E(C ′ ) then C = C ′ .
+
+Proof. Define a deterministic decoder by structural recursion on the capsule type.
+At the root, the decoder first consumes the exact fixed domain string. This string need not be length-
+prefixed because its length and expected bytes are constants in the grammar. It then decodes the
+product fields in the one specified order.
+For a length-prefixed byte string, the next eight bytes determine a unique unsigned length n, and the
+decoder consumes exactly the next n bytes. Hence no bytes belonging to one string can be reallocated
+to the next field. For a fixed-width integer, the next eight bytes determine exactly one integer. For an
+option or enum, the variant tag determines both the variant and the grammar of the following payload.
+For a list, the declared count determines the number of recursively decoded elements. For a map, the
+declared count does the same, and strict key ordering plus duplicate rejection gives one mathematical
+finite map rather than several wire descriptions of it. Recursive document values terminate because
+every encoded value is finite and each recursive branch consumes a positive, bounded portion of the
+input.
+The range-certificate decoder additionally checks the structural invariants in Definition 1.1; thus a byte
+string cannot decode both as an exhausted certificate and as a boundary certificate. After the last field,
+canonical decoding requires end of input, so trailing bytes cannot be ignored.
+It follows by induction on the type tree that decoding E(C) returns exactly C and consumes all bytes.
+If E(C) = E(C ′ ), applying this deterministic decoder to the common byte string returns both C and
+C ′ , hence C = C ′ .
+Lemma 3.2 (Outer MAC framing is injective in context and digest). Let d, d′ be 32-byte strings and
+let the accepted algorithm tag be the one fixed constant. If
+
+                                         M (ctx, d) = M (ctx′ , d′ ),
+
+then the cid, epoch, digest, tenant, deployment, and snapshot fields are pairwise equal.
+
+Proof. Remove the common fixed algorithm prefix of known length. The next field is a length-prefixed
+cid, so equality of the remaining byte strings gives equality of its length and bytes. The next eight bytes
+give equal epochs. The next length-prefixed field gives equal digests; although the digest is already
+fixed-size, framing makes the parse explicit. The next two length-prefixed fields give equal tenant and
+deployment byte strings. The final eight bytes give equal snapshots, and end-of-input prevents a suffix
+ambiguity. This is a direct left-to-right parse; no field boundary depends on the contents of a later
+field.
+Proposition 3.3 (The implemented outer message is not injective in the full capsule without hash
+collision resistance). Distinct capsules with the same context can produce the same outer MAC input
+exactly when their unkeyed digests collide.
+
+Proof. For a fixed context, the only capsule-dependent component of M is d = H(E(C)). Therefore
+M (ctx, C) = M (ctx, C ′ ) if and only if H(E(C)) = H(E(C ′ )). Lemma 3.1 ensures C ̸= C ′ implies
+E(C) ̸= E(C ′ ), but injectivity of the encoding does not imply injectivity of a fixed-length hash. Collision
+resistance is the computational condition excluding an efficiently found pair.
+
+
+                                                  14 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+Remark 3.4 (Direct-MAC seal alternative). A future seal input of the form
+                           aster-capsule-v3 ∥ lp(cid) ∥ le64(e) ∥ lp(E(C))
+with the remaining context fields framed either inside E(C) or outside it would be injective by Lemmas 3.1
+and 3.2. The T1a reduction would then have only the MAC-forgery case. BLAKE3 is streaming, so
+direct MACing does not require materializing a second copy of the capsule.
+
+3.2   Proof of T1a
+Proof of Theorem 2.4. Model all trusted issuance calls, over all contexts controlled by the coalition, as
+chosen-message queries to a single MAC oracle. The reduction records, for every oracle query, the exact
+outer message and the context/capsule pair that caused it. This gives the adversary at least the power
+of the real system because it may adaptively request all policy-allowed broker seals and may collude
+across contexts.
+Suppose the adversary eventually submits (ctx∗ , C ∗ , τ ∗ ) that passes all canonical, context, algorithm,
+and tag-length checks, but C ∗ ∈
+                               / Issued(ctx∗ ). Let
+                                           M ∗ = M (ctx∗ , C ∗ ).
+There are two exhaustive cases.
+Case 1: M ∗ was never queried to the MAC oracle. The verifier’s acceptance means τ ∗ = Fκ (M ∗ ).
+The reduction outputs (M ∗ , τ ∗ ) as a valid tag on a fresh message. This is an EUF-CMA forgery. It
+does not matter whether τ ∗ was copied from some other issued capsule or happened to equal another
+tag: validity on the fresh message is the forgery event.
+Case 2: M ∗ was queried before. Let that query have arisen from an issued pair (ctx′ , C ′ ). By
+Lemma 3.2, equality of outer messages gives equality of cid, epoch, tenant, deployment, snapshot, and
+digest. Hence ctx′ = ctx∗ in every field relevant to verification and
+                                        H(E(C ′ )) = H(E(C ∗ )).
+If C ′ = C ∗ , then C ∗ was issued for ctx∗ , contradicting the winning condition. Therefore C ′ ̸= C ∗ .
+Lemma 3.1 yields E(C ′ ) ̸= E(C ∗ ), so the reduction outputs the two distinct encodings as a collision in
+H.
+Every accepted unissued capsule therefore induces either a fresh-message MAC forgery or an unkeyed
+hash collision. The exact-algorithm and exact-tag-length checks remove downgrade and truncation cases
+rather than requiring separate reductions. The fixed tags are domain separators because verification
+does not accept a different parser under the same tag.
+The reduction is multi-context and thus already covers collusion. In particular:
+• A capsule copied from cid a to a channel bound to cid b changes the framed cid and is Case 1 unless
+  the adversary forges.
+• Changing the epoch, tenant, deployment, or snapshot likewise changes the outer message.
+• Taking entries from two issued capsules and forming a union changes the canonical capsule. If the
+  union was not itself issued, it is Case 1 or Case 2’s collision.
+• Replacing a version, document, absence marker, range endpoint, limit, returned key, or exhaustion
+  bit changes the canonical capsule.
+An earlier complete capsule is different: its exact message was genuinely queried and its exact pair
+is in Issued(ctx). Accepting it is replay, not a T1a failure. This proves the theorem with the stated
+advantage bound.
+
+                                                 15 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+3.3   Proof of T1b
+Proof of Theorem 2.7(a). Fix a coalition and an arbitrary adaptive strategy. The simulator receives
+every public context and the ordered ideal grant transcript, including initial prewarm items, policy
+denials, exact point/range answers, and public message lengths.
+The simulator reconstructs every capsule state that an honest broker would produce along each branch.
+It can do so because a capsule transition is a deterministic merge of the prior canonical capsule and the
+next transcript answer. It computes the public unkeyed digest and outer message for each reconstructed
+capsule.
+To simulate tags, the simulator uses a lazy random function table T . On the first occurrence of an
+outer message M , it samples a uniform 256-bit string and stores T [M ]; on repeats it returns the stored
+value. For a submitted capsule/tag pair, it performs all public canonical/context checks and accepts
+exactly the pairs present in its issuance table. It rejects other tags.
+Replace the real keyed-BLAKE3 function by a truly random function. The distinguishing loss is the
+PRF advantage. In the random-function hybrid, issued tags have exactly the simulator’s distribution.
+The only remaining behavioral difference is that the real verifier might accept a nonissued pair. By the
+T1a reduction, this occurs only with the MAC-forgery/hash-collision probability. All successful allowed
+read responses are already in the ideal transcript; all denied requests are rejected before database access.
+Therefore, excluding timing and other named side channels, no other database-dependent value reaches
+the coalition.
+Adaptivity causes no difficulty: the transcript and simulation proceed online, and the coalition’s next
+request may be any function of its prior simulated view. For multiple colluding contexts the simulator
+runs one shared random-function table, matching the real shared key, and gives the coalition the union
+transcript. This proves computational indistinguishability and the payload non-interference claim.
+
+Proof of Theorem 2.7(b). Counterexample 2.3 shows that the read-grant transcript alone is insufficient
+once commits are visible. Give the simulator instead the ordered outputs of FAster : V1-style format
+errors, epoch and retention outcomes, write-policy outcomes, conflict outcome, and successful commit
+timestamp. The simulator handles capsule tags exactly as in part (a) and emits the supplied control
+result for each ideal commit call.
+By construction, the ideal commit function touches hidden database state only to evaluate conflict
+predicates over exact declared authenticated windows and to apply an authorized write. Its output
+contains no document value. Therefore a difference in an unauthorized key that does not alter an
+allowed grant, public policy/epoch/retention metadata, or a declared authorized conflict window cannot
+alter the ideal transcript. The real and ideal protocol encodings are indistinguishable by the same
+PRF/T1a hybrid. This proves the repaired whole-protocol confinement statement.
+Remark 3.5 (Meaning of “transitive closure”). The phrase means adaptive closure: after receiving one
+allowed payload, a cell may compute the key or range for the next request, which may reveal another
+allowed payload, and so on. It does not mean closure under arbitrary database relations the policy did
+not authorize. A coalition’s closure is taken over the union of its contexts’ grants.
+
+3.4   Read-stability lemmas
+Lemma 3.6 (Point stability). Let s ≤ h. If ¬Changed({k}; (s, h]), then
+
+                                         Readσs (k) = Readσh (k).
+
+This includes never-present values, tombstones, and live documents.
+
+
+                                                 16 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+Proof. The state of a point key changes only when a commit contains that key in its write-set domain.
+By hypothesis no such commit occurs after s and through h. Thus the latest record at or before h is
+the same record, or the same absence of a record, as at or before s. The version option and document
+option are therefore identical.
+Lemma 3.7 (Limited-range stability and phantom protection). Let ρ be a semantically valid ascending
+range certificate at snapshot s. If
+                                    ¬Changed(Win(ρ); (s, h]),
+then
+                                         Scanσh (I, ℓ) = Scanσs (I, ℓ)
+including ordered keys, versions, and documents.
+
+Proof. Write the snapshot answer as ⟨k1 , . . . , km ⟩.
+Exhausted case m < ℓ. Here Win(ρ) = I. No key in I is written in (s, h]. By the point-stability
+argument applied to every key that could change, the live/dead status and value of every key in I are
+unchanged. The complete ordered live-key sequence in I is therefore identical at s and h, and taking its
+first ℓ elements gives the same answer. In particular, an insertion in the suffix after km would be a
+write in I and is rejected; this is the exhaustion-gap phantom case.
+Boundary case m = ℓ. Let b = km . The window is I≤b = {k ∈ I : k ≤ b}. At snapshot s, exactly
+the returned ℓ live keys occur in I≤b : if another live key in that prefix existed, the first-ℓ ordered
+answer would differ. No write occurs in this prefix, so each returned key remains live with the same
+version/document, no returned key is deleted, and no absent or tombstoned key in the prefix is inserted
+or resurrected. Hence the live ordered sequence in I≤b remains exactly k1 , . . . , kℓ . Any write outside
+the window is to a key strictly greater than b within I, or outside I entirely. Such a key cannot precede
+kℓ in an ascending scan. Therefore the first ℓ results at h are again the same sequence with the same
+values.
+These cases exhaust the well-formed certificate grammar. Updates are puts and therefore write events.
+Deletes of returned keys and insertions into gaps are write events in the window. The lemma follows.
+Lemma 3.8 (Authenticated observations are current at the append point). For every successful
+transaction T validated at stable horizon hT , every atom in RT evaluates in σhT to the value sealed at
+sT .
+
+Proof. By T1a, except with negligible probability, every atom comes from a broker-issued capsule for
+ctxT . Trusted issuance evaluated it at the fixed state σsT . V4 rejects if a point key or range window
+has any write in (sT , hT ]. Apply Lemma 3.6 to point atoms and Lemma 3.7 to range atoms.
+
+3.5    Retention safety
+Proof of Lemma 2.11. Sufficiency. Suppose every committed write event in (s, h] is present in an
+immutable log view or an equivalent lossless conflict structure during validation. V4 examines each point
+key and each range window. If V4 finds no intersection, the hypotheses of Lemmas 3.6 and 3.7 hold, so
+every accepted observation remains valid at h. This is exactly the fact later used by serialization.
+Necessity for a universal guarantee. Suppose some write event Cx at timestamp x ∈ (s, h] may
+be absent from all consulted conflict data. Choose a key k ∈ dom(Wx ). Let a transaction read k at s,
+obtaining value v0 , and later submit an otherwise authorized write to a different key y. Let Cx change
+k to v1 ̸= v0 . Arrange that no retained event touches k. The incomplete validator reports no conflict
+and commits the transaction. Immediately before its append, the serial state contains v1 , while its
+
+
+                                                   17 of 27
+The Capsule Transaction Theorem                                                                   Aster v0.7
+
+
+authenticated read says v0 . No serial execution at the append point can realize that read. Thus a
+missing event can make V4 unsound.
+A concrete truncation trace is: T reads k = 0 at old snapshot s; another transaction commits k = 1;
+time advances until that write is garbage-collected; T validates against the truncated suffix and writes
+y = 1. This is the required stale-read counterexample.
+The actual coverage condition is g ≤ s, because the validator needs the open interval (s, h]. The
+retention pin prevents a sweeper from changing a true coverage condition into a false one between the
+check and the scan. Under the stated ∆ contract, a snapshot older than Now − ∆ has no guaranteed
+coverage; the hard V3 rule therefore forces retry and provides the stated liveness bound.
+
+3.6    Atomicity of validation and append
+Counterexample 3.9 (Unlocked validation is unsound). Let T1 and T2 share snapshot s with x = y = 0.
+Let T1 read y = 0 and write x = 1, while T2 reads x = 0 and writes y = 1. If both validate concurrently
+against the same tip h = s, both see no conflict and may append. In the order T1 ; T2 , T2 ’s read of x is
+false; in the order T2 ; T1 , T1 ’s read of y is false. Hence no serial order realizes both reads. Serializing
+each validation with its append makes whichever transaction validates second see the first writer in (s, h]
+and abort.
+Lemma 3.10 (Commit-fence horizon). For every successful commit T , there is a unique horizon hT
+such that: (i) hT is the timestamp of the log tip immediately before T ; (ii) V4 covers (sT , hT ]; (iii)
+no other successful commit lies between that validation and T ’s append; and (iv) cT > hT is the next
+append in the total order.
+
+Proof. The repaired commit fence serializes successful append decisions in storage-visible order. A
+committer for a newly acquired epoch may not read h until its storage lease acquisition/fence has
+completed. Hence every old-epoch append that succeeds is ordered before that acquisition and is already
+present in the subsequently read prefix; every old-epoch attempt after the fence is rejected. While the
+request then holds the commit/validation fence, no current-epoch append can interpose between its
+validation and append. Thus every successful request observes a stable pre-append tip and immediately
+appends after it in the global storage order.
+
+3.7    Epoch fencing across failover
+Lemma 3.11 (Epoch block order). Under the storage lease assumption, no commit carrying epoch e is
+ordered after a successful commit carrying epoch e′ > e.
+
+Proof. Let the storage-level acquisition/fence for e′ be the point after which append attempts from
+epochs below e′ are rejected. A successful e′ append occurs at or after that fence. Any e append that
+races the fence has two possibilities: it linearizes before the fence and therefore before every e′ append,
+or it reaches the atomic epoch check after the fence and is rejected. There is no third possibility in
+which it succeeds after an e′ append. Because timestamp assignment is part of the same atomic append,
+the timestamp order agrees with this epoch order.
+
+3.8    Proof of T2
+Proof of Theorem 2.8. Take an arbitrary finite prefix of the successful mutation commits and order it
+by strictly increasing timestamp:
+                                           T1 , T2 , . . . , Tn .
+
+
+
+
+                                                  18 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+We prove by induction that applying their write sets in this order yields the actual database state and
+that each RTi is legal in the state immediately before WTi . Because the argument applies to every finite
+prefix and the timestamp order is globally fixed, it also defines the legal serial order for an infinite
+execution.
+The base state is the committed prefix before T1 . By Lemma 3.10, the state immediately before T1
+is σhT1 . Lemma 3.8 says every authenticated observation in RT1 evaluates to its sealed result in that
+state. Applying WT1 atomically is exactly the actual append semantics, yielding the next state.
+For the induction step, assume the serial application through Ti−1 equals the actual log state immediately
+after cTi−1 . The log prefix immediately before Ti consists of exactly all successful commits with timestamp
+below cTi , including any transactions not named in a smaller subhistory but ordered by the same rule.
+Thus the serial prestate for Ti is σhTi . Lemma 3.8 again makes every declared point/range observation
+legal in that prestate. Applying WTi matches the atomic log append. The invariant follows.
+This constructs a legal serial history in commit order. Write-write conflicts need not abort: two blind
+writes are legal serial overwrites in timestamp order. Read-write cycles are broken because once the
+earlier writer appends, a later transaction that declared the affected observation sees a write in (s, h]
+and aborts.
+Real-time consistency follows from the linearization point. A successful broker operation’s append
+occurs after its invocation reaches the committer and before the broker reports success. If successful
+operation T completes before successful operation U begins, then T ’s append precedes U ’s invocation
+and therefore precedes U ’s append, so cT < cU .
+Retries and failed attempts do not enter the committed history. Replays that succeed more than once
+enter as separate serial transactions. Lemma 3.11 shows that failover cannot insert a stale-epoch commit
+after a newer-epoch commit. The proof is indifferent to the cell’s internal computation and applies to
+both variants because it uses only the R actually selected and validated.
+For a read-only invocation, trusted issuance evaluates every grant at the fixed σs , so the grant transcript
+is a legal read-only transaction at that prefix. No backward validation is performed, so if s is stale
+relative to a completed update, the query need not satisfy strict real-time freshness. Finally, a Byzantine
+cell can transform or fabricate its outward application result; the theorem authenticates the broker’s
+observations, not that output.
+
+3.9   Proof of T3
+Proof of Theorem 2.10. Fix one successful Byzantine-produced request and the complete finite read-
+grant transcript that preceded it. By T1a, its accepted capsule C was actually issued for the request
+context, except with negligible probability. Every successful grant in the real transcript arose from a
+finite authorized issuance branch. Let the accepted write set be W .
+Construct a client program AC as follows. Under the same external schedule, it reproduces the successful
+grant requests and branch choices from the real transcript, thereby obtaining the same complete sequence
+of grants. It retains every bearer capsule, including C, and finally submits the same canonical request.
+Under Variant A it submits the earlier or latest selected capsule C and hence R = Obs(C); the stateless
+protocol does not require that C be the most recently issued branch. Under Variant B it submits the
+same exact subset S. The program contains all query choices and W as literal constants and therefore
+need not causally depend on any omitted observation. All objects have polynomial size because they
+occurred in a PPT execution, so this is a valid finite protocol client.
+The program follows every protocol rule: it uses a broker-issued seal, declares only allowed exact subset
+atoms, and requests only the write the original request submitted. Since the original request committed,
+V5 proves that W was authorized at its append point. Replacing the Byzantine computation by AC
+
+                                                 19 of 27
+The Capsule Transaction Theorem                                                                Aster v0.7
+
+
+while retaining the same external schedule presents the committer with the identical bytes and therefore
+the identical validation outcome and commit timestamp.
+Rollback causes no problem for the existential witness. If the Byzantine cell had later or forked capsules,
+AC may reproduce those same grants, retain them as unused, and still submit the accepted earlier
+capsule because the repaired theorem intentionally preserves stateless bearer replay. Under Variant B,
+prewarmed or actually observed but undeclared data is likewise treated as unused by the witness. This
+establishes external-trace equivalence with the same complete grant transcript.
+The policy consequence is immediate: T1b confines reads to grants, V5 confines writes to the policy
+envelope, T1a prevents fabricated observations, and T2 orders all successful effects. What remains is
+exactly the power to choose bad authorized writes and bad application outputs, which is the power of a
+malicious or buggy application inside the same capability boundary.
+
+3.10    Proof of C1 and obstruction-freedom remark
+Proof of Corollary 2.12. Read issuance requires the key, trusted policy enforcement, and access to σs ;
+it never appends. A read broker’s output is later checked by the committer under the same key and
+context. T2 depends on trusted issuance plus authoritative commit-time validation, not on the read
+broker holding the lease. Therefore adding trusted read brokers adds MAC-oracle capacity inside the
+TCB but no new serialization point. Only the committer’s log horizon and append determine the serial
+order.
+
+For an honest request in a quiescent interval, every V4 predicate is false, so after the repaired epoch,
+retention, and policy checks the append succeeds. A failover or retention expiry may force retry;
+Byzantine actors can always deny liveness by load or self-abort, which remains out of scope.
+
+
+4      Attack appendix: all thirteen enumerated obligations
+The briefing calls these “twelve” obligations but numbers thirteen. This appendix discharges all thirteen.
+Some attacks are rejected; rollback and under-declaration are instead absorbed into the repaired theorem
+boundary because the stateless protocol intentionally permits them.
+
+1. Capsule replay across snapshots
+A tag for snapshot s includes le64(s) in the outer MAC input, while the canonical capsule header
+also contains s. Replacing the commit context by s′ ̸= s changes the outer message and fails V1 by
+Theorem 2.4; a mismatched capsule header is rejected before MAC acceptance. Submitting the old
+capsule with its exact old context is ordinary bearer replay, not cross-snapshot mixing. It must still
+pass the current epoch check, the hard age and low-watermark checks, and V4 over (s, h]. Thus an old
+observation either remains conflict-free and is legal at the append point, or the request aborts.
+
+2. Cross-cell transplant
+On a channel labeled with cid b, the broker verifies with cid b, not a cid supplied by the payload. A
+capsule sealed for cid a ̸= b therefore changes the framed MAC message and fails by T1a. Without
+Repair C-CHANNEL, copying both the capsule and public context a would succeed, which is why
+channel binding is a load-bearing requirement. A coalition may ask the actual holder of context a to
+submit on its own channel; that is exercise of a’s authorized capability, and the coalition is already
+allowed to share a’s authorized payloads.
+
+
+
+                                                 20 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+3. Cross-epoch replay and a commit racing failover
+Changing epoch e to e + 1 invalidates V1 because epoch is MAC-bound. Keeping e makes V2 fail once
+the authoritative lease epoch is e + 1. For an in-flight race, the storage-level epoch check occurs inside
+atomic append. Lemma 3.11 gives the exhaustive order: the e append linearizes before the new fence
+and receives an earlier commit timestamp, or it is rejected. No e commit can appear after an e + 1
+commit.
+
+4. Capsule splicing, rollback, and fork
+Splicing entries from two capsules into a union not itself resealed changes the canonical capsule and
+requires a MAC forgery or unkeyed hash collision under T1a. Rollback is different: an earlier complete
+capsule was genuinely issued and remains valid. Under Variant A, all observations in the selected
+old capsule are validated, but later branch observations are absent. Under Variant B, the cell can
+additionally select a subset. Counterexample 2.1 disproves any stronger actual-read-completeness claim.
+T2 survives because it serializes the selected authenticated R; T3 survives because an authorized witness
+client can stop at that capsule and issue W as a blind constant.
+
+5. Phantoms, including the exhaustion gap
+For a full limited result k1 , . . . , kℓ , the sealed window is every key in the requested interval through
+kℓ . An insert such as k4′ between returned keys is a write in that window and V4 aborts. If only three
+results are returned with limit seven, the certificate is marked exhausted and the window is the entire
+interval; an insertion after the third result but before the range end is therefore also caught. Lemma 3.7
+proves both cases and explains why writes beyond the terminal boundary of a full result cannot affect
+the first ℓ keys.
+
+6. Absence flips
+A point observation of (None, None) or of a tombstone is an authenticated point atom on k. A
+concurrent insert, delete, or update has k ∈ dom(Wi ) and makes Changed({k}; (s, h]) true. V4 aborts,
+and Lemma 3.6 is exactly the contrapositive safety argument. Absence is not omitted merely because it
+carries no document bytes.
+
+7. Encoding ambiguity, fixed tags, and payload substitution
+Lemma 3.1 proves that the typed length-prefixed canonical grammar has one decode. Lemma 3.2 proves
+that the outer field sequence has one parse. The unlength-prefixed algorithm prefix is safe because it is
+one exact constant at a fixed grammar position; future algorithms must use disjoint exact dispatch.
+Distinct capsule encodings can still share the fixed-length unkeyed digest only by violating Repair
+K-PREHASH’s collision-resistance assumption. Thus payload substitution is reduced to either a hash
+collision or a new-message MAC forgery. Exact 32-byte tag enforcement removes truncation ambiguity.
+
+8. Variant B under-declaration
+A cell may choose S ⊊ Obs(C), including omission of a read that actually influenced its JavaScript.
+This can avoid an abort and can violate an invariant the tenant expected its program to maintain. It
+does not let the cell invent the reads that remain in S, write outside V5, or create a nonserial history
+for the summarized transaction. The accepted operation is equivalent, under T3, to an authorized
+application that ignored those grants and issued the same constant or blind write. The exact gain is
+semantic dishonesty inside the authorized tenant boundary, not additional database authority.
+
+
+                                                 21 of 27
+The Capsule Transaction Theorem                                                              Aster v0.7
+
+
+9. Over-declaration and prewarm poisoning
+Variant A validates every prewarmed or gratuitously granted observation in the selected capsule; Variant
+B can declare any exact subset. A malicious cell can request many authorized reads and thereby
+make its own later commit more likely to abort. It cannot make another transaction abort merely by
+holding or declaring a read: V4 consults only committed writes, and an in-flight read set is invisible
+to other transactions. A committed malicious write may conflict with another transaction only where
+write policy gives overlapping authority. CPU, memory, and queue exhaustion from read floods are
+denial-of-service and explicitly outside scope.
+
+10. GC/retention race
+V3’s age comparison followed by an unlocked log scan is insufficient: the sweeper could truncate an
+event after the check and before validation. Repair G-RETENTION reads the actual low-watermark
+and pins it, or serializes GC cutoff advancement with the commit fence. Lemma 2.11 proves sufficiency
+and supplies the stale-read counterexample when coverage is absent. The append releases the pin only
+after the validation result has been consumed.
+
+11. Duplicate keys and contradictory entries
+The attacker controls wire bytes, so relying on a language map type after permissive decoding is
+unsafe. Repair W-CANON requires duplicate-detecting canonical decode and byte-for-byte canonical
+re-encoding. A capsule with two entries for one key, a write set with both Put and Delete for one key,
+or a declared set with contradictory versions is rejected before V1/V4. Maps are strictly ordered and
+unique; range key lists are strictly ordered; exact range references cannot be edited.
+
+12. Policy TOCTOU
+A read grant is evaluated at read time. Revoking it later cannot erase data already delivered, so the
+capsule remains authentic and T1b records the historical grant. Write policy is evaluated at the append
+decision and wins. Repair P-WRITE prevents a revocation between V5 and append by tying append to
+the policy version or lock. If write authority has been revoked, the transaction aborts even though its
+old reads remain valid bearer data. T3’s witness uses the same historical read grants and the same
+current write authorization.
+
+13. Whole-capsule replay across invocations
+There is no nonce or issue time beyond the existing context tuple.                If exactly the same
+(cid, e, s, tenant, deployment) is reused, a capsule is replayable while epoch and retention permit. T2
+and T3 need no nonce: every replay is revalidated against all commits since s, rechecked under current
+write policy, and either aborts or becomes another legal serial authorized transaction. A nonce would
+provide invocation identity, not stronger isolation. What is not provided is at-most-once execution;
+an API that needs it should add a storage-recorded idempotency key, which is separate from capsule
+freshness.
+
+
+5    Assumptions ledger
+
+
+
+
+                                               22 of 27
+The Capsule Transaction Theorem                                                             Aster v0.7
+
+
+ ID       Assumption or proved      Exact role
+          fact
+ A1       Trusted    broker/key     Every process with κ enforces policy, reads the requested snap-
+          holders                   shot, and seals only truthful capsule transitions. Compromise of
+                                    one such process defeats T1a/T1b.
+ A2       Keyed          BLAKE3     Full 32-byte keyed output is a secure MAC under adaptive
+          PRF/EUF-CMA               chosen-message queries. Used in T1a and T1b.
+ A3       Unkeyed BLAKE3 col-       Required by the implemented prehash seal. Can be removed by
+          lision resistance         a direct-MAC seal version.
+ A4       Key secrecy and do-       The 32-byte key is generated/stored as a secret, not derived from
+          main discipline           public environment material; cross-protocol uses have disjoint
+                                    top-level tags or separate keys.
+ P1       Injective canonical en-   Lemma 3.1; not assumed. Requires the production decoder to
+          coding (proved)           reject noncanonical and duplicate forms.
+ P2       Injective outer framing   Lemma 3.2; the fixed algorithm prefix is exact and the remaining
+          (proved)                  fields are framed/fixed-width.
+ A5       Correct MVCC storage      Reads at s return one immutable prefix state, tombstones and
+                                    absence are represented as modeled, and successful writes are
+                                    atomic/durable.
+ A6       Complete conflict pro-    Every mutation that can change a point or key-interval scan is
+          jection                   represented as a write event on the corresponding primary/index
+                                    key.
+ A7       Single-writer lease and   At most one current writer epoch appends; the storage append
+          storage fencing           rejects stale epochs atomically and assigns globally increasing
+                                    timestamps.
+ A8       Atomic commit fence       V2–V5 validation uses one stable horizon and no successful
+                                    commit interposes before append. Failover races are resolved by
+                                    A7.
+ A9       Retention floor and pin   The committer knows g and prevents GC from removing (s, h]
+                                    during validation. Clock/Now is monotonic enough for the hard
+                                    age rule.
+ A10      Policy correctness and    P.read and P.write express the intended authority; their allow/-
+          versioning                deny outcomes are accepted as explicit leakage. Write-policy
+                                    decisions are linearized with append. Tenant-only consequences
+                                    additionally assume policy maps tenant contexts to disjoint key
+                                    authority.
+ A11      Context/channel bind-     The broker uses trusted launch/channel metadata for cid, ten-
+          ing                       ant, deployment, epoch context, and snapshot, rather than cell
+                                    assertions.
+ A12      Process isolation         Cells possess no database credentials, network, filesystem, or
+                                    alternate storage channel. Side/covert channels are excluded.
+                                    Collusion shares only information/capabilities the model explic-
+                                    itly permits.
+ A13      PPT adversary             Cryptographic conclusions are computational and quantify over
+                                    probabilistic polynomial-time cells/coalitions.
+
+
+
+
+                                                 23 of 27
+The Capsule Transaction Theorem                                                                    Aster v0.7
+
+
+5.1    Implementation obligations recorded but not proved
+• Compare MACs in constant time. The current prototype’s ordinary inequality must be replaced
+  before the side-channel assumption is credible.
+• Load the production key from a secret store or CSPRNG-provisioned key service. A derived
+  environment seed is not the A4 key model.
+• Obtain enow from the storage lease authority. The current self-asserted environment epoch is outside
+  this theorem.
+• Put explicit size/count limits on capsule collections, strings, range results, and write sets. These are
+  denial-of-service controls, not cryptographic correctness.
+• Recheck write policy inside the commit fence, and coordinate the retention low-watermark with GC
+  across process failover.
+• Test every endpoint off-by-one combination and every index mutation against the range-window
+  lemma.
+• If at-most-once behavior is required, persist an idempotency key in the same append transaction; do
+  not mistake a capsule nonce for durable deduplication.
+
+
+6     Variant verdict
+
+    Question                   Variant A: entire selected cap- Variant B: exact declared subset
+                               sule
+    Authenticated contents   Every point/range atom in the        Every declared atom is authentic and
+                             selected capsule is authentic.       is an exact member of the capsule.
+    Completeness relative to Yes. The committer does not ac-      No. The cell may omit arbitrary
+    submitted capsule        cept omission from that capsule.     capsule atoms.
+    Completeness relative to No. Earlier capsules and forked      No, by design.
+    actual Byzantine compu- branches remain valid; locally
+    tation                   used prewarm is not observable.
+    Prewarm conflicts        Every prewarmed atom in the se-      Unused prewarm can be omitted.
+                             lected capsule participates, even
+                             if unused.
+    Malicious         under- Possible by rollback/forking to      Directly possible through S.
+    declaration              an earlier selected capsule.
+    T2 guarantee             Strict     serializability   over    Strict serializability over S.
+                             Obs(Cselected ).
+    T3 authority boundary    Authorized-client equivalent; no     Same authority boundary; omis-
+                             computation integrity.               sion is equivalent to a blind/less-
+                                                                  dependent authorized application
+                                                                  write.
+    Honest-client ergonomics   Catches accidental omission Requires the honest runtime to track
+                               from the selected capsule, but and submit actual dependencies; sup-
+                               creates false conflicts under pre- ports dream capsules without false
+                               warm.                              conflicts.
+
+
+Recommendation for v0.7: Variant B. Name S the declared dependency set, not “the executor’s
+
+                                                24 of 27
+The Capsule Transaction Theorem                                                               Aster v0.7
+
+
+complete read set.” The broker should still authenticate every grant and should make the honest V8
+integration automatically add every actual trap observation to S while marking prewarm entries unused
+until consumed. This provides ordinary OCC behavior for honest code and the same T2/T3 Byzantine
+boundary as Variant A.
+Variant A’s proposed Byzantine advantage is illusory under the stateless design. It proves completeness
+only relative to whichever valid capsule the adversary chooses to submit. Enforcing complete actual
+usage would require two ingredients absent here: a trusted way to observe every use, including prewarm
+hits, and anti-rollback state or a one-time finalization record. Both conflict with the current goal
+of stateless read brokers. Variant A remains defensible as a conservative honest-client mode when
+prewarming is disabled or false conflicts are acceptable.
+The two variants therefore have the same class of history theorem but not the same accepted trace set.
+Variant B can accept a smaller R in a schedule where Variant A aborts. That extra trace is exactly an
+authorized blind or less-dependent write. It is harmful to a tenant invariant only to the extent that a
+malicious authorized application was already harmful.
+
+
+7    Prior-art position and exact delta
+FoundationDB demonstrates the classical systems core used by T2: clients read at an MVCC version,
+submit read/write key ranges, and resolvers compare read ranges against recently modified ranges; its
+paper also notes that snapshot reads are omitted from conflict ranges [1]. Aster’s proven delta is not a
+new OCC rule. It is that each declared read result and range window has broker-minted provenance,
+so an untrusted executor cannot fabricate the resolver’s evidence. Completeness still depends on the
+variant and the rollback boundary.
+Hyperledger Fabric’s execute-order-validate design has endorsing peers execute chaincode, construct
+versioned read sets and write sets, and sign endorsements; later validation checks those results rather
+than re-executing at validation time [2]. Aster does not trust or re-execute the tenant computation.
+Its trusted broker signs data flow at serve time, and the write is treated as adversary-chosen but
+policy-gated.
+Basil targets Byzantine transactional storage and Byzantine participants with a replicated protocol; its
+design uses 5f + 1 replicas per shard and provides Byzantine serializability [3]. Aster instead assumes
+one trusted broker/storage authority and makes the executor Byzantine. The costs and threat models
+are therefore different: Aster is not a one-node replacement for Byzantine storage replication, but a
+way to remove the executor from the database-authority TCB.
+TransEdge focuses efficient consistent read-only transactions across untrusted edge nodes [4]. Fides/TF-
+Commit focuses atomic commitment and audit over untrusted server infrastructure [5]. Aster’s axis is
+orthogonal: trusted storage and broker, untrusted application executor, and authenticated serve-time
+observations feeding ordinary single-writer OCC.
+The paper-ready thesis sentence that survives the proof is:
+     Aster makes every submitted OCC observation provenance-authentic without trusting or re-
+     executing the application executor; strict serializability then follows from classical backward
+     validation, while any omitted dependency is demoted to an authorized blind application
+     write rather than a cross-authority isolation failure.
+
+
+
+
+                                                25 of 27
+The Capsule Transaction Theorem                                                              Aster v0.7
+
+
+8     Open problems
+8.1   Reactive subscriptions over capsules
+A subscription needs invalidation without placing a resident write log or database credential in the
+cell plane. The promising direction is a broker-side approximate matcher with one-sided error: false
+positives trigger harmless re-execution, while false negatives would violate freshness and are forbidden.
+The certificate language developed for range windows is a natural input to such a matcher, but retention,
+compaction, and subscription handoff across epochs require separate proofs.
+
+8.2   Learned prewarming (“dream capsules”)
+Learned prewarming interacts directly with the A/B verdict. Variant A converts prediction error into
+conflict amplification; Variant B permits unused grants to remain outside S. A production design should
+keep grant content and declared-use metadata separate, policy-check every predicted item, prevent
+the predictor from encoding cross-tenant secrets in its choices, and measure whether capsule size itself
+becomes a side channel or denial-of-service vector.
+
+8.3   Zero-knowledge compliance transcripts
+A zero-knowledge layer could prove that a transaction used only capabilities, query forms, and write
+destinations allowed by a compliance policy, without revealing the underlying documents. It should not
+be marketed as proof of JavaScript correctness. The useful statement is capability/protocol compliance,
+not arithmetic or business-logic integrity.
+
+8.4   Actual-dependency completeness without trusting V8
+The repaired theorem exposes a clean open problem: can a system preserve prewarm and stateless read
+serving while proving that every value causally consumed by a Byzantine executor appears in R? A
+conventional MAC cannot attest to use. Stateful one-time finalization, a trusted monitor around every
+cache hit, hardware attestation, or a proof-carrying execution mechanism are possible directions, each
+spending a resource the present design intentionally avoids.
+
+
+9     Confidence report
+What a cryptographer should check first. Verify the exact Rust canonical encoder/decoder against
+Lemma 3.1; confirm duplicate rejection and exact algorithm/tag handling; and review the two-case T1a
+reduction, especially the added unkeyed-BLAKE3 collision-resistance assumption. The implemented
+prehash is the only reason the proof is not a pure MAC reduction. A v3 direct-MAC format would
+simplify this joint.
+What a database/concurrency reviewer should check first. Verify that the production commit
+path has one stable validation horizon across concurrent requests and failover, that GC cannot race the
+log scan, that policy revocation cannot race V5, and that every physical index mutation affecting a
+logical scan appears in the conflict structure. Model-check the interleavings in Counterexample 3.9 and
+the epoch race in Lemma 3.11.
+Single weakest joint. The weakest joint is the storage-facing conflict projection: the proof assumes
+that validation sees a complete, immutable (s, h] and that every mutation capable of changing a point
+or limited-range answer is represented by a write inside the corresponding validation key/window.
+A missing index-entry mutation, an off-by-one range endpoint, or a GC/interposition race defeats
+
+
+                                                26 of 27
+The Capsule Transaction Theorem                                                                 Aster v0.7
+
+
+T2 without breaking any cryptography. This is the part to implement and test as though it were a
+consensus boundary.
+Overall confidence. Conditional on the assumptions ledger and the repaired commit fence, confidence
+in T2/T3 is high: the serialization proof is a direct induction over the single commit log, with point/range
+stability as the only semantic bridge. Confidence in the stronger intuitive phrase “the capsule is the
+cell’s entire read history” is zero under stateless rollback; the document deliberately does not claim it.
+Confidence in read-plane confinement is high under the explicit exclusion of timing/covert channels and
+the prewarm policy rule. The theorem is ready to guide v0.7, but the commit/GC/policy transaction
+and range-index projection deserve independent model checking before deployment.
+
+
+Concluding statement
+The composition is safe at the authority boundary. A broker-issued observation cannot be forged; a
+declared observation cannot be crossed by an unseen committed write; a stale epoch cannot append;
+and an authorized write that survives those checks occupies one unambiguous place in the commit log.
+The executor remains free to be wrong, malicious, forgetful, or dishonest about its own dependencies.
+Those behaviors collapse to the behavior of an authorized bad application, not to possession of the
+database credential.
+That is the Capsule Transaction Theorem Aster can honestly implement.
+
+
+References
+[1] Jingyu Zhou et al. “FoundationDB: A Distributed Unbundled Transactional Key Value Store.”
+    Proceedings of SIGMOD, 2021. https://www.foundationdb.org/files/fdb-paper.pdf
+[2] Hyperledger Fabric documentation. “Architecture Explained: Endorsing peer simulation and read-
+    /write sets.” https://hyperledger-fabric.readthedocs.io/en/release-1.3/arch-deep-dive.
+    html
+[3] Florian Suri-Payer, Matthew Burke, Zheng Wang, Yunhao Zhang, Lorenzo Alvisi, and Natacha
+    Crooks. “Basil: Breaking up BFT with ACID (transactions).” SOSP, 2021. https://arxiv.org/
+    abs/2109.12443
+[4] Abhishek A. Singh, Aasim Khan, Sharad Mehrotra, and Faisal Nawab. “TransEdge: Supporting
+    Efficient Read Queries Across Untrusted Edge Nodes.” arXiv:2302.08019, 2023. https://arxiv.
+    org/abs/2302.08019
+[5] Sujaya Maiyya, Danny Hyun Bum Cho, Divyakant Agrawal, and Amr El Abbadi. “Fides: Managing
+    Data on Untrusted Infrastructure.” arXiv:2001.06933, 2020. https://arxiv.org/abs/2001.06933
+[6] Jack O’Connor et al. “BLAKE3: one function, fast everywhere.” Specification and design paper.
+    https://github.com/BLAKE3-team/BLAKE3
+
+
+
+
+                                                 27 of 27
+

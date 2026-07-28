@@ -1,196 +1,258 @@
 # Aster
 
-**Run untrusted Convex code without giving it your database credentials.**
+**Run untrusted Convex code without giving it database authority.**
 
-Aster is an open-source execution plane for [Convex](https://www.convex.dev/) apps where the JavaScript that runs your queries **never holds a Postgres handle**. A separate broker process owns the database; tenant code lives in a V8 cell that gets sealed snapshot capsules over a Unix-domain socket and nothing else. Even a CVE-class V8 escape leaves the attacker with an empty isolate — they can't reach the database, the modules dir, or other tenants.
+Aster is an open-source execution plane for Convex applications. Tenant JavaScript runs in a one-shot V8 cell with no database credentials, no module-directory mount, and no network interface. A separate broker owns Postgres, module loading, policy, capsule sealing, and commit admission. The only cell capability is a Unix-domain socket carrying a small, length-prefixed protocol.
 
-It runs **real `npx convex deploy` bundles** unmodified. You don't rewrite your app — you just run it somewhere with stronger isolation than the Convex backend gives you out of the box.
+Aster executes real `npx convex deploy` bundles without rewriting application code. Queries and mutations suspend on Convex syscalls, the broker hydrates a MAC-sealed snapshot capsule, and mutations submit their observed reads plus write set through one transactional OCC fence.
+
+The production Compose profile now proves the complete supported path:
 
 ```text
-$ ./docker/smoke-bundle.sh 0.4-modulequery
-==> staged bundle at /tmp/.../test-bundle.blob (14854 bytes, sha256 ef11...)
-==> sourcePackageId = r4zexvjnaqqewnanxvq5anfexsana5t4
-==> starting postgres:16
-==> starting brokerd (ASTER_STORE=postgres, modules dir mounted)
-==> running v8cell (module=messages.js, function=getById, id=...)
-==> v8cell stdout: {"capsule_hash":3703888312439000736,
-                    "output":"{\"_id\":\"messages|aaaa...\",\"name\":\"ian\"}",
-                    "traps":1}
-OK: aster brokerd(postgres) + v8cell module-query smoke passed —
-    real npx-convex-deploy bundle compiled as ESM,
-    getById invoked with args=[{"id":"..."}],
-    db.get(id) traversed Convex.asyncSyscall("1.0/get") → broker → postgres,
-    document body returned with name="ian".
+real Convex bundle
+  -> query db.get
+  -> one-time launch token
+  -> rootless, networkless V8 cell
+  -> broker over UDS
+  -> authoritative Postgres history
+  -> mutation db.insert
+  -> canonical Convex IDv6 allocation
+  -> transactional commit fence
+  -> fresh cell reads the committed document
 ```
 
-That's a real bundle. A real Postgres. A real V8 isolate. Real `db.get(id)` over the wire. **One** trap drained — exactly the syscall the user's `getById` query made. The cell never had a database connection.
-
-## Who this is for
-
-Aster solves three different problems for three different audiences. Pick whichever describes you.
-
-### You're hosting Convex apps for other people (PaaS / multi-tenant SaaS)
-
-Convex Cloud is closed. Self-hosted Convex is open but the executor and the database authority sit in the same process — if you run customer code on your infra, a single V8 escape gives that customer your other customers' data.
-
-**Aster is the missing piece.** Tenant code goes in cells with no credentials; the broker is the only thing that talks to Postgres. You can colocate 50 customer apps on one VPS without taking the "shared V8 sandbox" risk.
-
-### You're in a regulated industry (HIPAA, SOC 2, GDPR, financial)
-
-"How do you guarantee the application code can't reach data outside its scope?" is a question your auditor asks. With Convex's standard runtime the answer is "code review, V8 sandbox, IAM." With Aster the answer is **"the code physically does not have credentials. Every read passes through a sealed capsule with a per-invocation context. Here's the audit trail."**
-
-### You want to learn how a capability-narrowed runtime is actually built
-
-Aster is roughly 10k lines of Rust covering: V8 ESM compilation, BLAKE3 keyed-MAC capsule sealing, Convex IDv6/ConvexValue codec ports, a Postgres adapter that reads the same schema the upstream backend writes to, an `_modules` × `_source_packages` join + ZIP unzip pipeline that resolves module bundles, and a process-separated broker/cell architecture with read-trap continuations. **Every piece is tested. Real Convex bundles run end-to-end.** It's a working reference for how to build this kind of system.
-
-## How Aster compares
-
-| | Per-tenant isolation | Tenant code holds DB creds? | Snapshot semantics | Self-hostable | Runs `npx convex` bundles |
-|---|---|---|---|---|---|
-| Convex Cloud | V8 isolate | yes | MVCC | ❌ | yes |
-| Convex self-hosted | V8 isolate | yes | MVCC | ✅ | yes |
-| Cloudflare Workers | V8 isolate | yes (env-var) | none | ❌ | no |
-| Deno Deploy | V8 isolate | yes | none | ❌ | no |
-| AWS Lambda | container | yes (IAM role) | none | ❌ | no |
-| Fly.io Machines | Firecracker microVM | yes | none | partial | no |
-| **Aster** | V8 isolate **+ process boundary + sealed capsules** | **NO** | MVCC inherited | ✅ | **yes** |
-
-The "tenant code holds DB creds?" column is the difference. Everywhere else, application code has some path to credentials (env-var, IAM role, fetch endpoint). On Aster the cell has a Unix-domain socket to a broker; that's the entire surface.
-
-## Quick start — see it work
-
-You need Docker. The first build is slow (~5 min cold for V8); subsequent builds are seconds.
+Run that proof locally:
 
 ```bash
-# Build both binaries from this repo
-docker build --target=runtime-broker -t aster-brokerd:0.4 -f docker/Dockerfile .
-docker build --target=runtime-v8cell -t aster-v8cell:0.4 -f docker/Dockerfile .
-
-# Three smokes from least to most ambitious:
-./docker/smoke.sh           0.4              # UDS + V8 + memory store. ~5s.
-./docker/smoke-postgres.sh  0.4              # add postgres-backed reads. ~30s.
-./docker/smoke-bundle.sh    0.4-modulequery  # real `npx convex deploy` bundle, end-to-end.
+docker build --target runtime-broker -t aster-brokerd:0.8 -f docker/Dockerfile .
+docker build --target runtime-v8cell -t aster-v8cell:0.8 -f docker/Dockerfile .
+ASTER_PRODUCTION_COMPOSE_SMOKE=1 ./docker/smoke-bundle.sh 0.8
 ```
 
-Each script is self-contained: spins containers, asserts an exact stdout, tears everything down. The third one is the killer demo — copy it to read what staging a real Convex bundle on disk + driving a real query through the broker actually looks like in practice.
+The smoke uses real Postgres, the checked-in byte-for-byte output of a real Convex deployment bundle, the hardened production topology, a query, a mutation, and a fresh-cell readback. The cell never receives a Postgres handle, database URL, seal key, launch key, policy file, or module storage path.
 
-## What's working in v0.6
+## Security boundary
 
-- **Real `npx convex deploy` bundles execute end-to-end.** Cell compiles the bundle as a V8 ES module, finds the named export, asserts it's a `query`, calls `<export>.invokeQuery(args_json)`, drives the `Convex.asyncSyscall("1.0/get")` trap loop while the user's `db.get` awaits — same shape Convex's own runner uses, with the bundle's own `convex/server` / `convex/values` / `_generated/*` already inlined by esbuild.
-- **Read path against real Postgres.** Broker reads the same `documents` / `_tables` / `_modules` / `_source_packages` schema the upstream Convex backend writes to. IDv6 strings the JS bundle emits resolve to tablet UUIDs via a `_tables`-backed mapping cache.
-- **Cryptographic capsule integrity.** BLAKE3 keyed-MAC seals every snapshot a cell receives. A cell can't forge or replay another cell's capsule — context is bound to `(cell_id, lease_epoch)`.
-- **Process-separated broker + cell over UDS.** The cell binary cannot dial the database. The broker binary cannot execute user code. Two different attack surfaces; neither one alone gets the attacker anywhere useful.
-- **Two layers of CI proof.** A library-level test runs the byte-for-byte 58 KB output of `npx convex deploy` for `aster-e2e-fixture/messages.ts` through `V8SandboxCell::execute_module_query_with_broker` and asserts the document round-trips with exactly **1** syscall trap. A docker-level smoke script does the same against `postgres:16` + the actual binaries.
-- **VPS-validated through the Synapse control plane.** The full `HTTP → Synapse → spawn cell → broker → Postgres → response` path is documented end-to-end at `docs/ASTER_VPS_SMOKE.md` with the captured stdout from a Hetzner CPX22 invocation.
+Aster's distinction is not merely “JavaScript runs in V8.” It separates execution from authority:
 
-## What's deliberately out of scope for v0.6
+- **Cell:** untrusted tenant bundle, V8 isolate, sealed capsule, UDS client.
+- **Broker:** trusted policy and transaction authority, Postgres credentials, seal key, launch-token key, module source.
+- **Postgres:** one Aster history per tenant/deployment for transaction data; Convex module metadata remains a deployment input.
+- **Container supervisor:** trusted to enforce the production profile.
 
-- **Mutations and actions.** v0.6 is read-only by design. The cell rejects `isMutation === true` exports with a typed error so the OCC commit story can land separately with its own review surface.
-- **Convex-shaped HTTP frontend.** Aster ends at "given a module path + function + args, run it." The `/api/query/<module>:<fn>` path that Convex CLI clients speak lives in [Iann29/convex-synapse](https://github.com/Iann29/convex-synapse), not here.
-- **OS-level cell sandboxing.** The cell container runs as a non-root UID but doesn't yet have cgroups, seccomp, read-only rootfs, or per-tenant UID. P2 hardening, planned but not done.
-- **Cell warm-pool reincarnation.** Every invocation spawns a fresh container right now. Warm pooling is on the roadmap (see `docs/ABSURD_IDEAS.md`).
+The shipped production profile enforces:
 
-## How it works (one picture)
+- non-root broker and cell processes under an operator-selected UID/GID;
+- read-only root filesystems, all Linux capabilities dropped, `no-new-privileges`, default Docker seccomp, PID/CPU/memory/file-descriptor limits, and bounded tmpfs;
+- Docker `network_mode: none` for cells and the launch-token issuer;
+- a database network attached only to the broker;
+- a host-owned `0700` runtime directory mounted read-only into cells;
+- broker-side `SO_PEERCRED` UID admission on the UDS;
+- one-use, short-lived launch tokens bound to cell, tenant, deployment, and authority epoch;
+- session TTL and concurrency limits;
+- deployment policy for document reads, writes, scans, module loads, and insert tables;
+- BLAKE3 keyed-MAC capsule seals bound to the live session and lease epoch;
+- V8 heap limits, trap limits, invocation retries, and a host watchdog that terminates runaway JavaScript.
+
+The trusted computing base still includes the host kernel, Docker/container runtime, broker, Postgres, deployment policy, module-ingestion path, and operator. Aster is not an independently audited sandbox or a defense against a container-runtime/kernel escape.
+
+## Supported Convex surface
+
+Aster v0.8 intentionally implements a narrow, testable subset:
+
+- real bundled **queries** using `db.get`;
+- real bundled **mutations** using `db.get`, `db.insert`, `db.patch`, `db.replace`, and `db.delete`;
+- read-your-own-writes and absence tracking inside an invocation;
+- server-side canonical IDv6 allocation for inserts;
+- commit conflict retry from a fresh authoritative snapshot;
+- module resolution through Convex `_modules` and `_source_packages` metadata plus hash-verified bundle blobs;
+- point reads and certified prefix reads in the broker/storage protocol.
+
+Not implemented: actions, HTTP actions, scheduled functions, search/vector syscalls, arbitrary Convex query-filter/collect syscalls, file storage syscalls, auth context, external egress, components, and a Convex-compatible HTTP frontend. Aster ends at “invoke this module export with these arguments.” The HTTP/control-plane integration belongs in [Iann29/convex-synapse](https://github.com/Iann29/convex-synapse).
+
+## Install and operate
+
+Requirements: Docker Engine with Compose v2, a reachable Postgres deployment, and access to the Convex module-blob directory. Source verification uses Rust 1.94.1.
+
+### 1. Build the images
+
+```bash
+docker build --target runtime-broker -t aster-brokerd:0.8 -f docker/Dockerfile .
+docker build --target runtime-v8cell -t aster-v8cell:0.8 -f docker/Dockerfile .
+```
+
+The Dockerfile pins its builder/runtime base digests and verifies the uncompressed rusty_v8 native archive hash before linking. Both runtime images execute as non-root by default; Compose maps them to the host operator UID/GID so bind-mounted secrets and the socket directory remain private.
+
+### 2. Initialize deployment state
+
+```bash
+./docker/aster-init .aster
+cp docker/.env.production.example .env.aster
+```
+
+`aster-init` creates independent random 256-bit seal and launch keys, a `0700` runtime directory, a `0600` database URL file, and a deny-all policy template. Put a container-reachable Postgres URL in `.aster/db_url`; for example, use the Postgres service name on the external database network rather than `127.0.0.1`.
+
+Edit `.env.aster`:
+
+- replace every absolute path;
+- set the existing external Docker network in `ASTER_DATABASE_NETWORK`;
+- set the Postgres schema containing Convex module metadata;
+- set tenant and deployment identifiers;
+- grant only the required document/module prefixes and insert table names in `policy.json`.
+
+Load the environment and start the authority:
+
+```bash
+set -a
+. ./.env.aster
+set +a
+
+docker compose -f docker/compose.production.yml up -d --wait brokerd
+```
+
+### 3. Invoke a function
+
+```bash
+export ASTER_MODULE_PATH=messages.js
+export ASTER_FUNCTION_NAME=getById
+export ASTER_ARGS_JSON='[{"id":"j57ananananananananananananamzxg"}]'
+
+./docker/aster-invoke
+```
+
+`aster-invoke` waits for the broker, reads its published authority epoch, obtains a one-use token in an isolated helper container, launches exactly one networkless cell, enforces an outer timeout, and removes the cell afterward.
+
+Operational state is intentionally small:
 
 ```text
-  HTTP request                                                       
-       │                                                             
-       ▼                                                             
-  ┌─────────┐    spawn (per invocation)    ┌────────────────────┐
-  │ Synapse │ ──────────────────────────▶ │ aster-v8cell        │
-  │ control │                              │  - V8 isolate       │
-  │ plane   │                              │  - module loader    │
-  └─────────┘                              │  - Convex shims     │
-                                            │  - capability:      │
-                                            │    UDS + capsules   │
-                                            └─────────┬───────────┘
-                                                      │
-                                                      │ LoadModuleBundle(capsule, path)
-                                                      │ HydratePoint(capsule, doc_id)
-                                                      │  (length-prefixed JSON over UDS)
-                                                      ▼
-                                            ┌─────────────────────┐
-                                            │ aster-brokerd       │
-                                            │  - owns Postgres    │
-                                            │  - seals capsules   │
-                                            │    (BLAKE3 keyed)   │
-                                            │  - resolves IDv6    │
-                                            │  - reads modules    │
-                                            └─────────┬───────────┘
-                                                      │
-                                                      │ SQL
-                                                      ▼
-                                            ┌─────────────────────┐
-                                            │ postgres            │
-                                            │  - documents        │
-                                            │  - _tables          │
-                                            │  - _modules         │
-                                            │  - _source_packages │
-                                            │  - ZIP blobs on FS  │
-                                            └─────────────────────┘
+.aster/
+  db_url          # 0600; broker only
+  seal.key        # 0600; broker only
+  launch.key      # 0600; broker + isolated token issuer
+  policy.json     # deployment authority limits
+  run/
+    broker.sock
+    authority_epoch
 ```
 
-The cell never has a row from the broker's address space. It gets bytes that have been sealed, and a context (cell_id + lease_epoch) that was used as input to the seal. Replay a sealed capsule under a different cell_id — MAC fails. Try to use a capsule past its snapshot_ts — MAC fails. The integrity boundary is mathematical, not code-review.
+## How the transaction path works
 
-## Run
+```text
+operator / control plane
+        |
+        | module, export, args, one-use launch token
+        v
++--------------------------+
+| aster_v8cell             |
+| V8 + Convex bundle       |
+| no DB credentials        |
+| no module mount          |
+| no network               |
++------------+-------------+
+             | UDS
+             | InitialCapsule / HydratePoint / HydratePrefix
+             | MintDocumentId / LoadModuleBundle / Commit / Abort
+             v
++--------------------------+          +-------------------------+
+| aster_brokerd            |  SQL     | Postgres                |
+| policy + session table   +--------->| aster.log               |
+| seal + launch keys       |          | aster.lease             |
+| lease + commit fence     |          | aster.retention         |
++------------+-------------+          | Convex module metadata  |
+             |                        +-------------------------+
+             | sealed capsule or commit outcome
+             v
+       invocation envelope
+```
+
+For a mutation, the final evidence object is:
+
+```text
+(snapshot capsule, consumed point reads, certified ranges, write set, lease epoch)
+```
+
+The Postgres fence takes the tenant/deployment lease row `FOR UPDATE`, checks the epoch and snapshot horizon, validates every authenticated conflict window, and appends the whole write set before the transaction commits. Reads and validation consult the same `aster.log` history. Retention is monotonic and checked after reads to prevent half-compacted snapshots from becoming evidence.
+
+## Verification
+
+Fast local lane:
 
 ```bash
 cargo fmt --all -- --check
-cargo build --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo run --release -p aster-host --bin aster_bench -- 10000 32
 ```
 
-Workspace tests: 106 unit + 19 Postgres-integration (gated by `--features postgres-it` + `ASTER_DB_URL`) + 1 cross-process E2E + 3 docker smokes. All green on CI.
-
-### Postgres adapter local lane
+Authoritative Postgres lane:
 
 ```bash
 docker run -d --rm --name aster-pg-dev -p 5433:5432 \
-    -e POSTGRES_USER=aster -e POSTGRES_PASSWORD=aster \
-    -e POSTGRES_DB=aster postgres:16
+  -e POSTGRES_USER=aster -e POSTGRES_PASSWORD=aster \
+  -e POSTGRES_DB=aster \
+  postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c
+
 ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster \
-    cargo test -p aster-store-postgres --features postgres-it -- --test-threads=1
+  cargo test --locked -p aster-store-postgres --features postgres-it -- --test-threads=1
+ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster \
+  cargo test --locked -p aster-ipc --features postgres-it -- --test-threads=1
 ```
 
-CI runs the same lane via a service container; locally without `ASTER_DB_URL` the gated tests skip silently.
+Container lanes:
 
-## Crates
+```bash
+./docker/smoke.sh 0.8
+./docker/smoke-postgres.sh 0.8
+ASTER_PRODUCTION_COMPOSE_SMOKE=1 ./docker/smoke-bundle.sh 0.8
+```
 
-| Crate | Owns |
+CI runs on Blacksmith runners and gates ShellCheck, formatting, Clippy, the workspace suite, Postgres integration, hardened image builds with SBOM/provenance, Trivy scans, the three container lanes, dependency review, RustSec, and TLA+ positive/negative models. Third-party actions and container bases are pinned.
+
+## Formal and adversarial evidence
+
+`AsterFence.tla` models lease acquisition, fenced commit, conflict validation, retention, compaction, and epoch failover. CI requires:
+
+- the positive model to exhaust without an invariant violation;
+- shadowed-only compaction to remain sound;
+- epoch reuse, missing retention pinning, and non-atomic fencing mutants to produce their named counterexamples.
+
+The paper's `paper/CLAIMS.md` is an evidence ledger rather than a marketing checklist. The hostile re-referee report and its repairs remain in `paper/sources/` and `V07_BOARD.md`.
+
+## Workspace
+
+| Crate | Responsibility |
 |---|---|
-| `crates/capsule/` | MVCC store, snapshot capsules, BLAKE3 keyed seals, OCC committer |
-| `crates/broker/` | `CapsuleBrokerClient` (cell-facing trait) + `CapsuleStore` (storage backend trait) + `LocalCapsuleBroker` |
-| `crates/store-postgres/` | `PostgresCapsuleStore` — real Convex `documents` reads via `tokio-postgres` + `deadpool-postgres`. Includes the `_tables` mapping cache, the `_modules` × `_source_packages` index, and the local-FS modules-storage adapter that resolves a path to bundle bytes (`load_module_bundle`). |
-| `crates/convex-codec/` | Std-only port of `convex-backend@main:crates/value/src/{base32,id_v6,json}`. `DocumentIdV6` (encode/decode), Crockford lowercase base32, `ConvexValue` (`$integer` / `$float` / `$bytes` JSON wrappers). |
-| `crates/runner/` | Tenant-pinned sandbox cells, in-process toy program runner |
-| `crates/v8cell/` | Real V8 isolate. `Aster.read` (legacy), `Convex.asyncSyscall("1.0/get")`, and the v0.6 `execute_module_query_with_broker` that runs real Convex bundles. Locked by `tests/module_loader.rs`. |
-| `crates/ipc/` | Length-prefixed JSON over UDS. `aster_brokerd` + `aster_v8cell` binaries. v0.6 adds `LoadModuleBundle` (capsule-gated bundle bytes) and `bundle::extract_module_source` (ZIP unzip with `modules/<path>.js` priority). |
-| `crates/host/` | In-process facade + benchmark binary + smoke harnesses |
+| `crates/capsule` | Canonical capsules, range certificates, MVCC values, keyed seals. |
+| `crates/broker` | Cell-facing capability trait, store trait, in-memory broker, commit-fence types. |
+| `crates/store-postgres` | Authoritative Aster history, transactional write plane, Convex table mapping, module index/storage. |
+| `crates/convex-codec` | Strict Convex IDv6/base32 and ConvexValue codecs. |
+| `crates/v8cell` | V8 execution, Convex syscall bridge, in-cell read/write view, resource watchdog. |
+| `crates/ipc` | UDS wire protocol, policy, launch tokens, broker/cell/token binaries, bundle extraction. |
+| `crates/runner` | Tenant-pinned pure-Rust runner used by focused tests. |
+| `crates/host` | In-process facade and benchmark harness. |
 
 ## Version history
 
-| | What landed |
+| Version | Main result |
 |---|---|
-| v0.1 | Snapshot capsules + read-trap continuations + tenant-pinned sandbox cells (modeled in pure Rust). |
-| v0.2 | Real V8 isolate suspend/resume on missing reads via `await Aster.read(...)`. Cryptographic capsule seals (BLAKE3 keyed MAC + cell binding). |
-| v0.3 | Broker and cell run as **separate OS processes** over a Unix-domain socket. Cell can never reach the broker's address space. |
-| v0.4 | Broker reads from **real Postgres** (the same database a Convex backend writes to). Cell exposes `Convex.asyncSyscall("1.0/get")`. A Convex-compiled `await ctx.db.get(id)` resolves end-to-end against the cell's hydrated capsule. |
-| v0.5 | Convex IDv6 codec, `_tables`-backed table-mapping cache, `ConvexValue` `$integer`/`$float`/`$bytes` JSON wrappers. |
-| v0.6 | **Real Convex bundles run end-to-end.** `_modules` × `_source_packages` index, local-FS module-storage adapter, `LoadModuleBundle` IPC, V8 ESM compile + `<export>.invokeQuery(args)` dispatch, binary `ASTER_FUNCTION_NAME`/`ASTER_ARGS_JSON` envs, full docker smoke against real Postgres. |
+| v0.1 | Snapshot capsules and read-trap continuations in pure Rust. |
+| v0.2 | Real V8 suspend/resume and keyed capsule seals. |
+| v0.3 | Broker/cell process split over UDS. |
+| v0.4 | Real Postgres reads and the Convex `1.0/get` syscall. |
+| v0.5 | Strict IDv6/ConvexValue codecs and Convex table mapping. |
+| v0.6 | Real Convex bundle loading and ESM query invocation. |
+| v0.7 | Authenticated read consumption, certified ranges, lease epochs, transactional commit fence, mutations, retention/compaction proofs, and measured benchmarks. |
+| v0.8 | Shared authoritative history, server-side ID minting, deployment policy, one-use launch tokens, peer-authenticated concurrent IPC, rootless/networkless topology, resource watchdogs, and Blacksmith CI/security gates. |
 
-## Design docs
+## Design material
 
-- `docs/ARCHITECTURE.md` — current architecture
-- `docs/CONVEX_POSTGRES_REFERENCE.md` — the schema we read against, with 12 known gotchas, verbatim from `get-convex/convex-backend`
-- `docs/POSTGRES_ADAPTER_PLAN.md` — historical 5-commit plan, with follow-up status
-- `docs/THEORY_REGISTER.md` — research theories
-- `docs/ABSURD_IDEAS.md` — intentionally strange/falsifiable ideas (warm pools, cell reincarnation, ring-buffer trap diodes, etc.)
-- `docs/V8_QUESTION.md` — V8 experiment memo
-- `docs/COMPARISON_MATRIX_V0.3.md` — prior-art matrix
-- `docs/LOCAL_VALIDATION.md` — what passed on the developer machine
-- Synapse-side integration status, runbook, and pointers: [`docs/ASTER_INTEGRATION.md`](https://github.com/Iann29/convex-synapse/blob/main/docs/ASTER_INTEGRATION.md) in `Iann29/convex-synapse`
+- `docs/ARCHITECTURE.md` — runtime and trust-boundary details.
+- `docs/CONVEX_POSTGRES_REFERENCE.md` — upstream Convex Postgres schema notes used by module ingestion.
+- `docs/THEORY_REGISTER.md` — research theories and status.
+- `docs/ABSURD_IDEAS.md` — intentionally falsifiable follow-up ideas.
+- `docs/V8_QUESTION.md` — V8 experiments.
+- `docs/LOCAL_VALIDATION.md` — historical local evidence.
+- `paper/authenticate-the-reads.md` and `paper/CLAIMS.md` — technical report and claim ledger.
 
 ## License
 
-Apache 2.0 OR MIT, your choice.
+Apache 2.0 OR MIT, at your option.

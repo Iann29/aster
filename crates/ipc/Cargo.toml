@@ -10,12 +10,20 @@ aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
 aster-v8cell = { path = "../v8cell" }
 base64 = "0.22"
+blake3 = "1"
 # aster-store-postgres is linked unconditionally — the binary picks at
 # runtime based on ASTER_STORE. This drags tokio-postgres into the cell
 # binary too (which never uses it), but the alternative (cargo features)
 # would force per-target builds and double the docker/smoke surface.
 # Dead-code elim removes the unused symbols from aster_v8cell at link.
 aster-store-postgres = { path = "../store-postgres" }
+# Session ids (C-CHANNEL) are minted from OS entropy in the brokerd binary.
+# getrandom is the standard thin wrapper over getrandom(2)/equivalents and
+# is already in the workspace's dependency tree; never mint sessions from
+# time or constant seeds. Linked into the cell binary too but unused there
+# (same dead-code-elim note as aster-store-postgres above).
+getrandom = "0.4"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Convex emits per-source-package bundles as ZIP archives (one entry
@@ -24,3 +32,15 @@ serde_json = "1"
 # Convex's emitted compression; we explicitly disable other features
 # to keep the crate's dep surface narrow.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+# Gates the brokerd commit e2e (`pg_commit_e2e` in bin/aster_brokerd.rs)
+# that fences against a real Postgres via `WritePlane`. Same lane as
+# aster-store-postgres's postgres-it: needs ASTER_DB_URL and
+# --test-threads=1.
+postgres-it = []
+
+[dev-dependencies]
+aster-convex-codec = { path = "../convex-codec" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-postgres = "0.7"

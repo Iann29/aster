@@ -19,7 +19,10 @@ services:
       ASTER_DEPLOYMENT: dep-smoke
       ASTER_SEED_I64: "counters/a:value:20,counters/b:value:22"
       ASTER_SEAL_SEED: smoke-seed
-      ASTER_MAX_CONNECTIONS: "8"
+      # Memory-mode prototype stand-in for the lease authority (S9a):
+      # the broker only mints sessions for contexts claiming its own
+      # epoch, so this must match the v8cell service's value below.
+      ASTER_LEASE_EPOCH: "7"
     volumes:
       - aster-smoke-sock:/run/aster
     # The brokerd writes "ready" to stderr, but it doesn't expose any

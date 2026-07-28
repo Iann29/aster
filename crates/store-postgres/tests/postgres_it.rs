@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aster_broker::{CapsuleStore, StoreError};
-use aster_capsule::{DocumentId, Value};
+use aster_capsule::{DocumentId, KeyInterval, ScanDirection, ScanStop, Value};
 use aster_convex_codec::{ConvexValue, DocumentIdV6};
 use aster_store_postgres::{PostgresCapsuleStore, PostgresConfig};
 use sha2::{Digest, Sha256};
@@ -225,42 +225,260 @@ fn read_point_for_unknown_id_is_missing_not_error() {
 }
 
 #[test]
-fn read_prefix_returns_every_doc_in_table() {
+fn scan_prefix_returns_every_live_doc_with_exhausted_certificate() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
 
-    let rows = store.read_prefix(&prefix, 100, 200).expect("read_prefix");
-    assert_eq!(rows.len(), 2, "expected both seeded docs, got {rows:?}");
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 200).expect("scan_prefix");
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected both seeded docs, got {entries:?}"
+    );
+    cert.validate().expect("valid certificate");
+    assert_eq!(cert.interval, KeyInterval::Prefix(prefix.clone()));
+    assert_eq!(cert.direction, ScanDirection::Ascending);
+    assert_eq!(cert.limit, 100);
+    assert_eq!(cert.stop, ScanStop::Exhausted, "2 live < limit 100");
+    assert_eq!(
+        cert.keys,
+        entries.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()
+    );
 
-    for (id, value) in &rows {
-        assert!(id.0.starts_with(&format!("{TEST_TABLE_ID_HEX}/")));
+    for (id, value) in &entries {
+        assert!(id.0.starts_with(&prefix));
         assert!(value.version.is_some());
         assert!(value.document.is_some());
     }
 
-    let ids: Vec<&str> = rows.iter().map(|(d, _)| d.0.as_str()).collect();
+    let ids: Vec<&str> = entries.iter().map(|(d, _)| d.0.as_str()).collect();
     assert!(ids.iter().any(|id| id.contains(ID_IAN_HEX)));
     assert!(ids.iter().any(|id| id.contains(ID_CAUE_HEX)));
 }
 
 #[test]
-fn read_prefix_honours_limit() {
+fn scan_prefix_limit_hit_is_boundary() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
-    let rows = store.read_prefix(&prefix, 1, 200).expect("read_prefix");
-    assert_eq!(rows.len(), 1, "limit=1 should clip to a single row");
+    let (cert, entries) = store.scan_prefix(&prefix, 1, 200).expect("scan_prefix");
+    assert_eq!(entries.len(), 1, "limit=1 should clip to a single row");
+    cert.validate().expect("valid certificate");
+    assert_eq!(cert.stop, ScanStop::Boundary);
+    assert!(cert.keys[0].0.contains(ID_IAN_HEX), "ascending id order");
 }
 
 #[test]
-fn read_prefix_at_old_ts_only_sees_first_insert() {
+fn scan_prefix_at_old_ts_only_sees_first_insert() {
     reset_fixture(&url());
     let store = make_store();
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
-    let rows = store.read_prefix(&prefix, 100, 150).expect("read_prefix");
-    assert_eq!(rows.len(), 1, "ts=150 should only see the first insert");
-    assert!(rows[0].0 .0.contains(ID_IAN_HEX));
+    let (cert, entries) = store.scan_prefix(&prefix, 100, 150).expect("scan_prefix");
+    assert_eq!(entries.len(), 1, "ts=150 should only see the first insert");
+    assert!(entries[0].0 .0.contains(ID_IAN_HEX));
+    // caue exists in the key space but not at ts=150 — the certificate
+    // still proves interval exhaustion at that snapshot.
+    assert_eq!(cert.stop, ScanStop::Exhausted);
+    cert.validate().expect("valid certificate");
+}
+
+/// Tombstones must be skipped WITHOUT consuming limit slots — the exact
+/// bug class the old read_prefix had (its LIMIT applied before the
+/// deleted filter, so a tombstone displaced a live key from the answer).
+#[test]
+fn scan_prefix_skips_tombstones_without_consuming_limit() {
+    reset_fixture(&url());
+    // Tombstone ian at ts=300: at snapshots >= 300 the only live doc is caue.
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("ad-hoc runtime for tombstone insert");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&url(), NoTls)
+            .await
+            .expect("connect for tombstone insert");
+        let handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {TEST_SCHEMA}.documents (id, ts, table_id, json_value, deleted, prev_ts) \
+                     VALUES (decode($1, 'hex'), 300, decode($2, 'hex'), convert_to('null', 'UTF8'), true, 100)"
+                ),
+                &[&ID_IAN_HEX, &TEST_TABLE_ID_HEX],
+            )
+            .await
+            .expect("insert tombstone");
+        drop(client);
+        handle.abort();
+    });
+
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    // limit=1 at ts=300: ian (smaller id) is tombstoned — the slot must go
+    // to caue, and the stop is Boundary because the limit was hit.
+    let (cert, entries) = store.scan_prefix(&prefix, 1, 300).expect("scan_prefix");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].0 .0.contains(ID_CAUE_HEX),
+        "tombstoned ian must not consume the limit slot, got {entries:?}"
+    );
+    assert_eq!(cert.stop, ScanStop::Boundary);
+
+    // The same scan at the pre-delete snapshot still sees ian first.
+    let (_, entries_before) = store.scan_prefix(&prefix, 1, 200).expect("scan_prefix");
+    assert!(entries_before[0].0 .0.contains(ID_IAN_HEX));
+}
+
+/// Stamp the document-retention floor the way Convex's vacuum would —
+/// `persistence_globals['min_document_snapshot_ts']` (gotcha #10).
+fn set_min_document_snapshot_ts(value: i64) {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("ad-hoc runtime for retention floor");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&url(), NoTls)
+            .await
+            .expect("connect for retention floor");
+        let handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {TEST_SCHEMA}.persistence_globals (key, json_value) \
+                     VALUES ('min_document_snapshot_ts', convert_to($1, 'UTF8')) \
+                     ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value"
+                ),
+                &[&value.to_string()],
+            )
+            .await
+            .expect("upsert retention floor");
+        drop(client);
+        handle.abort();
+    });
+}
+
+/// A pinned snapshot below the retention floor must fail loudly with
+/// `Stale` — the rows it would see are half-vacuumed history, and a
+/// "missing" answer there would become false sealed absence evidence.
+#[test]
+fn read_point_below_retention_floor_returns_stale() {
+    reset_fixture(&url());
+    set_min_document_snapshot_ts(150);
+    let store = make_store();
+    let key = DocumentId::new(format!("{TEST_TABLE_ID_HEX}/{ID_IAN_HEX}"));
+
+    match store.read_point(&key, 100) {
+        Err(StoreError::Stale { requested, latest }) => {
+            assert_eq!(requested, 100);
+            assert_eq!(latest, 150, "latest must carry the floor");
+        }
+        other => panic!("expected Stale below the floor, got {other:?}"),
+    }
+
+    // At/above the floor reads stay normal — the visible revision's own
+    // ts may sit below the floor (retention bounds snapshots, not
+    // revision ages).
+    let value = store.read_point(&key, 150).expect("at-floor read");
+    assert_eq!(value.version, Some(100));
+    let value = store.read_point(&key, 200).expect("above-floor read");
+    assert_eq!(value.version, Some(100));
+}
+
+/// Same gate on the scan path: an Exhausted certificate minted below
+/// the floor would falsely attest absence for vacuumed keys.
+#[test]
+fn scan_prefix_below_retention_floor_returns_stale() {
+    reset_fixture(&url());
+    set_min_document_snapshot_ts(150);
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    match store.scan_prefix(&prefix, 100, 100) {
+        Err(StoreError::Stale { requested, latest }) => {
+            assert_eq!(requested, 100);
+            assert_eq!(latest, 150);
+        }
+        other => panic!("expected Stale below the floor, got {other:?}"),
+    }
+
+    let (cert, entries) = store
+        .scan_prefix(&prefix, 100, 200)
+        .expect("above-floor scan");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 2);
+}
+
+/// Missing floor key (fixtures/fresh deployments) means floor 0 — reads
+/// at any snapshot behave normally; a low floor is equally harmless.
+#[test]
+fn reads_with_absent_or_low_retention_floor_behave_normally() {
+    reset_fixture(&url()); // seed.sql sets no min_document_snapshot_ts
+    let store = make_store();
+    let key = DocumentId::new(format!("{TEST_TABLE_ID_HEX}/{ID_IAN_HEX}"));
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+
+    let value = store.read_point(&key, 50).expect("absent floor read");
+    assert!(
+        value.version.is_none(),
+        "pre-insert snapshot is missing, not Stale"
+    );
+
+    set_min_document_snapshot_ts(50);
+    let value = store.read_point(&key, 100).expect("low-floor read");
+    assert_eq!(value.version, Some(100));
+    let (cert, entries) = store
+        .scan_prefix(&prefix, 100, 150)
+        .expect("low-floor scan");
+    cert.validate().expect("valid certificate");
+    assert_eq!(entries.len(), 1, "ts=150 sees only the first insert");
+}
+
+/// `decode_hex` accepts uppercase hex but keys re-encode lowercase —
+/// the certificate interval must be canonicalized to the same form, or
+/// every returned key fails `interval.contains` and the broker seals a
+/// structurally invalid capsule (KeyOutsideInterval at verify time).
+#[test]
+fn scan_prefix_with_uppercase_prefix_yields_canonical_valid_certificate() {
+    reset_fixture(&url());
+    let store = make_store();
+    let upper = format!("{}/", TEST_TABLE_ID_HEX.to_uppercase());
+    let lower = format!("{TEST_TABLE_ID_HEX}/");
+
+    let (cert, entries) = store.scan_prefix(&upper, 100, 200).expect("uppercase scan");
+    assert_eq!(entries.len(), 2, "same rows as the lowercase form");
+    cert.validate()
+        .expect("uppercase prefix must still yield a structurally valid certificate");
+    assert_eq!(
+        cert.interval,
+        KeyInterval::Prefix(lower.clone()),
+        "interval must be the canonical lowercase wire form"
+    );
+    for (id, _) in &entries {
+        assert!(id.0.starts_with(&lower), "keys are lowercase: {id:?}");
+    }
+}
+
+#[test]
+fn scan_prefix_rejects_zero_limit() {
+    reset_fixture(&url());
+    let store = make_store();
+    let prefix = format!("{TEST_TABLE_ID_HEX}/");
+    match store.scan_prefix(&prefix, 0, 200) {
+        Err(StoreError::Backend(msg)) => {
+            assert!(
+                msg.contains("limit"),
+                "message should name the limit: {msg}"
+            )
+        }
+        other => panic!("limit=0 must be a Backend error, got {other:?}"),
+    }
 }
 
 #[test]

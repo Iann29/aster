@@ -10,13 +10,18 @@
 //! structs from the other side of the socket.
 
 pub mod bundle;
+pub mod launch;
+pub mod policy;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use aster_broker::{BrokerError, CapsuleBrokerClient};
-use aster_capsule::{DeploymentId, DocumentId, SealContext, SealedCapsule, TenantId};
+use aster_broker::{BrokerError, CapsuleBrokerClient, CommitOutcome};
+use aster_capsule::{
+    DeploymentId, Document, DocumentId, SealContext, SealedCapsule, SessionBinding, TenantId,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
@@ -27,9 +32,19 @@ use serde::{Deserialize, Serialize};
 /// per-deployment and much lower for point-read traps.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Session ids on the wire (Repair C-CHANNEL): `InitialCapsule` mints one
+/// and returns it in the grant; every later capsule verb must present it.
+/// The broker treats the presented id purely as a lookup key into its own
+/// session table — it rebuilds the bound `SealContext` from that table and
+/// only checks the request's serialized `context` for equality, never
+/// trusting it as authority. `session: None` on a capsule verb is an
+/// explicit unbound request, which the broker rejects with a structured
+/// error rather than falling back to unbound verification.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     InitialCapsule {
+        #[serde(default)]
+        launch_token: Option<String>,
         context: SealContext,
         tenant: TenantId,
         deployment: DeploymentId,
@@ -38,24 +53,123 @@ pub enum IpcRequest {
     },
     HydratePoint {
         context: SealContext,
+        session: Option<SessionBinding>,
         capsule: SealedCapsule,
         key: DocumentId,
     },
+    HydratePrefix {
+        context: SealContext,
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    },
+    MintDocumentId {
+        context: SealContext,
+        session: Option<SessionBinding>,
+        table: String,
+    },
     LoadModuleBundle {
         context: SealContext,
+        session: Option<SessionBinding>,
         capsule: SealedCapsule,
         path: String,
+    },
+    /// The write path (S9a): submit the sealed capsule, the declared
+    /// dependency subset (the theorem's Variante B `S`), and the write
+    /// set for fenced commit. Unlike the hydrate verbs there is no
+    /// separate `context` claim — the capsule's own seal fields are the
+    /// claimed context the broker checks against its session table before
+    /// the seal MAC enforces the binding. ANY structured answer (success
+    /// or rejection past the session gate) CLOSES the session: one
+    /// session = one transaction attempt.
+    Commit {
+        session: Option<SessionBinding>,
+        capsule: SealedCapsule,
+        /// Declared point observations, by key. Every key must reference
+        /// an atom the sealed capsule carries (B-SUBSET); a capsule key
+        /// left undeclared is legal and demotes that dependency to an
+        /// authorized blind write (Variante B omission, T2).
+        declared_reads: Vec<DocumentId>,
+        /// `Some(document)` puts, `None` deletes.
+        writes: Vec<(DocumentId, Option<Document>)>,
+    },
+    /// No-commit end-of-life for a session: closes it without touching
+    /// the fence. Unknown ids are rejected (`unknown_session`), never
+    /// silently ignored.
+    Abort {
+        session: SessionBinding,
     },
     Shutdown,
 }
 
+/// What `InitialCapsule` hands back: the sealed capsule plus the freshly
+/// minted session id the cell must present on every subsequent verb.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitialCapsuleGrant {
+    pub capsule: SealedCapsule,
+    pub session: SessionBinding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IpcResponse {
-    InitialCapsule(Result<SealedCapsule, WireBrokerError>),
+    InitialCapsule(Result<InitialCapsuleGrant, WireBrokerError>),
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
+    HydratePrefix(Result<SealedCapsule, WireBrokerError>),
+    MintDocumentId(Result<DocumentId, WireBrokerError>),
     LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
+    Commit(Result<WireCommitOutcome, WireBrokerError>),
+    Abort(Result<(), WireBrokerError>),
     ShutdownAck,
     Error(WireBrokerError),
+}
+
+/// Wire mirror of the fence's `CommitOutcome` — field-for-field parity
+/// with `aster_broker::CommitOutcome` so the committer's answer crosses
+/// the socket lossless.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WireCommitOutcome {
+    Committed {
+        ts: u64,
+    },
+    /// A committed write in `(s, h]` intersects a declared observation.
+    Conflict {
+        key: DocumentId,
+    },
+    /// The committer or the capsule context is stale relative to the
+    /// storage lease authority.
+    StaleEpoch {
+        lease_epoch: u64,
+    },
+    /// The capsule claims a snapshot the log has never committed
+    /// (S-SNAPSHOT violation — honest brokers cannot produce this).
+    SnapshotBeyondHorizon {
+        horizon: u64,
+    },
+    /// Validation history below the snapshot is no longer retained;
+    /// retry from a fresh snapshot.
+    RetentionViolated {
+        low_watermark: u64,
+    },
+    /// Mutations-only path: an empty write set never enters the log.
+    EmptyWriteSet,
+}
+
+impl From<CommitOutcome> for WireCommitOutcome {
+    fn from(value: CommitOutcome) -> Self {
+        match value {
+            CommitOutcome::Committed { ts } => Self::Committed { ts },
+            CommitOutcome::Conflict { key } => Self::Conflict { key },
+            CommitOutcome::StaleEpoch { lease_epoch } => Self::StaleEpoch { lease_epoch },
+            CommitOutcome::SnapshotBeyondHorizon { horizon } => {
+                Self::SnapshotBeyondHorizon { horizon }
+            }
+            CommitOutcome::RetentionViolated { low_watermark } => {
+                Self::RetentionViolated { low_watermark }
+            }
+            CommitOutcome::EmptyWriteSet => Self::EmptyWriteSet,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -105,6 +219,7 @@ impl From<BrokerError> for WireBrokerError {
             BrokerError::Seal(error) => Self::new(format!("seal_{error:?}"), value.to_string()),
             BrokerError::TenantMismatch => Self::new("tenant_mismatch", value.to_string()),
             BrokerError::DeploymentMismatch => Self::new("deployment_mismatch", value.to_string()),
+            BrokerError::ZeroScanLimit => Self::new("zero_scan_limit", value.to_string()),
             BrokerError::Remote(_) => Self::new("remote", value.to_string()),
         }
     }
@@ -151,6 +266,11 @@ impl From<serde_json::Error> for IpcError {
 
 pub type IpcResult<T> = Result<T, IpcError>;
 
+/// Serializes fully before touching the socket: an oversized message
+/// returns `FrameTooLarge` with zero bytes on the wire, leaving the stream
+/// clean. brokerd's `send_response` relies on that ordering to substitute
+/// a small structured `response_too_large` frame — don't switch this to
+/// streaming serialization without revisiting that fallback.
 pub fn write_frame<T: Serialize>(stream: &mut UnixStream, message: &T) -> IpcResult<()> {
     let bytes = serde_json::to_vec(message)?;
     if bytes.len() > MAX_FRAME_BYTES {
@@ -186,19 +306,79 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> IpcR
 
 /// UDS implementation of the v0.2 broker trait.
 ///
-/// This type intentionally contains only a socket path. It has no store handle,
-/// no seal key, and no way to read documents except by presenting a valid sealed
-/// capsule to the broker process.
+/// This type intentionally contains only a socket path plus the current
+/// session id. It has no store handle, no seal key, and no way to read
+/// documents except by presenting a valid sealed capsule to the broker
+/// process.
+///
+/// Session handling: `initial_capsule` atomically reserves the shared slot,
+/// then stores the broker-minted session id. A second initialization on the
+/// same client (including through a clone) is rejected until `commit` or
+/// `abort` closes the active session. This prevents silently orphaning the
+/// previous broker-side capability.
+#[derive(Clone, Copy, Debug, Default)]
+enum ClientSession {
+    #[default]
+    Idle,
+    Initializing,
+    Active(SessionBinding),
+}
 #[derive(Clone, Debug)]
 pub struct UdsCapsuleBrokerClient {
     socket_path: PathBuf,
+    launch_token: Option<Arc<str>>,
+    session: Arc<Mutex<ClientSession>>,
 }
 
 impl UdsCapsuleBrokerClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            launch_token: None,
+            session: Arc::new(Mutex::new(ClientSession::Idle)),
         }
+    }
+
+    pub fn with_launch_token(
+        socket_path: impl Into<PathBuf>,
+        launch_token: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            launch_token: Some(launch_token.into()),
+            session: Arc::new(Mutex::new(ClientSession::Idle)),
+        }
+    }
+
+    /// The active session id, if initialization completed successfully.
+    pub fn session(&self) -> Option<SessionBinding> {
+        match *self.session.lock().expect("session slot lock") {
+            ClientSession::Active(session) => Some(session),
+            ClientSession::Idle | ClientSession::Initializing => None,
+        }
+    }
+
+    fn reserve_session(&self) -> Result<(), BrokerError> {
+        let mut slot = self.session.lock().expect("session slot lock");
+        match *slot {
+            ClientSession::Idle => {
+                *slot = ClientSession::Initializing;
+                Ok(())
+            }
+            ClientSession::Initializing | ClientSession::Active(_) => Err(BrokerError::Remote(
+                "initial_capsule called while this client already owns a transaction session; \
+                 commit or abort it before starting another"
+                    .into(),
+            )),
+        }
+    }
+
+    fn store_session(&self, session: SessionBinding) {
+        *self.session.lock().expect("session slot lock") = ClientSession::Active(session);
+    }
+
+    fn clear_session(&self) {
+        *self.session.lock().expect("session slot lock") = ClientSession::Idle;
     }
 
     pub fn shutdown(&self) -> IpcResult<()> {
@@ -225,6 +405,7 @@ impl UdsCapsuleBrokerClient {
     ) -> IpcResult<Option<Vec<u8>>> {
         match self.call(IpcRequest::LoadModuleBundle {
             context: context.clone(),
+            session: self.session(),
             capsule,
             path: path.into(),
         })? {
@@ -237,6 +418,78 @@ impl UdsCapsuleBrokerClient {
                 )))
             }
             _ => Err(IpcError::UnexpectedResponse("LoadModuleBundle")),
+        }
+    }
+
+    /// Close the loop: submit the sealed capsule, the declared dependency
+    /// subset (Variante B), and the write set for fenced commit, on the
+    /// held session. The broker closes the session on every structured
+    /// answer (one session = one transaction attempt), so the held id is
+    /// dropped before returning — the next transaction starts with a
+    /// fresh `initial_capsule`. Structured broker rejections fold into
+    /// `IpcError::Protocol` (same shape as `load_module_bundle`); fence
+    /// outcomes — including `Conflict` — are the `Ok` value.
+    pub fn commit(
+        &self,
+        capsule: SealedCapsule,
+        declared_reads: Vec<DocumentId>,
+        writes: Vec<(DocumentId, Option<Document>)>,
+    ) -> IpcResult<WireCommitOutcome> {
+        let response = self.call(IpcRequest::Commit {
+            session: self.session(),
+            capsule,
+            declared_reads,
+            writes,
+        })?;
+        match response {
+            IpcResponse::Commit(result) => {
+                // Every structured Commit answer leaves no live broker-side
+                // session: the broker closes a table-registered session even
+                // when the gate rejects the attempt (context mismatch), and
+                // the other gate rejections mean nothing was registered —
+                // so dropping the held id here can never orphan one.
+                self.clear_session();
+                result.map_err(|error| {
+                    IpcError::Protocol(format!(
+                        "broker rejected commit: {}: {}",
+                        error.code, error.message
+                    ))
+                })
+            }
+            IpcResponse::Error(error) => Err(IpcError::Protocol(format!(
+                "broker rejected commit: {}: {}",
+                error.code, error.message
+            ))),
+            _ => Err(IpcError::UnexpectedResponse("Commit")),
+        }
+    }
+
+    /// End the held session without committing (the no-commit half of
+    /// session end-of-life). The slot is cleared on any structured
+    /// answer — an `unknown_session` rejection means the session is gone
+    /// either way.
+    pub fn abort(&self) -> IpcResult<()> {
+        let Some(session) = self.session() else {
+            return Err(IpcError::Protocol(
+                "abort requires a session held from initial_capsule".into(),
+            ));
+        };
+        let response = self.call(IpcRequest::Abort { session })?;
+        match response {
+            IpcResponse::Abort(result) => {
+                self.clear_session();
+                result.map_err(|error| {
+                    IpcError::Protocol(format!(
+                        "broker rejected abort: {}: {}",
+                        error.code, error.message
+                    ))
+                })
+            }
+            IpcResponse::Error(error) => Err(IpcError::Protocol(format!(
+                "broker rejected abort: {}: {}",
+                error.code, error.message
+            ))),
+            _ => Err(IpcError::UnexpectedResponse("Abort")),
         }
     }
 
@@ -256,21 +509,33 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
         snapshot_ts: u64,
         prewarm: Vec<DocumentId>,
     ) -> Result<SealedCapsule, BrokerError> {
+        self.reserve_session()?;
         match self.call(IpcRequest::InitialCapsule {
+            launch_token: self.launch_token.as_deref().map(str::to_owned),
             context: context.clone(),
             tenant,
             deployment,
             snapshot_ts,
             prewarm,
         }) {
-            Ok(IpcResponse::InitialCapsule(result)) => {
-                result.map_err(|error| error.to_broker_error())
+            Ok(IpcResponse::InitialCapsule(Ok(grant))) => {
+                self.store_session(grant.session);
+                Ok(grant.capsule)
             }
-            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
-            Ok(_) => Err(BrokerError::Remote(
-                IpcError::UnexpectedResponse("InitialCapsule").to_string(),
-            )),
-            Err(error) => Err(BrokerError::Remote(error.to_string())),
+            Ok(IpcResponse::InitialCapsule(Err(error))) | Ok(IpcResponse::Error(error)) => {
+                self.clear_session();
+                Err(error.to_broker_error())
+            }
+            Ok(_) => {
+                self.clear_session();
+                Err(BrokerError::Remote(
+                    IpcError::UnexpectedResponse("InitialCapsule").to_string(),
+                ))
+            }
+            Err(error) => {
+                self.clear_session();
+                Err(BrokerError::Remote(error.to_string()))
+            }
         }
     }
 
@@ -282,6 +547,7 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
     ) -> Result<SealedCapsule, BrokerError> {
         match self.call(IpcRequest::HydratePoint {
             context: context.clone(),
+            session: self.session(),
             capsule,
             key,
         }) {
@@ -291,6 +557,52 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
             Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
             Ok(_) => Err(BrokerError::Remote(
                 IpcError::UnexpectedResponse("HydratePoint").to_string(),
+            )),
+            Err(error) => Err(BrokerError::Remote(error.to_string())),
+        }
+    }
+
+    fn hydrate_prefix(
+        &self,
+        context: &SealContext,
+        capsule: SealedCapsule,
+        prefix: String,
+        limit: usize,
+    ) -> Result<SealedCapsule, BrokerError> {
+        match self.call(IpcRequest::HydratePrefix {
+            context: context.clone(),
+            session: self.session(),
+            capsule,
+            prefix,
+            limit,
+        }) {
+            Ok(IpcResponse::HydratePrefix(result)) => {
+                result.map_err(|error| error.to_broker_error())
+            }
+            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
+            Ok(_) => Err(BrokerError::Remote(
+                IpcError::UnexpectedResponse("HydratePrefix").to_string(),
+            )),
+            Err(error) => Err(BrokerError::Remote(error.to_string())),
+        }
+    }
+
+    fn mint_document_id(
+        &self,
+        context: &SealContext,
+        table: &str,
+    ) -> Result<DocumentId, BrokerError> {
+        match self.call(IpcRequest::MintDocumentId {
+            context: context.clone(),
+            session: self.session(),
+            table: table.to_string(),
+        }) {
+            Ok(IpcResponse::MintDocumentId(result)) => {
+                result.map_err(|error| error.to_broker_error())
+            }
+            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
+            Ok(_) => Err(BrokerError::Remote(
+                IpcError::UnexpectedResponse("MintDocumentId").to_string(),
             )),
             Err(error) => Err(BrokerError::Remote(error.to_string())),
         }

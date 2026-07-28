@@ -1,0 +1,24 @@
+date: 2026-07-16T10:33:30-03:00
+git: 8cb09c7321ea7468b64b2ebe837258a482c3499a (v0.7-s10)
+kernel: Linux 7.0.9-arch2-1
+cpu: AMD Ryzen 7 5800H with Radeon Graphics (nproc=16)
+mem: MemTotal:       32705232 kB
+rustc: rustc 1.94.1 (e408947bf 2026-03-25)
+cargo: cargo 1.94.1 (29ea6fb6a 2026-03-24)
+postgres: PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+pg container: aster-pg-dev on 127.0.0.1:5433
+
+background load (this is a developer workstation — a docker dev
+stack runs alongside the bench; snapshot below):
+ 10:33:31 up 12:35,  1 user,  load average: 2.19, 1.63, 1.52
+aster-pg-dev	0.00%	64.27MiB / 31.19GiB
+synapse-dashboard	0.00%	20.73MiB / 31.19GiB
+synapse-api	0.37%	25.47MiB / 31.19GiB
+jumpy-engine	0.00%	30.92MiB / 4GiB
+synapse-convex-dashboard-proxy	0.00%	15.77MiB / 31.19GiB
+synapse-convex-dashboard	0.00%	5.566MiB / 31.19GiB
+synapse-postgres	3.01%	58.75MiB / 31.19GiB
+jumpy-engine-caddy-dev-1	0.29%	37.34MiB / 31.19GiB
+
+# appended 2026-07-16 (adversarial review A6): durability GUCs verified live
+postgres GUCs: synchronous_commit=on, fsync=on, shared_buffers=128MB

@@ -15,7 +15,7 @@
 #      mounted; wait for `ready socket=`.
 #   5. Run v8cell with `ASTER_MODULE_PATH=messages.js` +
 #      `ASTER_FUNCTION_NAME=getById` +
-#      `ASTER_ARGS_JSON=[{"id":"<aster wire id>"}]`. The cell loads the
+#      `ASTER_ARGS_JSON=[{"id":"<canonical Convex IDv6>"}]`. The cell loads the
 #      bundle ZIP via `LoadModuleBundle`, compiles it as ESM, calls
 #      `getById.invokeQuery(args)`, which fires
 #      `Convex.asyncSyscall("1.0/get", {id})` — that lands at the
@@ -37,9 +37,8 @@
 #   - The IDv6 + `_modules` × `_source_packages` join — exactly the
 #     surface a Synapse-provisioned cell will hit in production.
 #
-# Reuses the conventions of `docker/smoke-postgres.sh`: shared volume
-# for the UDS, transient network, EXIT trap that cleans up containers
-# + volumes + tmp dirs.
+# Uses a host-UID runtime directory for the UDS and secrets, a transient
+# database network, and an EXIT trap that cleans up containers + temp dirs.
 #
 # Usage:
 #   docker/smoke-bundle.sh [tag]
@@ -56,11 +55,17 @@ BROKERD_IMAGE="${ASTER_BROKERD_IMAGE:-aster-brokerd:${TAG}}"
 V8CELL_IMAGE="${ASTER_V8CELL_IMAGE:-aster-v8cell:${TAG}}"
 SUFFIX="$(date +%s)-$$"
 NETWORK="aster-bundle-smoke-${SUFFIX}"
-VOLUME="aster-bundle-smoke-sock-${SUFFIX}"
+STATE_DIR="$(mktemp -d /tmp/aster-bundle-smoke-state.XXXXXX)"
 BROKER="aster-bundle-smoke-brokerd-${SUFFIX}"
 PG_CONTAINER="aster-bundle-smoke-postgres-${SUFFIX}"
 PG_PASSWORD="${ASTER_PG_PASSWORD:-aster}"
+POSTGRES_IMAGE="${ASTER_POSTGRES_IMAGE:-postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c}"
 SCHEMA="convex_dev"
+RUNTIME_UID="$(id -u)"
+RUNTIME_GID="$(id -g)"
+COMPOSE_MODE="${ASTER_PRODUCTION_COMPOSE_SMOKE:-0}"
+COMPOSE_PROJECT="aster-bundle-smoke-${SUFFIX}"
+COMPOSE_FILE="${HERE}/compose.production.yml"
 
 # Bundle staging directory on the host. The brokerd container bind-
 # mounts this read-only at `/run/aster/modules`; the storage adapter
@@ -97,28 +102,24 @@ MODULES_TABLET_HEX="aaaa1111aaaa1111aaaa1111aaaa1111"
 # inside the `_modules` tablet. Picking `cafe...` for grep-ability.
 MODULE_ROW_HEX="cafecafecafecafecafecafecafecafe"
 
-# User-table tablet (`messages`) — also from seed.sql. Used to build
-# the Aster wire form `<table_hex>/<id_hex>` for the `db.get(id)` arg.
-MESSAGES_TABLET_HEX="0123456789abcdef0123456789abcdef"
+# User-table number from seed.sql. The checked-in IDv6 helper combines it
+# with the internal document id into the canonical point spelling.
+MESSAGES_TABLE_NUMBER="10001"
 
-# Existing seeded document under that tablet (body
-# `{"name":"ian", ...}`).
+# Existing seeded document under that tablet.
 MESSAGE_DOC_HEX="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-# Aster wire form the bundle's `getById` will receive. The bundle
-# pipes `args.id` straight into `Convex.asyncSyscall("1.0/get", {id})`;
-# the cell-side syscall handler keys off the literal string. The
-# Postgres adapter accepts EITHER an IDv6 string OR this Aster wire
-# form (`<table_hex>/<id_hex>`) — the latter is shorter and skips the
-# IDv6→tablet roundtrip, so we use it in the smoke.
-WIRE_ID="${MESSAGES_TABLET_HEX}/${MESSAGE_DOC_HEX}"
+WIRE_ID=""
 
 cleanup() {
     rc=$?
     set +e
+    if [[ "${COMPOSE_MODE}" == "1" ]]; then
+        docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" \
+            down --remove-orphans >/dev/null 2>&1
+    fi
     docker rm -f "${BROKER}" >/dev/null 2>&1
     docker rm -f "${PG_CONTAINER}" >/dev/null 2>&1
-    docker volume rm "${VOLUME}" >/dev/null 2>&1
+    rm -rf "${STATE_DIR}"
     docker network rm "${NETWORK}" >/dev/null 2>&1
     [[ -n "${MODULES_DIR}" ]] && rm -rf "${MODULES_DIR}"
     [[ -n "${TMPDIR_TENANT}" ]] && rm -rf "${TMPDIR_TENANT}"
@@ -126,9 +127,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> creating network + volume (suffix: ${SUFFIX})"
+echo "==> creating network + runtime state (suffix: ${SUFFIX})"
 docker network create "${NETWORK}" >/dev/null
-docker volume create "${VOLUME}" >/dev/null
+dd if=/dev/urandom of="${STATE_DIR}/seal.key" bs=32 count=1 status=none
+dd if=/dev/urandom of="${STATE_DIR}/launch.key" bs=32 count=1 status=none
+printf 'postgres://aster:%s@postgres:5432/aster\n' "${PG_PASSWORD}" >"${STATE_DIR}/db_url"
+chmod 0600 "${STATE_DIR}/seal.key" "${STATE_DIR}/launch.key" "${STATE_DIR}/db_url"
 
 # ---------------------------------------------------------------------
 # Stage the bundle on disk.
@@ -202,6 +206,27 @@ if [[ -z "${SP_IDV6}" ]]; then
     exit 1
 fi
 echo "==> sourcePackageId = ${SP_IDV6}"
+WIRE_ID="$(cd "${REPO_ROOT}" && cargo run --release --quiet \
+    -p aster-convex-codec --example idv6_smoke_helper -- \
+    "${MESSAGES_TABLE_NUMBER}" "${MESSAGE_DOC_HEX}")"
+if [[ -z "${WIRE_ID}" ]]; then
+    echo "ERROR: message idv6 helper produced empty output"
+    exit 1
+fi
+cat >"${STATE_DIR}/policy.json" <<JSON
+{
+  "version": 1,
+  "read_prefixes": ["j"],
+  "write_prefixes": ["j"],
+  "module_prefixes": ["messages.js"],
+  "insert_tables": ["messages"],
+  "max_reads_per_transaction": 8,
+  "max_writes_per_transaction": 4,
+  "max_scan_limit": 8,
+  "max_concurrent_sessions": 4,
+  "session_ttl_seconds": 60
+}
+JSON
 
 # ---------------------------------------------------------------------
 # Build the JSON bodies for `_source_packages` + `_modules` rows.
@@ -258,7 +283,7 @@ echo "==> starting postgres:16"
 docker run -d --name "${PG_CONTAINER}" --network "${NETWORK}" \
     --network-alias postgres \
     -e POSTGRES_USER=aster -e POSTGRES_PASSWORD="${PG_PASSWORD}" -e POSTGRES_DB=aster \
-    postgres:16 >/dev/null
+    "${POSTGRES_IMAGE}" >/dev/null
 
 echo "==> waiting for postgres ready"
 for i in $(seq 1 60); do
@@ -311,39 +336,147 @@ SQL
 # Boot brokerd with the bundle dir mounted + ASTER_STORE=postgres.
 
 echo "==> starting brokerd (ASTER_STORE=postgres, modules dir mounted)"
-docker run -d --name "${BROKER}" --network "${NETWORK}" \
-    -v "${VOLUME}:/run/aster" \
-    -v "${MODULES_DIR}:/run/aster/modules:ro" \
-    -e ASTER_BROKER_SOCK=/run/aster/broker.sock \
-    -e ASTER_TENANT=tenant-bundle-smoke \
-    -e ASTER_DEPLOYMENT=dep-bundle-smoke \
-    -e ASTER_SEAL_SEED=bundle-smoke-seed \
-    -e ASTER_STORE=postgres \
-    -e ASTER_DB_URL="postgres://aster:${PG_PASSWORD}@postgres:5432/aster" \
-    -e ASTER_DB_SCHEMA="${SCHEMA}" \
-    -e ASTER_MODULES_DIR=/run/aster/modules \
-    -e ASTER_SNAPSHOT_TS=200 \
-    -e ASTER_MAX_CONNECTIONS=8 \
-    "${BROKERD_IMAGE}" >/dev/null
+if [[ "${COMPOSE_MODE}" == "1" ]]; then
+    export ASTER_COMPOSE_FILE="${COMPOSE_FILE}"
+    export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}"
+    export ASTER_BROKER_IMAGE="${BROKERD_IMAGE}"
+    export ASTER_CELL_IMAGE="${V8CELL_IMAGE}"
+    export ASTER_DB_URL_FILE="${STATE_DIR}/db_url"
+    export ASTER_SEAL_KEY_FILE="${STATE_DIR}/seal.key"
+    export ASTER_LAUNCH_KEY_FILE="${STATE_DIR}/launch.key"
+    export ASTER_AUTHORITY_EPOCH_FILE="${STATE_DIR}/authority_epoch"
+    export ASTER_POLICY_FILE="${STATE_DIR}/policy.json"
+    export ASTER_MODULES_DIR="${MODULES_DIR}"
+    export ASTER_RUNTIME_DIR="${STATE_DIR}"
+    export ASTER_RUNTIME_UID="${RUNTIME_UID}"
+    export ASTER_RUNTIME_GID="${RUNTIME_GID}"
+    export ASTER_DATABASE_NETWORK="${NETWORK}"
+    export ASTER_DB_SCHEMA="${SCHEMA}"
+    export ASTER_TENANT=tenant-bundle-smoke
+    export ASTER_DEPLOYMENT=dep-bundle-smoke
+    export ASTER_CELL_ID=cell-bundle-smoke-1
+    export ASTER_MODULE_PATH=messages.js
+    export ASTER_FUNCTION_NAME=getById
+    export ASTER_ARGS_JSON='[]'
+    docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" \
+        up -d --wait brokerd >/dev/null
+else
+    docker run -d --name "${BROKER}" --network "${NETWORK}" \
+        --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+        --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        --pids-limit 64 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=${RUNTIME_UID},gid=${RUNTIME_GID}" \
+        -v "${STATE_DIR}:/run/aster" \
+        -v "${MODULES_DIR}:/run/aster-modules:ro" \
+        -e ASTER_BROKER_SOCK=/run/aster/broker.sock \
+        -e ASTER_TENANT=tenant-bundle-smoke \
+        -e ASTER_DEPLOYMENT=dep-bundle-smoke \
+        -e ASTER_SEAL_KEY_FILE=/run/aster/seal.key \
+        -e ASTER_LAUNCH_KEY_FILE=/run/aster/launch.key \
+        -e ASTER_AUTHORITY_EPOCH_FILE=/run/aster/authority_epoch \
+        -e ASTER_POLICY_FILE=/run/aster/policy.json \
+        -e ASTER_STORE=postgres \
+        -e ASTER_DB_URL_FILE=/run/aster/db_url \
+        -e ASTER_DB_SCHEMA="${SCHEMA}" \
+        -e ASTER_MODULES_DIR=/run/aster-modules \
+        "${BROKERD_IMAGE}" >/dev/null
+fi
+
+broker_logs() {
+    if [[ "${COMPOSE_MODE}" == "1" ]]; then
+        docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" \
+            logs --no-color brokerd
+    else
+        docker logs "${BROKER}"
+    fi
+}
 
 echo "==> waiting for broker ready"
 for i in $(seq 1 100); do
-    if docker logs "${BROKER}" 2>&1 | grep -q "ready socket="; then
+    if broker_logs 2>&1 | grep -q "ready socket="; then
         break
     fi
     if [[ "$i" == "100" ]]; then
         echo "ERROR: broker did not log 'ready socket=' within 10s"
-        docker logs "${BROKER}" 2>&1 | sed 's/^/  /'
+        broker_logs 2>&1 | sed 's/^/  /'
         exit 1
     fi
     sleep 0.1
 done
 
-if ! docker logs "${BROKER}" 2>&1 | grep -q "store=postgres"; then
+if ! broker_logs 2>&1 | grep -q "store=postgres"; then
     echo "ERROR: broker did not log 'store=postgres' — dispatch failed"
-    docker logs "${BROKER}" 2>&1 | sed 's/^/  /'
+    broker_logs 2>&1 | sed 's/^/  /'
     exit 1
 fi
+
+# S9a: a postgres-mode brokerd acquires its epoch from the storage lease
+# authority at boot (ASTER_LEASE_EPOCH is ignored) and refuses to mint
+# sessions for any other epoch — the cell must claim the logged value.
+LEASE_EPOCH="$(broker_logs 2>&1 | sed -n 's/.*lease epoch=\([0-9][0-9]*\).*/\1/p' | head -1)"
+if [[ -z "${LEASE_EPOCH}" ]]; then
+    echo "ERROR: broker did not log its lease epoch"
+    broker_logs 2>&1 | sed 's/^/  /'
+    exit 1
+fi
+echo "==> broker lease epoch: ${LEASE_EPOCH}"
+docker exec "${PG_CONTAINER}" psql -U aster -d aster -v ON_ERROR_STOP=1 \
+    -c "INSERT INTO aster.log (tenant, deployment, ts, key, epoch, document)
+        VALUES (
+          'tenant-bundle-smoke',
+          'dep-bundle-smoke',
+          1,
+          '${WIRE_ID}',
+          ${LEASE_EPOCH},
+          '{\"_raw\":{\"Text\":\"{\\\"_id\\\":\\\"${WIRE_ID}\\\",\\\"name\\\":\\\"ian\\\"}\"}}'
+        )" >/dev/null
+issue_launch_token() {
+    cell_id=$1
+    docker run --rm --network none --read-only \
+        --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+        --cap-drop ALL --security-opt no-new-privileges:true \
+        --entrypoint /usr/local/bin/aster_launch_token \
+        -v "${STATE_DIR}:/run/aster:ro" \
+        -e ASTER_LAUNCH_KEY_FILE=/run/aster/launch.key \
+        -e ASTER_AUTHORITY_EPOCH_FILE=/run/aster/authority_epoch \
+        "${BROKERD_IMAGE}" \
+        "${cell_id}" tenant-bundle-smoke dep-bundle-smoke current 60
+}
+
+run_cell() {
+    cell_id=$1
+    function_name=$2
+    args_json=$3
+    if [[ "${COMPOSE_MODE}" == "1" ]]; then
+        ASTER_CELL_ID="${cell_id}" \
+        ASTER_FUNCTION_NAME="${function_name}" \
+        ASTER_ARGS_JSON="${args_json}" \
+        "${HERE}/aster-invoke"
+        return
+    fi
+
+    launch_token="$(issue_launch_token "${cell_id}")"
+    docker run --rm \
+        --network none \
+        --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+        --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        --pids-limit 64 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=${RUNTIME_UID},gid=${RUNTIME_GID}" \
+        -v "${STATE_DIR}:/run/aster:ro" \
+        -e ASTER_BROKER_SOCK=/run/aster/broker.sock \
+        -e ASTER_TENANT=tenant-bundle-smoke \
+        -e ASTER_DEPLOYMENT=dep-bundle-smoke \
+        -e ASTER_CELL_ID="${cell_id}" \
+        -e ASTER_LEASE_EPOCH="${LEASE_EPOCH}" \
+        -e ASTER_LAUNCH_TOKEN="${launch_token}" \
+        -e ASTER_PREWARM= \
+        -e ASTER_MAX_TRAPS=8 \
+        -e ASTER_MODULE_PATH=messages.js \
+        -e ASTER_FUNCTION_NAME="${function_name}" \
+        -e ASTER_ARGS_JSON="${args_json}" \
+        "${V8CELL_IMAGE}"
+}
+
 
 # ---------------------------------------------------------------------
 # Run v8cell against the bundle.
@@ -355,21 +488,7 @@ fi
 
 ARGS_JSON='[{"id":"'"${WIRE_ID}"'"}]'
 echo "==> running v8cell (module=messages.js, function=getById, id=${WIRE_ID})"
-output="$(docker run --rm \
-    --network "${NETWORK}" \
-    -v "${VOLUME}:/run/aster" \
-    -e ASTER_BROKER_SOCK=/run/aster/broker.sock \
-    -e ASTER_TENANT=tenant-bundle-smoke \
-    -e ASTER_DEPLOYMENT=dep-bundle-smoke \
-    -e ASTER_SNAPSHOT_TS=200 \
-    -e ASTER_CELL_ID=cell-bundle-smoke-1 \
-    -e ASTER_LEASE_EPOCH=11 \
-    -e ASTER_PREWARM= \
-    -e ASTER_MAX_TRAPS=8 \
-    -e ASTER_MODULE_PATH=messages.js \
-    -e ASTER_FUNCTION_NAME=getById \
-    -e ASTER_ARGS_JSON="${ARGS_JSON}" \
-    "${V8CELL_IMAGE}")"
+output="$(run_cell cell-bundle-smoke-1 getById "${ARGS_JSON}")"
 
 echo "==> v8cell stdout: ${output}"
 
@@ -381,23 +500,51 @@ echo "==> v8cell stdout: ${output}"
 # body, so we should see `name` (and `_id`) in there.
 
 # The envelope's `output` field is itself a JSON-encoded string —
-# the resolved value `JSON.stringify(convexToJson(doc))`. So the
 # document fields appear inside escaped quotes (`\"name\":\"ian\"`).
 # Match against the escaped form so a bash literal stays correct,
 # regardless of what `grep`'s glob does with bare double-quotes.
 if ! grep -q '\\"name\\":\\"ian\\"' <<<"${output}"; then
     echo "ERROR: expected name=\"ian\" in cell stdout (read from postgres via module-query)"
     echo "  full output: ${output}"
-    docker logs "${BROKER}" 2>&1 | tail -30 | sed 's/^/  brokerd: /'
+    broker_logs 2>&1 | tail -30 | sed 's/^/  brokerd: /'
     exit 1
 fi
-if ! grep -q '\\"_id\\":\\"messages|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\"' <<<"${output}"; then
+if ! grep -Fq "\\\"_id\\\":\\\"${WIRE_ID}\\\"" <<<"${output}"; then
     echo "ERROR: expected the seeded _id field in cell stdout"
     echo "  full output: ${output}"
     exit 1
 fi
 if ! grep -q '"traps":1' <<<"${output}"; then
     echo "ERROR: expected exactly one trap (the db.get → 1.0/get syscall)"
+    exit 1
+fi
+
+echo "==> running real seedIan mutation"
+mutation_output="$(run_cell cell-bundle-smoke-2 seedIan '[]')"
+echo "==> mutation stdout: ${mutation_output}"
+if ! grep -q '"transaction_status":"committed"' <<<"${mutation_output}"; then
+    echo "ERROR: real bundle mutation did not commit"
+    exit 1
+fi
+MINTED_ID="$(python3 -c '
+import json, sys
+envelope = json.loads(sys.argv[1])
+print(json.loads(envelope["output"]))
+' "${mutation_output}")"
+if [[ -z "${MINTED_ID}" || "${MINTED_ID}" == */* ]]; then
+    echo "ERROR: broker did not mint a canonical-looking Convex IDv6: ${MINTED_ID}"
+    exit 1
+fi
+
+READBACK_ARGS='[{"id":"'"${MINTED_ID}"'"}]'
+echo "==> reading committed mutation from a fresh cell (id=${MINTED_ID})"
+readback_output="$(run_cell cell-bundle-smoke-3 getById "${READBACK_ARGS}")"
+echo "==> readback stdout: ${readback_output}"
+if ! grep -q '\\"name\\":\\"ian\\"' <<<"${readback_output}" \
+    || ! grep -q '\\"body\\":\\"hello\\"' <<<"${readback_output}" \
+    || ! grep -Fq "\\\"_id\\\":\\\"${MINTED_ID}\\\"" <<<"${readback_output}" \
+    || ! grep -q '"transaction_status":"read_only"' <<<"${readback_output}"; then
+    echo "ERROR: a fresh cell did not observe the committed real-bundle insert"
     exit 1
 fi
 
