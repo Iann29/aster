@@ -1,0 +1,149 @@
+% References for "Authenticate the Reads, Not the Code".
+% Every entry verified against the public record on 2026-07-28
+% (dblp / ACM DL / USENIX / IEEE Xplore / arXiv / publisher pages).
+
+@inproceedings{fdb2021,
+  author    = {Zhou, Jingyu and Xu, Meng and Shraer, Alexander and Namasivayam, Balamurugan and Miller, Alex and Tschannen, Evan and Atherton, Steve and Beamon, Andrew J. and Sears, Rusty and Leach, John and Rosenthal, Dave and Dong, Xin and Wilson, Will and Collins, Ben and Scherer, David and Grieser, Alec and Liu, Young and Moore, Alvin and Muppana, Bhaskar and Su, Xiaoge and Yadav, Vishesh},
+  title     = {{FoundationDB}: A Distributed Unbundled Transactional Key Value Store},
+  booktitle = {Proceedings of the 2021 International Conference on Management of Data (SIGMOD '21)},
+  year      = {2021},
+  pages     = {2653--2666},
+  publisher = {ACM},
+  doi       = {10.1145/3448016.3457559}
+}
+
+@misc{fabricdocs,
+  author       = {{Hyperledger Fabric}},
+  title        = {Architecture Explained: Endorsing peer simulation and read/write sets},
+  howpublished = {Hyperledger Fabric documentation, \url{https://hyperledger-fabric.readthedocs.io/en/latest/arch-deep-dive.html}},
+  note         = {Accessed July 2026}
+}
+
+@inproceedings{basil2021,
+  author    = {Suri-Payer, Florian and Burke, Matthew and Wang, Zheng and Zhang, Yunhao and Alvisi, Lorenzo and Crooks, Natacha},
+  title     = {Basil: Breaking up {BFT} with {ACID} (transactions)},
+  booktitle = {Proceedings of the ACM SIGOPS 28th Symposium on Operating Systems Principles (SOSP '21)},
+  year      = {2021},
+  publisher = {ACM},
+  doi       = {10.1145/3477132.3483552}
+}
+
+@inproceedings{transedge2023,
+  author    = {Singh, Abhishek A. and Khan, Aasim and Mehrotra, Sharad and Nawab, Faisal},
+  title     = {{TransEdge}: Supporting Efficient Read Queries Across Untrusted Edge Nodes},
+  booktitle = {Proceedings of the 26th International Conference on Extending Database Technology (EDBT 2023)},
+  year      = {2023},
+  pages     = {684--696},
+  note      = {arXiv:2302.08019}
+}
+
+@inproceedings{fides2020,
+  author    = {Maiyya, Sujaya and Cho, Danny Hyun Bum and Agrawal, Divyakant and El Abbadi, Amr},
+  title     = {Fides: Managing Data on Untrusted Infrastructure},
+  booktitle = {Proceedings of the 40th IEEE International Conference on Distributed Computing Systems (ICDCS 2020)},
+  year      = {2020},
+  publisher = {IEEE},
+  note      = {arXiv:2001.06933}
+}
+
+@misc{blake3-2020,
+  author       = {O'Connor, Jack and Aumasson, Jean-Philippe and Neves, Samuel and Wilcox-O'Hearn, Zooko},
+  title        = {{BLAKE3}: one function, fast everywhere},
+  year         = {2020},
+  howpublished = {Specification and design paper, \url{https://github.com/BLAKE3-team/BLAKE3-specs}}
+}
+
+@inproceedings{ryoan2016,
+  author    = {Hunt, Tyler and Zhu, Zhiting and Xu, Yuanzhong and Peter, Simon and Witchel, Emmett},
+  title     = {Ryoan: A Distributed Sandbox for Untrusted Computation on Secret Data},
+  booktitle = {Proceedings of the 12th USENIX Symposium on Operating Systems Design and Implementation (OSDI '16)},
+  year      = {2016},
+  publisher = {USENIX Association}
+}
+
+@inproceedings{opaque2017,
+  author    = {Zheng, Wenting and Dave, Ankur and Beekman, Jethro G. and Popa, Raluca Ada and Gonzalez, Joseph E. and Stoica, Ion},
+  title     = {Opaque: An Oblivious and Encrypted Distributed Analytics Platform},
+  booktitle = {Proceedings of the 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI '17)},
+  year      = {2017},
+  publisher = {USENIX Association}
+}
+
+@inproceedings{enclavedb2018,
+  author    = {Priebe, Christian and Vaswani, Kapil and Costa, Manuel},
+  title     = {{EnclaveDB}: A Secure Database Using {SGX}},
+  booktitle = {Proceedings of the 2018 IEEE Symposium on Security and Privacy (S\&P)},
+  year      = {2018},
+  publisher = {IEEE}
+}
+
+@inproceedings{vc3-2015,
+  author    = {Schuster, Felix and Costa, Manuel and Fournet, C{\'e}dric and Gkantsidis, Christos and Peinado, Marcus and Mainar-Ruiz, Gloria and Russinovich, Mark},
+  title     = {{VC3}: Trustworthy Data Analytics in the Cloud Using {SGX}},
+  booktitle = {Proceedings of the 2015 IEEE Symposium on Security and Privacy (S\&P)},
+  year      = {2015},
+  publisher = {IEEE}
+}
+
+@inproceedings{cobra2020,
+  author    = {Tan, Cheng and Zhao, Changgeng and Mu, Shuai and Walfish, Michael},
+  title     = {Cobra: Making Transactional Key-Value Stores Verifiably Serializable},
+  booktitle = {Proceedings of the 14th USENIX Symposium on Operating Systems Design and Implementation (OSDI '20)},
+  year      = {2020},
+  publisher = {USENIX Association}
+}
+
+@inproceedings{sundr2004,
+  author    = {Li, Jinyuan and Krohn, Maxwell N. and Mazi{\`e}res, David and Shasha, Dennis},
+  title     = {Secure Untrusted Data Repository ({SUNDR})},
+  booktitle = {Proceedings of the 6th USENIX Symposium on Operating Systems Design and Implementation (OSDI '04)},
+  year      = {2004},
+  publisher = {USENIX Association}
+}
+
+@inproceedings{depot2010,
+  author    = {Mahajan, Prince and Setty, Srinath and Lee, Sangmin and Clement, Allen and Alvisi, Lorenzo and Dahlin, Mike and Walfish, Michael},
+  title     = {Depot: Cloud Storage with Minimal Trust},
+  booktitle = {Proceedings of the 9th USENIX Symposium on Operating Systems Design and Implementation (OSDI '10)},
+  year      = {2010},
+  publisher = {USENIX Association}
+}
+
+@inproceedings{ifdb2013,
+  author    = {Schultz, David and Liskov, Barbara},
+  title     = {{IFDB}: Decentralized Information Flow Control for Databases},
+  booktitle = {Proceedings of the 8th ACM European Conference on Computer Systems (EuroSys '13)},
+  year      = {2013},
+  publisher = {ACM}
+}
+
+@inproceedings{qapla2017,
+  author    = {Mehta, Aastha and Elnikety, Eslam and Harvey, Katura and Garg, Deepak and Druschel, Peter},
+  title     = {Qapla: Policy Compliance for Database-Backed Systems},
+  booktitle = {Proceedings of the 26th USENIX Security Symposium},
+  year      = {2017},
+  publisher = {USENIX Association}
+}
+
+@phdthesis{captp2006,
+  author = {Miller, Mark Samuel},
+  title  = {Robust Composition: Towards a Unified Approach to Access Control and Concurrency Control},
+  school = {Johns Hopkins University},
+  year   = {2006},
+  note   = {Defines the {CapTP} distributed capability protocol}
+}
+
+@inproceedings{gdp2019,
+  author    = {Mor, Nitesh and Pratt, Richard and Allman, Eric and Lutz, Ken and Kubiatowicz, John},
+  title     = {{Global Data Plane}: A Federated Vision for Secure Data in Edge Computing},
+  booktitle = {Proceedings of the 39th IEEE International Conference on Distributed Computing Systems (ICDCS 2019)},
+  year      = {2019},
+  publisher = {IEEE}
+}
+
+@misc{ctt2026,
+  author       = {B{\'e}e, Ian Lucas},
+  title        = {The {Capsule Transaction Theorem} --- a repaired proof for {Aster} v0.7, as amended by its {Seal-v3 and Session Protocol Addendum}},
+  year         = {2026},
+  howpublished = {Companion technical report, 27 pp. + addendum, \url{https://github.com/Iann29/aster/tree/main/paper/sources}}
+}

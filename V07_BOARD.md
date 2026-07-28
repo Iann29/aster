@@ -133,9 +133,14 @@ fechado SEM apagar F1; pointer do paper atualizado pra "the report, as
 amended, governs" + CLAIMS.md reconciliado; (2) ✅ 28/07 — texto do paper RECONCILIADO com o v0.8 (parágrafo a
 parágrafo, CLAIMS.md no mesmo commit; contagens re-carimbadas 22.112
 LOC / 287 testes; números de bench mantidos rotulados como campanha
-v0.7); (3) LaTeX + BibTeX com as citações confirmadas → arXiv (preprint
-honesto, timestamp); (4) campanha do venue — resta a eval fatorial F16
-(re-medir no caminho single-history do v0.8 + baselines do §6.5).
+v0.7); (3) ✅ 28/07 — LaTeX + BibTeX PRONTOS (`paper/latex/`: main.tex via
+pandoc + pós-processamento, references.bib com TODAS as citações
+verificadas na web — 6 numeradas + 11 sistemas in-text + 3 incidentes
+com URL em footnote; 29 pp., pdflatex do arXiv compila limpo, 0 refs
+indefinidas). Resta do lado do Ian: revisão visual do PDF + submissão
+arXiv (categoria/licença); (4) campanha do venue — resta a eval
+fatorial F16 (re-medir no caminho single-history do v0.8 + baselines
+do §6.5).
 
 **Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
 Iterações de cron: NADA a construir — reportar status em uma linha e
