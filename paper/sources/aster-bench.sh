@@ -134,7 +134,7 @@ bench() { # $1 = js file, $2 = label
 echo "==> benching (N=${N} each; one-shot container per invocation)"
 bench t0.js T0_noop
 bench t1.js T1_one_trap
-bench tk.js TK_${K}_traps
+bench tk.js "TK_${K}_traps"
 
 t0=$(awk -v n="${N}" 'NR==int(n*0.5)+1' /tmp/aster-bench-T0_noop.txt)
 t1=$(awk -v n="${N}" 'NR==int(n*0.5)+1' /tmp/aster-bench-T1_one_trap.txt)

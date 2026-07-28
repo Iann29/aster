@@ -1,4 +1,4 @@
-# Aster v0.7 — board de execução
+# Aster v0.7 + fechamento v0.8 — board de execução
 
 Write path + provas reais + paper. Fonte de verdade entre iterações do loop
 (o contexto da sessão pode resetar; este arquivo não). Atualizar a cada fatia
@@ -136,16 +136,62 @@ Iterações de cron: NADA a construir — reportar status em uma linha e
 encerrar o turno imediatamente. O cron do loop (15min, id `5ce96300`) já
 pode ser desligado.
 
-## Operacional
+## Fechamento v0.8 — 23/07/2026
 
-- Branch de trabalho: `v0.7-write-path`. **NUNCA push sem ok explícito do Ian.**
-- Suíte: `cargo test --workspace --exclude aster-v8cell` (v8cell à parte: `cargo test -p aster-v8cell`).
-- Write plane (Postgres real): container `aster-pg-dev` na `:5433` —
-  `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test -p aster-store-postgres --features postgres-it --test write_plane_it -- --test-threads=1`
-- Lane gated do brokerd (fence e2e via handle_request):
-  `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test -p aster-ipc --features postgres-it -- --test-threads=1`
-- Worktrees compartilham cache: `export CARGO_TARGET_DIR=/home/ian/Documents/amage/aster/target`.
-- Cron do loop: 15min, id `5ce96300`.
-- Fontes do paper/teorema: `paper/sources/` (teorema completo em `ctt.txt`,
-  referee F1-F9, related-work com regras de claim, bench notes com os únicos
-  números reais: ~0,34ms/trap warm, cold ~390ms, ~2.900 traps/s serial).
+O caminho B que o round 5 deixou para depois foi implementado e provado no
+produto:
+
+| Bloco | Estado | Evidência |
+|---|---|---|
+| F1 — uma história autoritativa | OK | `AuthoritativeCapsuleStore` liga reads, snapshot, retention e fence ao mesmo `aster.log`; `authoritative_postgres` prova commit → célula fresca |
+| F2 — policy fina | OK | policy estrita para read/write/scan/module/insert + limites de sessão; wildcard só quando explícito |
+| F3 — launch identity | OK | token one-shot com nonce aleatório, TTL e binding `(cell, tenant, deployment, epoch)`; issuer isolado lê epoch publicado atomicamente |
+| A12 — isolamento operacional | OK | Compose rootless, rootfs read-only, cap-drop ALL, no-new-privileges, limites PID/CPU/RAM/FD, cell sem rede, DB network broker-only, UDS `SO_PEERCRED` |
+| Mutations de bundle real | OK | `db.insert/patch/replace/delete`, read-your-own-writes, commit/abort IPC e retry; smoke executa `seedIan` real e faz readback em outra célula |
+| IDs de insert | OK | broker consulta `_tables`, usa entropia do SO e devolve IDv6 canônico; regressão achou/corrigiu forwarding ausente no wrapper `Arc<CapsuleStore>` |
+| Resource safety | OK | heap limit V8 + watchdog `terminate_execution` + timeout externo do supervisor; bundle capado antes da leitura |
+| Imagens/CI | OK | bases pinadas por digest, SBOM/provenance, Trivy, RustSec, dependency review e ações pinadas; runners Blacksmith |
+| Model checking | OK | TLC 1.8.0 pinado: positivos 14,8M/22,2M sem erro; mutantes epoch-reuse, no-pin e no-atomic falham nos invariantes nomeados |
+| Produção ponta a ponta | OK | `ASTER_PRODUCTION_COMPOSE_SMOKE=1 ./docker/smoke-bundle.sh 0.8`: query real → mutation real → IDv6 → commit ts=2 → readback fresco |
+
+O escopo suportado continua deliberadamente estreito: queries pontuais e
+mutations get/insert/patch/replace/delete. Actions, HTTP actions, auth context,
+storage/search/vector syscalls, query builder completo, componentes e warm
+pools não são apresentados como prontos.
+
+## Operacional atual
+
+- Branch de integração observada: `main`. Não fazer push sem pedido explícito do Ian.
+- Suíte rápida: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`.
+- Postgres real local: `aster-pg-dev` em `:5433`.
+- Lane storage/fence:
+  `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test --locked -p aster-store-postgres --features postgres-it -- --test-threads=1`
+- Lane broker/cell:
+  `ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster cargo test --locked -p aster-ipc --features postgres-it -- --test-threads=1`
+- Prova de containers:
+  `./docker/smoke-postgres.sh 0.8` e
+  `ASTER_PRODUCTION_COMPOSE_SMOKE=1 ./docker/smoke-bundle.sh 0.8`.
+- Worktrees compartilham cache:
+  `export CARGO_TARGET_DIR=/home/ian/Documents/amage/aster/target`.
+- Fontes do paper/teorema: `paper/sources/`; ledger de honestidade:
+  `paper/CLAIMS.md`.
+
+## Verificação final do fechamento
+
+- Rust 1.94.1: `fmt` limpo, Clippy `--all-targets -D warnings` limpo e
+  workspace com 236 testes verdes.
+- Postgres real: storage/fence com 79 testes; IPC/broker/cell com 83.
+- IPC adversarial novo: peer UID incorreto é recusado, peer silencioso não
+  bloqueia outras células e dois commits concorrentes não gastam a mesma
+  sessão duas vezes.
+- TLC 1.8.0 oficial, SHA-256 `cc4803…16b3`: positivo principal
+  14.813.201 estados / 5.956.127 distintos; shadow-only 22.175.377 /
+  7.333.215; os três mutantes produziram exatamente I3, I2 e I4.
+- Dockerfile atual construiu as duas imagens com base e rusty_v8 verificados;
+  os smokes memory, Postgres e Compose production passaram.
+- Compose production executou pelo `aster-invoke`: query de bundle real,
+  `seedIan`, IDv6 canônico, fence committed em ts=2 e readback em célula
+  fresca.
+- `aster-init` produziu chaves/DB URL `0600`, runtime `0700` e policy
+  deny-all; ShellCheck, Actionlint e `docker compose config --quiet`
+  passaram.

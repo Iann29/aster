@@ -16,6 +16,22 @@ paper edit that touches a claim.
 | `PENDING` | Does not exist. The paper must say so (planned methodology only, no numbers) |
 | `RULE` | A standing guardrail about what we may never claim |
 
+## Post-paper v0.8 product-state addendum (2026-07-23)
+
+The tables below remain the ledger for the v0.7 paper text. Mainline has since
+closed several limitations that the paper correctly reports as absent. This
+addendum does **not** silently upgrade the submitted/draft prose; a v0.8 paper
+revision must reconcile every affected paragraph before using these facts.
+
+| Product delta | Evidence | Mainline status |
+|---|---|---|
+| One authoritative transaction history: snapshot selection, document reads, retention, conflict validation, and append all use tenant/deployment `aster.log` | `crates/store-postgres/src/authoritative.rs`; broker Postgres construction; `crates/ipc/tests/authoritative_postgres.rs` commit-to-fresh-cell proof | IMPLEMENTED |
+| Deployment policy independently gates read/write/scan/module/insert plus bounded transaction/session limits; generated policy starts deny-all | `crates/ipc/src/policy.rs`; broker authorization gates and denial tests; `docker/policy.production.example.json` | IMPLEMENTED |
+| Trusted launch binding uses one-use, expiring tokens tied to cell/tenant/deployment/authority epoch; broker reconstructs session context | `crates/ipc/src/launch.rs`; `aster_launch_token`; token/session tests | IMPLEMENTED |
+| Operational A12 profile: rootless/read-only/capability-free cells, no cell network, broker-only DB network, kernel peer-UID gate, resource limits and V8 watchdog | `docker/compose.production.yml`; `docker/aster-invoke`; `crates/v8cell/tests/resource_limits.rs`; peer rejection + production Compose smokes | IMPLEMENTED, not independently audited |
+| Bounded concurrent IPC contains silent peers; commit consumes a bearer session atomically before fence work | `aster_brokerd.rs`; `process_boundary.rs::silent_peer_does_not_head_of_line_block_other_cells`; `concurrent_commits_cannot_double_spend_one_session` | IMPLEMENTED |
+| Real bundle mutations mint canonical IDv6, commit through the fence, and are visible to a fresh cell | `docker/smoke-bundle.sh`; `module_loader.rs`; `authoritative_postgres.rs` | IMPLEMENTED for get/insert/patch/replace/delete subset |
+
 ---
 
 ## 1 Headline & theorem claims
