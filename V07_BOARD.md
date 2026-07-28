@@ -130,10 +130,12 @@ capsule-transaction-theorem-v3-addendum.md`, SHA-256 `924cc5d1…f664f6bd`),
 verificado contra o código shipped (frame v3 byte a byte, digest fora do
 MAC, consume-first, R0 clamp+repair, Rimpl híbrido — tudo bate), F9
 fechado SEM apagar F1; pointer do paper atualizado pra "the report, as
-amended, governs" + CLAIMS.md reconciliado; (2) LaTeX + BibTeX com as
-citações confirmadas → arXiv (preprint honesto, timestamp); (3) campanha
-do venue (F1/F2/F3/F12 já fechados no produto em 23/07 — resta eval
-fatorial F16 e reconciliar o texto do paper com o estado v0.8).
+amended, governs" + CLAIMS.md reconciliado; (2) ✅ 28/07 — texto do paper RECONCILIADO com o v0.8 (parágrafo a
+parágrafo, CLAIMS.md no mesmo commit; contagens re-carimbadas 22.112
+LOC / 287 testes; números de bench mantidos rotulados como campanha
+v0.7); (3) LaTeX + BibTeX com as citações confirmadas → arXiv (preprint
+honesto, timestamp); (4) campanha do venue — resta a eval fatorial F16
+(re-medir no caminho single-history do v0.8 + baselines do §6.5).
 
 **Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
 Iterações de cron: NADA a construir — reportar status em uma linha e
