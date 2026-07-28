@@ -1,7 +1,7 @@
 # Builds the preprint with the same pdflatex toolchain arXiv runs.
 # Requires Docker; image: pandoc/latex (TeX Live + pandoc).
 
-IMAGE := pandoc/latex:latest
+IMAGE := texlive/texlive:latest
 RUN   := docker run --rm -v $(CURDIR):/data -w /data \
          --user $(shell id -u):$(shell id -g) --entrypoint sh $(IMAGE)
 
