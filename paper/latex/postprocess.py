@@ -86,5 +86,48 @@ sub("Global Data Plane names durable signed append-only logs",
     "Global Data Plane \\cite{gdp2019} names durable signed append-only logs")
 sub("are in the companion technical report:", "are in the companion technical report \\cite{ctt2026}:")
 
+
+# 11. figure floats: swap the ASCII figure blocks for the generated images
+#     (canonical PNGs live in ../figures/; Figure 3 stays typeset pseudocode
+#     inside a float so it gets a real caption and number)
+import os
+sub("\\usepackage{longtable,booktabs,array}", "\\usepackage{longtable,booktabs,array}\n\\usepackage{graphicx}\n\\graphicspath{{../figures/}}")
+
+def swap_figure(marker, replacement):
+    global src
+    pat = re.compile(r"\\begin\{verbatim\}\n" + marker + r".*?\\end\{verbatim\}", re.S)
+    assert pat.search(src), "figure block missing: " + marker
+    src = pat.sub(replacement.replace('\\', '\\\\'), src, count=1)
+
+fig_tpl = """\\begin{figure}[t]
+\\centering
+\\includegraphics[width=%s\\linewidth]{%s}
+\\caption{%s}
+\\label{%s}
+\\end{figure}"""
+
+if os.path.exists('../figures/fig1-architecture.png'):
+    swap_figure("Figure 1: architecture",
+        fig_tpl % ('0.72', 'fig1-architecture.png',
+                   'Architecture. The broker owns $\\kappa$, the storage handle, and the single-writer lease; the cell gets a UDS and nothing else.',
+                   'fig:architecture'))
+if os.path.exists('../figures/fig2-read-trap.png'):
+    swap_figure("Figure 2: one read trap",
+        fig_tpl % ('0.85', 'fig2-read-trap.png', 'One read trap.', 'fig:readtrap'))
+if os.path.exists('../figures/fig4-conflict-windows.png'):
+    swap_figure("Figure 4: the two conflict windows",
+        fig_tpl % ('0.85', 'fig4-conflict-windows.png',
+                   'The two conflict windows of a limited ascending scan.',
+                   'fig:windows'))
+
+# Figure 3: keep the pseudocode but give it a numbered float + caption
+pat3 = re.compile(r"\\begin\{verbatim\}\nFigure 3: CommitFence pseudocode[^\n]*\n\n(.*?)\\end\{verbatim\}", re.S)
+m = pat3.search(src)
+assert m, "figure 3 block missing"
+body = m.group(1)
+src = pat3.sub(lambda _: ("\\begin{figure}[t]\n\\begin{verbatim}\n" + body +
+                          "\\end{verbatim}\n\\caption{CommitFence pseudocode (technical report \\S1.8).}\n"
+                          "\\label{fig:fence}\n\\end{figure}"), src, count=1)
+
 open('main.tex','w').write(src)
 print("postprocess ok, cites:", src.count('\\cite{'))

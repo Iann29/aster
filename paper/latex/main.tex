@@ -40,6 +40,8 @@
   \KOMAoptions{parskip=half}}
 \makeatother
 \usepackage{longtable,booktabs,array}
+\usepackage{graphicx}
+\graphicspath{{../figures/}}
 \newcounter{none} % for unnumbered tables
 \usepackage{calc} % for calculating minipage widths
 % Correct order of tables after \paragraph or \subparagraph
@@ -172,26 +174,12 @@ A transaction reads at snapshot \emph{s}, accumulating a read-set R, and submits
 
 \subsection{3.1 Architecture}\label{architecture}
 
-\begin{verbatim}
-Figure 1: architecture. The broker owns kappa + storage + lease; the cell
-gets a UDS and nothing else.
-
-                 HTTP request
-                      |
-              +-------v--------+  owns: Postgres handle,
-              |   aster-broker |  MAC key kappa, single-writer
-              |  (long-lived,  |  lease (epoch e)
-              |   per deploy)  |
-              +---+-------^----+
-     spawn, ctx = |       | sealed capsules /
- (tenant, deploy, |       | commit verdicts
-  cid, e, s)      |       |       ^
-              +---v-------+----+  | UDS only. No DB creds,
-              |  V8 cell       |--+ no network, no fs.
-              | (one-shot, per |
-              |  invocation)   |
-              +----------------+
-\end{verbatim}
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\linewidth]{fig1-architecture.png}
+\caption{Architecture. The broker owns $\kappa$, the storage handle, and the single-writer lease; the cell gets a UDS and nothing else.}
+\label{fig:architecture}
+\end{figure}
 
 A long-lived broker runs per deployment; it owns $\kappa$, the storage handle, and the lease. Each invocation gets a fresh one-shot cell: a V8 isolate in its own OS process, connected to the broker by a Unix-domain socket (\texttt{crates/ipc/src/bin/aster\_brokerd.rs}, \texttt{crates/ipc/src/bin/aster\_v8cell.rs}). The broker spawns the cell with a context
 
@@ -219,23 +207,12 @@ This is the \textbf{full framed canonical encoding}, with tenant, deployment, an
 
 \subsection{3.3 The read protocol: grow-and-reseal}\label{the-read-protocol-grow-and-reseal}
 
-\begin{verbatim}
-Figure 2: one read trap.
-
-cell                         broker                        Postgres
- |  JS executes; db.get(id)     |                              |
- |  suspends on a trap          |                              |
- |--(ctx, sealed Cap_i, key)--> |                              |
- |                              | verify seal (V1, channel ctx)|
- |                              | check P.read(ctx, key)       |
- |                              |---- point read at sigma_s ------>|
- |                              |<---- (version, doc/absence) -|
- |                              | merge into Cap_{i+1}         |
- |                              | reseal: canonical encode +   |
- |                              | keyed MAC for ctx            |
- | <--(sealed Cap_{i+1})--------|                              |
- |  promise resolves; JS resumes|                              |
-\end{verbatim}
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{fig2-read-trap.png}
+\caption{One read trap.}
+\label{fig:readtrap}
+\end{figure}
 
 Reads are pull-based \textbf{traps}. The cell starts with a sealed initial capsule (possibly prewarmed: every prewarmed item passes the same read-policy check a trap would, and enters the grant transcript; prewarm is an ideal read grant, not a policy bypass). When the JavaScript touches a key that is not in the capsule, the runtime suspends, sends the sealed capsule and the request over the UDS, and the broker: verifies the seal against the channel-bound context, checks read policy \emph{before} any storage access, evaluates the point read or scan at the immutable snapshot $\sigma_s$, merges the exact result, and reseals the grown capsule. Denied requests return a denial code and nothing else.
 
@@ -245,9 +222,8 @@ Two properties matter. First, the broker is \textbf{stateless per invocation}: i
 
 At commit the cell submits (ctx, sealed Cap, S, W): its channel-bound context, a sealed capsule, a \textbf{declared dependency set} S (Variant B, Section 3.6), and a canonical write set W. The broker reduces this to the theorem's validated ingredients and executes the \textbf{commit fence}:
 
+\begin{figure}[t]
 \begin{verbatim}
-Figure 3: CommitFence pseudocode (technical report section 1.8).
-
 CommitFence(ctx, Cap, R, W):
   enter a storage-visible commit/validation serialization fence
   require the committer's epoch e_now was acquired and fenced at storage
@@ -266,6 +242,9 @@ CommitFence(ctx, Cap, R, W):
       the policy decision/version p is still current
   release the fence and retention pin
 \end{verbatim}
+\caption{CommitFence pseudocode (technical report \S1.8).}
+\label{fig:fence}
+\end{figure}
 
 The load-bearing property is that \textbf{validation and append share one stable horizon} (repair A-ATOMIC). The classical write-skew pair shows why a check-then-append implementation is simply wrong, not merely racy: T1 reads y=0 and writes x=1; T2 reads x=0 and writes y=1; both validate against the same tip h=s, both see no conflict, both append, and no serial order realizes both reads (Counterexample 3.9 of the report). Serializing each validation with its append forces whichever transaction reaches the fence second to see the first writer in (s, h{]} and abort.
 
@@ -279,19 +258,12 @@ $\rho$ = (I, direction, $\ell$, $\langle$k1 \ldots{} km$\rangle$, stop), stop $\
 
 binding the normalized interval with endpoint inclusivity, the scan direction, the positive limit, the ordered returned keys, and, critically, whether the scan \textbf{stopped at the limit} or \textbf{exhausted the interval} (repair R-RANGE). Every returned key must cross-reference an exact entry in the capsule's document map. The certificate determines the \textbf{observed window} that commit-time validation defends:
 
-\begin{verbatim}
-Figure 4: the two conflict windows of a limited ascending scan.
-
-Exhausted (m < l):        [============ whole interval I ============]
-                           k1   k2   k3        (gap certified empty)
-                           a later insert ANYWHERE in I conflicts.
-
-Boundary (m = l):         [==== prefix through km ====]. . . . . . .]
-                           k1   k2   ...  km            (unobserved)
-                           a later insert <= km conflicts;
-                           an insert strictly after km does not --
-                           it cannot change the first-l answer.
-\end{verbatim}
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{fig4-conflict-windows.png}
+\caption{The two conflict windows of a limited ascending scan.}
+\label{fig:windows}
+\end{figure}
 
 A full result protects the prefix through the last returned key; a short result certifies an \textbf{exhaustion gap} (no additional live key existed at \emph{s}) and protects the whole interval. This is next-key locking's insight transplanted into OCC validation windows. Stability is proved as Lemma 3.7 of the report: if no committed write in (s, h{]} touches Win($\rho$), the first-$\ell$ answer at h equals the answer at s, including versions and documents.
 

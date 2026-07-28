@@ -2,7 +2,7 @@
 # Requires Docker; image: pandoc/latex (TeX Live + pandoc).
 
 IMAGE := texlive/texlive:latest
-RUN   := docker run --rm -v $(CURDIR):/data -w /data \
+RUN   := docker run --rm -v $(CURDIR)/../..:/data -w /data/paper/latex \
          --user $(shell id -u):$(shell id -g) --entrypoint sh $(IMAGE)
 
 pdf:
