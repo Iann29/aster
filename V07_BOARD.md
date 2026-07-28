@@ -124,12 +124,16 @@ bundles (F5), Variante B híbrida (F6), datas de incidente corrigidas (F18),
 Re-stamp: **18.992 LOC / 263 testes / 18 provas do fence**. Suítes:
 workspace 23 ok, v8cell 18, postgres-it 33+25+18, ipc gated 32.
 
-**PRÓXIMOS PASSOS (nesta ordem):** (1) Ian roda o round 3 no GPT Pro —
-`paper/rereferee-round3-report-reissue-prompt.md` (reemitir o report formal
-pro seal v3; fecha F9 de verdade e devolve o "report governs"); (2) LaTeX +
-BibTeX com as citações confirmadas → arXiv (preprint honesto, timestamp);
-(3) v0.8 = a campanha do venue (integração committer/uma história F1,
-policy fina F2, launch token F3, deployment A12 F12, eval fatorial F16).
+**PRÓXIMOS PASSOS (nesta ordem):** (1) ✅ 28/07 — round 3 do GPT Pro
+CONCLUÍDO: addendum formal recebido (`paper/sources/
+capsule-transaction-theorem-v3-addendum.md`, SHA-256 `924cc5d1…f664f6bd`),
+verificado contra o código shipped (frame v3 byte a byte, digest fora do
+MAC, consume-first, R0 clamp+repair, Rimpl híbrido — tudo bate), F9
+fechado SEM apagar F1; pointer do paper atualizado pra "the report, as
+amended, governs" + CLAIMS.md reconciliado; (2) LaTeX + BibTeX com as
+citações confirmadas → arXiv (preprint honesto, timestamp); (3) campanha
+do venue (F1/F2/F3/F12 já fechados no produto em 23/07 — resta eval
+fatorial F16 e reconciliar o texto do paper com o estado v0.8).
 
 **Cron:** o v0.7 está completo e o próximo passo é manual (Ian → GPT Pro).
 Iterações de cron: NADA a construir — reportar status em uma linha e

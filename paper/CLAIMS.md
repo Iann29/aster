@@ -32,6 +32,26 @@ revision must reconcile every affected paragraph before using these facts.
 | Bounded concurrent IPC contains silent peers; commit consumes a bearer session atomically before fence work | `aster_brokerd.rs`; `process_boundary.rs::silent_peer_does_not_head_of_line_block_other_cells`; `concurrent_commits_cannot_double_spend_one_session` | IMPLEMENTED |
 | Real bundle mutations mint canonical IDv6, commit through the fence, and are visible to a fresh cell | `docker/smoke-bundle.sh`; `module_loader.rs`; `authoritative_postgres.rs` | IMPLEMENTED for get/insert/patch/replace/delete subset |
 
+## Round-3 formal addendum (2026-07-28) — F9 closed
+
+The companion report is amended by `paper/sources/capsule-transaction-theorem-v3-addendum.md`
+(SHA-256 `924cc5d1042f830a813a69bf28c353fa12c2aeaf1f0382bf23f10e99f664f6bd`), issued by the
+report's author to close re-referee F9. It proves the **shipped v3 protocol exactly**:
+Lemma 3.2-v3 (outer-frame injectivity including the session frame), T1a-v3 as a one-branch
+EUF-CMA reduction (A3 retired; P2 replaced by the proved lemma), the honest bearer-session
+scope for T1a (physical-cell attribution stays conditional on A11), consume-first lifecycle
+in CE 2.1 plus Lemma S1 (at most one fence attempt per session), T1b-v3 with the exact
+transcript leakage (conflicting key, epoch, horizon, retention floor, commit timestamp) and
+module bundles as a separate launch-input functionality, invariant R0 with obstruction
+freedom (separate from T2/Lemma R), and a re-stamped reality ledger recording the shipped
+hybrid `Rimpl = S_points ∪ AllRanges(C)`. The addendum closes **F9 only** — it explicitly
+preserves the F1 two-plane disclosure. Code correspondence spot-verified in-tree on
+2026-07-28: v3 frame byte layout and audit-digest-outside-MAC (`seal.rs::seal_mac`/`verify`),
+consume-first atomic remove (`aster_brokerd.rs::consume_bound_context` +
+`concurrent_commits_cannot_double_spend_one_session`), retention clamp + lease repair
+(`write_plane.rs`), all-ranges window derivation (`aster_brokerd.rs` commit path). The
+paper's appendix pointer now reads "the report, as amended by the addendum, governs".
+
 ---
 
 ## 1 Headline & theorem claims
@@ -40,12 +60,12 @@ revision must reconcile every affected paragraph before using these facts.
 |---|---|---|
 | Committed **mutations** are strictly serializable over the declared, authenticated read/write sets; commit-timestamp order; append is the linearization point (T2) | `paper/sources/ctt.txt` §2.3 + §3.8 (induction over the commit log; stability lemmas 3.6/3.7; fence lemmas 3.10/3.11); referee report: verdict "APROVADO COM RESSALVAS", T2 induction spot-checked | PROVED-COND |
 | **Snapshot reads are serializable but possibly stale**; the headline is never stated without this caveat (referee F6) | ctt.txt Executive verdict item 6 + §2.3; mirrors FDB's own snapshot-read caveat | PROVED-COND + RULE |
-| Read-set unforgeability: an accepted capsule was issued for exactly that channel-bound context (T1a); scope is "an issued capsule", NOT "the latest" — rollback/replay of earlier issued capsules is permitted by design (CE 2.1) | ctt.txt §2.1 + §3.2 (two-case reduction: MAC forgery ∨ hash collision; direct-MAC seal removes the collision case) | PROVED-COND |
-| Confinement: executor's view simulatable from its authorized grant transcript; whole protocol additionally leaks named control bits, esp. the **conflict bit** (T1b, CE 2.3) | ctt.txt §2.2 + §3.3 | PROVED-COND |
+| Read-set unforgeability: an accepted capsule was issued for exactly that channel-bound context (T1a); scope is "an issued capsule", NOT "the latest" — rollback/replay of earlier issued capsules is permitted by design (CE 2.1) | ctt.txt §2.1 + §3.2, as amended by v3 addendum §2.2 + §3.2 (T1a-v3: one-branch EUF-CMA reduction, session in the outer frame, bearer-session scope; A3 retired) | PROVED-COND |
+| Confinement: executor's view simulatable from its authorized grant transcript; whole protocol additionally leaks named control bits, esp. the **conflict bit** (T1b, CE 2.3) | ctt.txt §2.2 + §3.3, as amended by v3 addendum §2.6 + §2.8 + §3.4 (exact transcript leakage: conflicting key, epoch, horizon, retention floor, commit ts; module bundles via `Fmodule`) | PROVED-COND |
 | **Byzantine equivalence / honesty boundary**: every Byzantine commit is reproducible by an authorized protocol-following client with the same grants; omission demotes to an authorized blind write (T3, Variant B) | ctt.txt §2.4 + §3.9; attack appendix items 4 & 8 | PROVED-COND |
 | Retention safety: validation sound iff consulted log covers (s, h]; exact condition g ≤ s under a pin; stale-read counterexample makes it necessary (Lemma R) | ctt.txt §2.5 + §3.5 | PROVED-COND |
 | Read-plane scale-out: any κ-holder can serve+reseal; only the committer needs the lease (C1); revocation propagates with bounded skew across read brokers (F3 caveat) | ctt.txt §2.6 + §3.10; referee F3 | PROVED-COND |
-| The proof is **conditional** on ledger A1–A13 (+P1/P2 proved); it is a protocol specification, not code verification — the paper says this verbatim | ctt.txt Status box + §5; referee §5 | PROVED-COND + RULE |
+| The proof is **conditional** on ledger A1–A13 (+P1/P2 proved); it is a protocol specification, not code verification — the paper says this verbatim | ctt.txt Status box + §5; referee §5; v3 addendum §4 (A3 retired, P2 replaced by Lemma 3.2-v3, A11 narrowed, A11-S added) | PROVED-COND + RULE |
 | Thirteen attack obligations discharged (replay, transplant, epoch race, splice/rollback/fork, phantoms/exhaustion gap, absence flips, encoding ambiguity, under/over-declaration, GC race, duplicates, policy TOCTOU, whole-capsule replay) | ctt.txt §4 (items 1–13) | PROVED-COND |
 | Weakest joint is **A6 (complete conflict projection)** — defeats T2 with no cryptography broken; named plainly in §8 | ctt.txt §9 Confidence report; referee F8 | PROVED-COND + RULE |
 | The theorem survived an independent adversarial review round with **no fatal findings** (two independent passes converged) | `paper/sources/aster-referee-report.md` (verdict + §7 Opus convergence) | Evidence on disk |
