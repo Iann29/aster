@@ -1,11 +1,11 @@
-//! Convex IDv6 — `(table_number, internal_id)` pairs encoded with VInt
-//! + Fletcher16 footer + Crockford base32. Ported verbatim from
+//! Convex IDv6 — `(table_number, internal_id)` pairs encoded with VInt,
+//! a Fletcher16 footer, and Crockford base32. Ported from:
+//!
 //! `get-convex/convex-backend@main:crates/value/src/id_v6.rs`.
 //!
-//! Aster only consumes the codec — it never *mints* IDs, those come
-//! from Convex's own committer. We still ship the encoder so tests can
-//! produce known fixtures and compare bit-for-bit against IDs the
-//! upstream backend would write.
+//! Aster decodes IDs at the broker boundary and encodes newly allocated
+//! IDs for `db.insert`. Fixtures are checked bit-for-bit against the
+//! spelling emitted by the upstream backend.
 
 use crate::base32::{self, InvalidBase32Error};
 

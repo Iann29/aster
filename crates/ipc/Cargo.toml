@@ -10,6 +10,7 @@ aster-broker = { path = "../broker" }
 aster-capsule = { path = "../capsule" }
 aster-v8cell = { path = "../v8cell" }
 base64 = "0.22"
+blake3 = "1"
 # aster-store-postgres is linked unconditionally — the binary picks at
 # runtime based on ASTER_STORE. This drags tokio-postgres into the cell
 # binary too (which never uses it), but the alternative (cargo features)
@@ -22,6 +23,7 @@ aster-store-postgres = { path = "../store-postgres" }
 # time or constant seeds. Linked into the cell binary too but unused there
 # (same dead-code-elim note as aster-store-postgres above).
 getrandom = "0.4"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Convex emits per-source-package bundles as ZIP archives (one entry
@@ -37,3 +39,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # aster-store-postgres's postgres-it: needs ASTER_DB_URL and
 # --test-threads=1.
 postgres-it = []
+
+[dev-dependencies]
+aster-convex-codec = { path = "../convex-codec" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-postgres = "0.7"

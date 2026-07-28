@@ -10,6 +10,8 @@
 //! structs from the other side of the socket.
 
 pub mod bundle;
+pub mod launch;
+pub mod policy;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -41,6 +43,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     InitialCapsule {
+        #[serde(default)]
+        launch_token: Option<String>,
         context: SealContext,
         tenant: TenantId,
         deployment: DeploymentId,
@@ -59,6 +63,11 @@ pub enum IpcRequest {
         capsule: SealedCapsule,
         prefix: String,
         limit: usize,
+    },
+    MintDocumentId {
+        context: SealContext,
+        session: Option<SessionBinding>,
+        table: String,
     },
     LoadModuleBundle {
         context: SealContext,
@@ -107,6 +116,7 @@ pub enum IpcResponse {
     InitialCapsule(Result<InitialCapsuleGrant, WireBrokerError>),
     HydratePoint(Result<SealedCapsule, WireBrokerError>),
     HydratePrefix(Result<SealedCapsule, WireBrokerError>),
+    MintDocumentId(Result<DocumentId, WireBrokerError>),
     LoadModuleBundle(Result<Option<ModuleBundle>, WireBrokerError>),
     Commit(Result<WireCommitOutcome, WireBrokerError>),
     Abort(Result<(), WireBrokerError>),
@@ -301,42 +311,74 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> IpcR
 /// documents except by presenting a valid sealed capsule to the broker
 /// process.
 ///
-/// Session handling: `initial_capsule` stores the broker-minted session id
-/// and every later capsule verb presents it automatically. Internal shared
-/// state (`Arc<Mutex<..>>`, so clones share the slot) was chosen over a
-/// returned session handle because it keeps the `CapsuleBrokerClient` trait
-/// signature unchanged — the v8cell execute path drives the trait and must
-/// stay oblivious to wire-only concerns. A later `initial_capsule` on the
-/// same client replaces the held session, matching brokerd, where every
-/// InitialCapsule mints a fresh session; `commit`/`abort` clear it, because
-/// the broker closes the session on those verbs (one session = one
-/// transaction attempt).
+/// Session handling: `initial_capsule` atomically reserves the shared slot,
+/// then stores the broker-minted session id. A second initialization on the
+/// same client (including through a clone) is rejected until `commit` or
+/// `abort` closes the active session. This prevents silently orphaning the
+/// previous broker-side capability.
+#[derive(Clone, Copy, Debug, Default)]
+enum ClientSession {
+    #[default]
+    Idle,
+    Initializing,
+    Active(SessionBinding),
+}
 #[derive(Clone, Debug)]
 pub struct UdsCapsuleBrokerClient {
     socket_path: PathBuf,
-    session: Arc<Mutex<Option<SessionBinding>>>,
+    launch_token: Option<Arc<str>>,
+    session: Arc<Mutex<ClientSession>>,
 }
 
 impl UdsCapsuleBrokerClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
-            session: Arc::new(Mutex::new(None)),
+            launch_token: None,
+            session: Arc::new(Mutex::new(ClientSession::Idle)),
         }
     }
 
-    /// The session id held from the last successful `initial_capsule`, if
-    /// any. Exposed for tests and tooling that build raw wire requests.
+    pub fn with_launch_token(
+        socket_path: impl Into<PathBuf>,
+        launch_token: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            launch_token: Some(launch_token.into()),
+            session: Arc::new(Mutex::new(ClientSession::Idle)),
+        }
+    }
+
+    /// The active session id, if initialization completed successfully.
     pub fn session(&self) -> Option<SessionBinding> {
-        *self.session.lock().expect("session slot lock")
+        match *self.session.lock().expect("session slot lock") {
+            ClientSession::Active(session) => Some(session),
+            ClientSession::Idle | ClientSession::Initializing => None,
+        }
+    }
+
+    fn reserve_session(&self) -> Result<(), BrokerError> {
+        let mut slot = self.session.lock().expect("session slot lock");
+        match *slot {
+            ClientSession::Idle => {
+                *slot = ClientSession::Initializing;
+                Ok(())
+            }
+            ClientSession::Initializing | ClientSession::Active(_) => Err(BrokerError::Remote(
+                "initial_capsule called while this client already owns a transaction session; \
+                 commit or abort it before starting another"
+                    .into(),
+            )),
+        }
     }
 
     fn store_session(&self, session: SessionBinding) {
-        *self.session.lock().expect("session slot lock") = Some(session);
+        *self.session.lock().expect("session slot lock") = ClientSession::Active(session);
     }
 
     fn clear_session(&self) {
-        *self.session.lock().expect("session slot lock") = None;
+        *self.session.lock().expect("session slot lock") = ClientSession::Idle;
     }
 
     pub fn shutdown(&self) -> IpcResult<()> {
@@ -467,25 +509,33 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
         snapshot_ts: u64,
         prewarm: Vec<DocumentId>,
     ) -> Result<SealedCapsule, BrokerError> {
+        self.reserve_session()?;
         match self.call(IpcRequest::InitialCapsule {
+            launch_token: self.launch_token.as_deref().map(str::to_owned),
             context: context.clone(),
             tenant,
             deployment,
             snapshot_ts,
             prewarm,
         }) {
-            Ok(IpcResponse::InitialCapsule(result)) => match result {
-                Ok(grant) => {
-                    self.store_session(grant.session);
-                    Ok(grant.capsule)
-                }
-                Err(error) => Err(error.to_broker_error()),
-            },
-            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
-            Ok(_) => Err(BrokerError::Remote(
-                IpcError::UnexpectedResponse("InitialCapsule").to_string(),
-            )),
-            Err(error) => Err(BrokerError::Remote(error.to_string())),
+            Ok(IpcResponse::InitialCapsule(Ok(grant))) => {
+                self.store_session(grant.session);
+                Ok(grant.capsule)
+            }
+            Ok(IpcResponse::InitialCapsule(Err(error))) | Ok(IpcResponse::Error(error)) => {
+                self.clear_session();
+                Err(error.to_broker_error())
+            }
+            Ok(_) => {
+                self.clear_session();
+                Err(BrokerError::Remote(
+                    IpcError::UnexpectedResponse("InitialCapsule").to_string(),
+                ))
+            }
+            Err(error) => {
+                self.clear_session();
+                Err(BrokerError::Remote(error.to_string()))
+            }
         }
     }
 
@@ -532,6 +582,27 @@ impl CapsuleBrokerClient for UdsCapsuleBrokerClient {
             Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
             Ok(_) => Err(BrokerError::Remote(
                 IpcError::UnexpectedResponse("HydratePrefix").to_string(),
+            )),
+            Err(error) => Err(BrokerError::Remote(error.to_string())),
+        }
+    }
+
+    fn mint_document_id(
+        &self,
+        context: &SealContext,
+        table: &str,
+    ) -> Result<DocumentId, BrokerError> {
+        match self.call(IpcRequest::MintDocumentId {
+            context: context.clone(),
+            session: self.session(),
+            table: table.to_string(),
+        }) {
+            Ok(IpcResponse::MintDocumentId(result)) => {
+                result.map_err(|error| error.to_broker_error())
+            }
+            Ok(IpcResponse::Error(error)) => Err(error.to_broker_error()),
+            Ok(_) => Err(BrokerError::Remote(
+                IpcError::UnexpectedResponse("MintDocumentId").to_string(),
             )),
             Err(error) => Err(BrokerError::Remote(error.to_string())),
         }

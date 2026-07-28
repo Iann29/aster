@@ -287,7 +287,11 @@ impl fmt::Display for RangeCertificateError {
                 write!(f, "range certificate keys are not strictly ordered")
             }
             Self::KeyOutsideInterval(key) => {
-                write!(f, "range certificate key {:?} is outside its interval", key.0)
+                write!(
+                    f,
+                    "range certificate key {:?} is outside its interval",
+                    key.0
+                )
             }
             Self::StopInconsistent => write!(
                 f,
@@ -375,8 +379,14 @@ pub enum CapsuleStructureError {
         index: usize,
         error: RangeCertificateError,
     },
-    RangeKeyNotInDocs { index: usize, key: DocumentId },
-    RangeKeyNotLive { index: usize, key: DocumentId },
+    RangeKeyNotInDocs {
+        index: usize,
+        key: DocumentId,
+    },
+    RangeKeyNotLive {
+        index: usize,
+        key: DocumentId,
+    },
 }
 
 impl fmt::Display for CapsuleStructureError {
@@ -999,11 +1009,8 @@ mod tests {
 
     #[test]
     fn validate_structure_requires_live_crossreferenced_range_keys() {
-        let mut capsule = SnapshotCapsule::empty(
-            TenantId::new("tenant-a"),
-            DeploymentId::new("dep-a"),
-            10,
-        );
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 10);
         capsule.hydrate_point(DocumentId::new("docs/live"), live_doc(3, 1));
         capsule.hydrate_range(
             asc_cert(

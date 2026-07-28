@@ -177,7 +177,8 @@ fn session_binding_gates_wire_hydrates() {
     // Re-spawned cell: a SECOND session for the identical cell_id/epoch.
     // The session-A capsule presented on session B passes the public
     // context checks and must die in the seal MAC (WrongSession).
-    let _sealed_b = client
+    let client_b = UdsCapsuleBrokerClient::new(socket.clone());
+    let _sealed_b = client_b
         .initial_capsule(
             &context,
             TenantId::new("tenant-proc"),
@@ -186,9 +187,9 @@ fn session_binding_gates_wire_hydrates() {
             Vec::new(),
         )
         .expect("second initial capsule");
-    let session_b = client.session().expect("session held after re-initial");
+    let session_b = client_b.session().expect("session held by second client");
     assert_ne!(session_a, session_b, "each grant mints a fresh session");
-    let response = client
+    let response = client_b
         .raw_call(IpcRequest::HydratePoint {
             context: context.clone(),
             session: Some(session_b),
@@ -240,15 +241,19 @@ fn prefix_hydrate_over_uds_carries_certificate() {
     );
     let certificate = &capsule.ranges[0];
     certificate.validate().expect("wire certificate is valid");
-    assert_eq!(certificate.interval, KeyInterval::Prefix("counters/".into()));
+    assert_eq!(
+        certificate.interval,
+        KeyInterval::Prefix("counters/".into())
+    );
     assert_eq!(
         certificate.keys,
-        vec![
-            DocumentId::new("counters/a"),
-            DocumentId::new("counters/b")
-        ]
+        vec![DocumentId::new("counters/a"), DocumentId::new("counters/b")]
     );
-    assert_eq!(certificate.stop, ScanStop::Boundary, "2 collected == limit 2");
+    assert_eq!(
+        certificate.stop,
+        ScanStop::Boundary,
+        "2 collected == limit 2"
+    );
     capsule
         .validate_structure()
         .expect("certificate keys cross-reference live docs");
@@ -414,17 +419,15 @@ fn commit_verb_closes_the_loop_and_the_session() {
     assert!(broker.wait().expect("broker wait").success());
 }
 
-/// S9b closes the FULL theorem loop with the write set born in the cell:
-/// a Convex-shaped mutation module (the real bundle contract — isMutation
-/// + invokeMutation → Promise<string>) runs inside a V8 cell, reads via
-/// `1.0/get` (hydrated over the real socket, consumed) and writes via
-/// `1.0/insert` + `1.0/shallowMerge` (accumulated in-cell, never on the
-/// wire). The harness then drives the S9a Commit verb over UDS with
-/// exactly the transaction bundle the execution produced —
-/// (sealed_capsule, consumed_reads, write_set) — and the fence commits it.
-/// A SECOND cell interleaved at the same snapshot, whose declared absence
-/// read was hit by the first commit, gets a structured Conflict: the
-/// absence flip, end to end from JS.
+/// S9b closes the full theorem loop with the write set born in the cell. A
+/// Convex-shaped mutation module (the real bundle contract: `isMutation` plus
+/// `invokeMutation` returning `Promise<string>`) runs inside V8, reads through
+/// `1.0/get`, and writes through `1.0/insert` plus `1.0/shallowMerge`. The
+/// harness sends exactly the resulting `(sealed capsule, consumed reads,
+/// write set)` through the Commit verb, and the fence commits it.
+///
+/// A second cell interleaved at the same snapshot has its declared absence
+/// flipped by the first commit and receives a structured Conflict end to end.
 ///
 /// NOTE: this is the only test in this binary that runs V8 IN-PROCESS
 /// (the others spawn the cell as a subprocess). V8 isolates on parallel
@@ -548,6 +551,82 @@ fn v8_mutation_write_set_commits_over_uds_and_interleaved_conflict_aborts() {
 }
 
 #[test]
+fn real_insert_without_id_mints_commits_and_reads_back_over_uds() {
+    const INSERT_MODULE: &str = r#"
+        export const create = {
+          isMutation: true,
+          invokeMutation: async (argsJson) => {
+            const [input] = JSON.parse(argsJson);
+            const result = JSON.parse(await Convex.asyncSyscall(
+              "1.0/insert",
+              JSON.stringify({ table: "messages", value: { body: input.body } }),
+            ));
+            return JSON.stringify(result._id);
+          },
+        };
+    "#;
+
+    let temp = TempDir::new("aster-ipc-mint");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+    let tenant = TenantId::new("tenant-proc");
+    let deployment = DeploymentId::new("dep-proc");
+    let writer = UdsCapsuleBrokerClient::new(socket.clone());
+    let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
+    let run = cell
+        .execute_module_mutation_with_broker(
+            &writer,
+            "cell-mint",
+            7,
+            tenant.clone(),
+            deployment.clone(),
+            2,
+            Vec::new(),
+            INSERT_MODULE,
+            "create",
+            r#"[{"body":"hello"}]"#,
+        )
+        .expect("insert module");
+    assert_eq!(run.traps, 1, "id mint is one broker round trip");
+    let Value::Text(output) = &run.output else {
+        panic!("mutation output must be text");
+    };
+    let minted: String = serde_json::from_str(output).expect("returned id");
+    assert!(minted.starts_with("messages/"), "minted id: {minted}");
+    assert_eq!(run.write_set[0].0, DocumentId::new(minted.clone()));
+    let committed = writer
+        .commit(
+            run.sealed_capsule.expect("sealed capsule"),
+            run.consumed_reads,
+            run.write_set,
+        )
+        .expect("commit minted insert");
+    assert_eq!(committed, WireCommitOutcome::Committed { ts: 3 });
+
+    let reader = UdsCapsuleBrokerClient::new(socket.clone());
+    let context = SealContext::new("cell-mint-reader", 7);
+    let capsule = reader
+        .initial_capsule(
+            &context,
+            tenant,
+            deployment,
+            0,
+            vec![DocumentId::new(minted.clone())],
+        )
+        .expect("fresh capsule");
+    let stored = capsule
+        .capsule()
+        .get(&DocumentId::new(minted))
+        .and_then(|versioned| versioned.document.as_ref())
+        .and_then(|document| document.get("_raw"));
+    assert!(matches!(stored, Some(Value::Text(raw)) if raw.contains("\"body\":\"hello\"")));
+    reader.abort().expect("close reader session");
+    writer.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+#[test]
 fn broker_outlives_many_sequential_connections() {
     let temp = TempDir::new("aster-ipc-manyconn");
     let socket = temp.path().join("broker.sock");
@@ -571,9 +650,72 @@ fn broker_outlives_many_sequential_connections() {
                 Vec::new(),
             )
             .expect("initial capsule");
+        client.abort().expect("close sequential session");
     }
     client.shutdown().expect("shutdown broker");
     assert!(broker.wait().expect("broker wait").success());
+}
+
+#[test]
+fn silent_peer_does_not_head_of_line_block_other_cells() {
+    let temp = TempDir::new("aster-ipc-silent-peer");
+    let socket = temp.path().join("broker.sock");
+    let mut broker = spawn_broker(&socket);
+    wait_for_socket(&socket);
+
+    let silent = UnixStream::connect(&socket).expect("connect silent peer");
+    let client = UdsCapsuleBrokerClient::new(socket.clone());
+    let started = Instant::now();
+    client
+        .initial_capsule(
+            &SealContext::new("cell-responsive", 7),
+            TenantId::new("tenant-proc"),
+            DeploymentId::new("dep-proc"),
+            2,
+            Vec::new(),
+        )
+        .expect("responsive cell must bypass silent peer");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "responsive request waited behind a silent peer"
+    );
+
+    client.abort().expect("close responsive session");
+    drop(silent);
+    client.shutdown().expect("shutdown broker");
+    assert!(broker.wait().expect("broker wait").success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn broker_rejects_a_peer_with_the_wrong_uid() {
+    let temp = TempDir::new("aster-ipc-peer-uid");
+    let socket = temp.path().join("broker.sock");
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let denied_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    let mut command = broker_command(&socket, "counters/a:value:20,counters/b:value:22");
+    let mut broker = command
+        .env("ASTER_ALLOWED_PEER_UID", denied_uid.to_string())
+        .spawn()
+        .expect("spawn peer-rejecting broker");
+    wait_for_socket(&socket);
+
+    let client = UdsCapsuleBrokerClient::new(socket);
+    let result = client.initial_capsule(
+        &SealContext::new("cell-denied", 7),
+        TenantId::new("tenant-proc"),
+        DeploymentId::new("dep-proc"),
+        2,
+        Vec::new(),
+    );
+    let _ = broker.kill();
+    let _ = broker.wait();
+
+    let error = result.expect_err("wrong peer uid must be rejected");
+    assert!(
+        matches!(&error, BrokerError::Remote(message) if message.contains("peer_uid_denied")),
+        "unexpected rejection: {error}"
+    );
 }
 
 /// One bad client must never kill the broker — and with it the in-process
@@ -598,6 +740,7 @@ fn broker_survives_clients_that_close_before_reading() {
         write_frame(
             &mut stream,
             &IpcRequest::InitialCapsule {
+                launch_token: None,
                 context: SealContext::new("cell-epipe", 7),
                 tenant: TenantId::new("tenant-proc"),
                 deployment: DeploymentId::new("dep-proc"),
@@ -692,6 +835,10 @@ fn oversized_response_returns_structured_error_and_broker_survives() {
         other => panic!("expected remote response_too_large error, got {other:?}"),
     }
 
+    client
+        .abort()
+        .expect("close oversized-response session before a fresh grant");
+
     // The broker survived the oversized response and still serves small
     // hydrates on a fresh grant.
     let context = SealContext::new("cell-small", 7);
@@ -718,7 +865,13 @@ fn spawn_broker(socket: &Path) -> Child {
 }
 
 fn spawn_broker_with_seed(socket: &Path, seed: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_aster_brokerd"))
+    let mut command = broker_command(socket, seed);
+    command.spawn().expect("spawn brokerd")
+}
+
+fn broker_command(socket: &Path, seed: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aster_brokerd"));
+    command
         .env("ASTER_BROKER_SOCK", socket)
         .env("ASTER_TENANT", "tenant-proc")
         .env("ASTER_DEPLOYMENT", "dep-proc")
@@ -729,9 +882,8 @@ fn spawn_broker_with_seed(socket: &Path, seed: &str) -> Child {
         // every context in this file claims.
         .env("ASTER_LEASE_EPOCH", "7")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn brokerd")
+        .stderr(Stdio::piped());
+    command
 }
 
 /// `count` seed entries under `prefix`, each key padded to `key_len` bytes —

@@ -33,7 +33,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Once};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use aster_broker::{BrokerError, CapsuleBrokerClient};
 use aster_capsule::{
@@ -49,6 +52,59 @@ fn init_v8() {
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
+}
+
+struct ExecutionWatchdog {
+    cancel: mpsc::Sender<()>,
+    worker: Option<JoinHandle<()>>,
+    timed_out: Arc<AtomicBool>,
+    limit_ms: u64,
+}
+
+impl ExecutionWatchdog {
+    fn start(isolate: &v8::Isolate, limit: Duration) -> Self {
+        let handle = isolate.thread_safe_handle();
+        let (cancel, cancelled) = mpsc::channel();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let worker_timed_out = timed_out.clone();
+        let worker = std::thread::spawn(move || {
+            if matches!(
+                cancelled.recv_timeout(limit),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                worker_timed_out.store(true, Ordering::Release);
+                handle.terminate_execution();
+            }
+        });
+        Self {
+            cancel,
+            worker: Some(worker),
+            timed_out,
+            limit_ms: limit.as_millis().min(u128::from(u64::MAX)) as u64,
+        }
+    }
+
+    fn error_or(&self, fallback: V8CellError) -> V8CellError {
+        if self.timed_out.load(Ordering::Acquire) {
+            V8CellError::ExecutionTimedOut {
+                limit_ms: self.limit_ms,
+            }
+        } else {
+            fallback
+        }
+    }
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ExecutionWatchdog {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// A typed read trap emitted by a real V8 isolate.
@@ -146,6 +202,10 @@ enum SyscallAnswer {
     /// capsule, then dispatch the same syscall again (which must then
     /// answer — hydration always installs an entry, absent included).
     NeedsHydration(DocumentId),
+    /// A real `db.insert` needs a store-native id. The host asks the broker
+    /// to mint one, then completes the write locally; allocation is not a
+    /// database write and the fence remains the sole commit path.
+    NeedsDocumentId(String),
 }
 
 /// The base document a mutating verb builds on, resolved through the
@@ -286,42 +346,65 @@ impl V8CellState {
         Ok(SyscallAnswer::NeedsHydration(key))
     }
 
-    /// `db.insert(table, value)` → `1.0/insert {table, value}`; the syscall
-    /// resolves `{"_id": <id>}` (the bundle reads `y(r)._id`).
-    ///
-    /// Upstream Convex mints the document id server-side. Aster's id scheme
-    /// is the store's, and broker-side minting is future work — so the
-    /// prototype accepts an explicit `_id` supplied in the value (a shape
-    /// only hand-written modules can produce; the real client lib never
-    /// sends system fields) and REJECTS mint-me inserts with a clear error
-    /// rather than inventing an id scheme silently. A supplied-id insert is
-    /// a plain put: it does not probe the snapshot for collisions (no
-    /// consumption), so colliding with an existing doc is an authorized
-    /// blind overwrite the fence orders like any other write (T2).
+    /// `db.insert(table, value)` → `1.0/insert {table, value}`. A real
+    /// Convex bundle omits system fields, so the broker mints a store-native
+    /// id and the cell adds it to the pending write before resolving.
     fn syscall_insert(&mut self, args_json: &str) -> Result<SyscallAnswer, V8CellError> {
         if let Some(reject) = self.write_gate() {
             return Ok(reject);
         }
         let args = parse_syscall_args("1.0/insert", args_json)?;
-        let Some(value) = args.get("value").and_then(|v| v.as_object()) else {
+        let table = args
+            .get("table")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                V8CellError::Run(
+                    "convex 1.0/insert: missing string field `table` in args".to_string(),
+                )
+            })?;
+        let Some(value) = args.get("value").and_then(|value| value.as_object()) else {
             return Err(V8CellError::Run(
                 "convex 1.0/insert: missing object field `value` in args".to_string(),
             ));
         };
-        let Some(id) = value.get("_id").and_then(|v| v.as_str()) else {
-            return Ok(SyscallAnswer::Reject(
-                "aster-v8cell: db.insert without an `_id` field in the value is not supported \
-                 yet — upstream Convex mints document ids server-side and Aster's broker-side \
-                 id minting is future work; supply an explicit `_id` (the store's wire form) \
-                 to insert from a cell"
-                    .to_string(),
-            ));
-        };
-        let key = DocumentId::new(id);
-        let raw = serde_json::Value::Object(value.clone()).to_string();
-        self.writes.insert(key, Some(raw_doc(raw)));
+        if let Some(id) = value.get("_id").and_then(|value| value.as_str()) {
+            return self.complete_insert(args_json, DocumentId::new(id), false);
+        }
+        Ok(SyscallAnswer::NeedsDocumentId(table.to_string()))
+    }
+
+    fn complete_insert(
+        &mut self,
+        args_json: &str,
+        key: DocumentId,
+        minted: bool,
+    ) -> Result<SyscallAnswer, V8CellError> {
+        let args = parse_syscall_args("1.0/insert", args_json)?;
+        let mut value = args
+            .get("value")
+            .and_then(|value| value.as_object())
+            .cloned()
+            .ok_or_else(|| {
+                V8CellError::Run(
+                    "convex 1.0/insert: missing object field `value` in args".to_string(),
+                )
+            })?;
+        value.insert("_id".into(), serde_json::Value::String(key.0.clone()));
+        if minted && !value.contains_key("_creationTime") {
+            let creation_time = self
+                .capsule
+                .as_ref()
+                .map(|capsule| capsule.ts)
+                .unwrap_or_default();
+            value.insert(
+                "_creationTime".into(),
+                serde_json::Value::Number(creation_time.into()),
+            );
+        }
+        let raw = serde_json::Value::Object(value).to_string();
+        self.writes.insert(key.clone(), Some(raw_doc(raw)));
         Ok(SyscallAnswer::Resolve(
-            serde_json::json!({ "_id": id }).to_string(),
+            serde_json::json!({ "_id": key.0 }).to_string(),
         ))
     }
 
@@ -447,11 +530,15 @@ impl V8CellState {
         let (base, from_capsule) = match self.mutation_base(&key)? {
             MutationBase::Unheld => return Ok(SyscallAnswer::NeedsHydration(key)),
             MutationBase::PendingDeleted => {
-                return Ok(SyscallAnswer::Reject(nonexistent_doc_message("delete", &id)));
+                return Ok(SyscallAnswer::Reject(nonexistent_doc_message(
+                    "delete", &id,
+                )));
             }
             MutationBase::CapsuleAbsent => {
                 self.consumed.insert(key);
-                return Ok(SyscallAnswer::Reject(nonexistent_doc_message("delete", &id)));
+                return Ok(SyscallAnswer::Reject(nonexistent_doc_message(
+                    "delete", &id,
+                )));
             }
             MutationBase::PendingLive(base) => (base, false),
             MutationBase::CapsuleLive(base) => (base, true),
@@ -511,7 +598,9 @@ fn pending_field_value(pending: Option<&Document>, field: &str) -> Value {
 /// A PRESENT but unparseable/non-object `_raw` is a different animal: it
 /// means the store handed us a corrupt envelope, and silently merging from
 /// an empty base would let a patch replace the whole document — error out.
-fn raw_json_object(doc: &Document) -> Result<serde_json::Map<String, serde_json::Value>, V8CellError> {
+fn raw_json_object(
+    doc: &Document,
+) -> Result<serde_json::Map<String, serde_json::Value>, V8CellError> {
     match doc.get("_raw") {
         Some(Value::Text(raw)) => serde_json::from_str::<serde_json::Value>(raw)
             .ok()
@@ -615,6 +704,7 @@ pub enum V8CellError {
     Run(String),
     NotAPromise,
     TooManyTraps { limit: usize },
+    ExecutionTimedOut { limit_ms: u64 },
     PendingWithoutTrap,
     Rejected(String),
     UnsupportedValue(String),
@@ -632,6 +722,9 @@ impl std::fmt::Display for V8CellError {
             Self::Run(error) => write!(f, "JavaScript run error: {error}"),
             Self::NotAPromise => write!(f, "JavaScript entrypoint did not return a Promise"),
             Self::TooManyTraps { limit } => write!(f, "too many V8 read traps, limit {limit}"),
+            Self::ExecutionTimedOut { limit_ms } => {
+                write!(f, "JavaScript execution exceeded {limit_ms}ms")
+            }
             Self::PendingWithoutTrap => {
                 write!(f, "Promise is pending but no read trap was emitted")
             }
@@ -650,6 +743,9 @@ impl From<BrokerError> for V8CellError {
     }
 }
 
+const DEFAULT_MAX_HEAP_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_EXECUTION_LIMIT: Duration = Duration::from_secs(30);
+
 /// A tenant/deployment pinned V8 cell.
 ///
 /// The isolate is real and the broker may be in-process (unit tests) or a
@@ -663,6 +759,8 @@ pub struct V8SandboxCell {
     tenant: TenantId,
     deployment: DeploymentId,
     max_traps: usize,
+    max_heap_bytes: usize,
+    execution_limit: Duration,
 }
 
 /// What the namespace lookup yielded when the cell-side ESM loader
@@ -690,6 +788,7 @@ enum ExportShape {
 /// versa.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModuleInvocation {
+    Auto,
     Query,
     Mutation,
 }
@@ -699,17 +798,50 @@ impl ModuleInvocation {
         match self {
             Self::Query => "invokeQuery",
             Self::Mutation => "invokeMutation",
+            Self::Auto => unreachable!("auto invocation must resolve from the export marker"),
         }
     }
 }
 
 impl V8SandboxCell {
     pub fn new(tenant: TenantId, deployment: DeploymentId, max_traps: usize) -> Self {
+        Self::with_heap_limit(tenant, deployment, max_traps, DEFAULT_MAX_HEAP_BYTES)
+    }
+
+    pub fn with_heap_limit(
+        tenant: TenantId,
+        deployment: DeploymentId,
+        max_traps: usize,
+        max_heap_bytes: usize,
+    ) -> Self {
+        Self::with_resource_limits(
+            tenant,
+            deployment,
+            max_traps,
+            max_heap_bytes,
+            DEFAULT_EXECUTION_LIMIT,
+        )
+    }
+
+    pub fn with_resource_limits(
+        tenant: TenantId,
+        deployment: DeploymentId,
+        max_traps: usize,
+        max_heap_bytes: usize,
+        execution_limit: Duration,
+    ) -> Self {
         init_v8();
+        assert!(max_heap_bytes > 0, "V8 heap limit must be nonzero");
+        assert!(
+            !execution_limit.is_zero(),
+            "execution limit must be nonzero"
+        );
         Self {
             tenant,
             deployment,
             max_traps,
+            max_heap_bytes,
+            execution_limit,
         }
     }
 
@@ -719,6 +851,8 @@ impl V8SandboxCell {
     /// Aster.read(key, field)`. This method drains all typed traps by reading
     /// from `store` at the original snapshot timestamp and resolving the exact
     /// V8 `PromiseResolver` that caused the trap.
+    // Keep the full authority tuple explicit at this trust-boundary API.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_async_main_with_broker(
         &self,
         broker: &impl CapsuleBrokerClient,
@@ -825,6 +959,41 @@ impl V8SandboxCell {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Run a named Convex query or mutation by inspecting the export marker.
+    ///
+    /// This is the production entry point: a caller should not need to trust
+    /// separately supplied function-kind metadata. The bundle's own
+    /// `isQuery`/`isMutation` marker chooses the matching invoke function;
+    /// actions remain unsupported and queries keep the write gate closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_module_function_with_broker(
+        &self,
+        broker: &impl CapsuleBrokerClient,
+        cell_id: impl Into<String>,
+        lease_epoch: u64,
+        tenant: TenantId,
+        deployment: DeploymentId,
+        snapshot_ts: u64,
+        prewarm: Vec<DocumentId>,
+        module_source: &str,
+        function_name: &str,
+        args_json: &str,
+    ) -> Result<V8ExecutionResult, V8CellError> {
+        self.execute_module_with_broker(
+            broker,
+            cell_id,
+            lease_epoch,
+            tenant,
+            deployment,
+            snapshot_ts,
+            prewarm,
+            module_source,
+            function_name,
+            args_json,
+            ModuleInvocation::Auto,
+        )
     }
 
     /// Run a Convex-deploy bundled module's named query end to end.
@@ -1024,6 +1193,11 @@ impl V8SandboxCell {
                 state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
                 Ok(())
             },
+            |table| {
+                broker
+                    .mint_document_id(context, table)
+                    .map_err(V8CellError::from)
+            },
         );
         // The evidence object the Commit verb needs is the capsule as
         // finally hydrated — hand it back on the result so the harness
@@ -1042,13 +1216,23 @@ impl V8SandboxCell {
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        let result = self.execute_core(state_ptr, source, |key| {
-            sealed_capsule = broker.hydrate_point(context, sealed_capsule.clone(), key.clone())?;
-            let capsule = sealed_capsule.capsule().clone();
-            let state = &*state_ptr;
-            state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
-            Ok(())
-        });
+        let result = self.execute_core(
+            state_ptr,
+            source,
+            |key| {
+                sealed_capsule =
+                    broker.hydrate_point(context, sealed_capsule.clone(), key.clone())?;
+                let capsule = sealed_capsule.capsule().clone();
+                let state = &*state_ptr;
+                state.lock().expect("v8 state mutex poisoned").capsule = Some(capsule);
+                Ok(())
+            },
+            |table| {
+                broker
+                    .mint_document_id(context, table)
+                    .map_err(V8CellError::from)
+            },
+        );
         // Same rule as the module path: the final sealed capsule rides the
         // result for the commit half of the transaction.
         result.map(|mut output| {
@@ -1063,27 +1247,36 @@ impl V8SandboxCell {
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        self.execute_core(state_ptr, source, |key| {
-            let ts = {
+        self.execute_core(
+            state_ptr,
+            source,
+            |key| {
+                let ts = {
+                    let state = &*state_ptr;
+                    state
+                        .lock()
+                        .expect("v8 state mutex poisoned")
+                        .capsule
+                        .as_ref()
+                        .expect("capsule present")
+                        .ts
+                };
+                let value = store.read_at(key, ts);
                 let state = &*state_ptr;
+                let mut state = state.lock().expect("v8 state mutex poisoned");
                 state
-                    .lock()
-                    .expect("v8 state mutex poisoned")
                     .capsule
-                    .as_ref()
+                    .as_mut()
                     .expect("capsule present")
-                    .ts
-            };
-            let value = store.read_at(key, ts);
-            let state = &*state_ptr;
-            let mut state = state.lock().expect("v8 state mutex poisoned");
-            state
-                .capsule
-                .as_mut()
-                .expect("capsule present")
-                .hydrate_point(key.clone(), value);
-            Ok(())
-        })
+                    .hydrate_point(key.clone(), value);
+                Ok(())
+            },
+            |table| {
+                aster_broker::mint_opaque_document_id(table)
+                    .map_err(BrokerError::from)
+                    .map_err(V8CellError::from)
+            },
+        )
     }
 
     unsafe fn execute_core(
@@ -1091,9 +1284,11 @@ impl V8SandboxCell {
         state_ptr: *mut Mutex<V8CellState>,
         source: &str,
         mut hydrate: impl FnMut(&DocumentId) -> Result<(), V8CellError>,
+        mut mint_document_id: impl FnMut(&str) -> Result<DocumentId, V8CellError>,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        let create_params = v8::CreateParams::default();
+        let create_params = v8::CreateParams::default().heap_limits(0, self.max_heap_bytes);
         let mut isolate = v8::Isolate::new(create_params);
+        let watchdog = ExecutionWatchdog::start(&isolate, self.execution_limit);
         // Host-controlled continuation: V8 should not decide when to drain
         // Promise jobs. The cell scheduler hydrates traps, resolves exactly one
         // host promise, then explicitly checkpoints microtasks.
@@ -1139,11 +1334,14 @@ impl V8SandboxCell {
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let source = v8::String::new(scope, source).unwrap();
-        let script = v8::Script::compile(scope, source, None)
-            .ok_or_else(|| V8CellError::Compile("Script::compile returned None".to_string()))?;
-        script
-            .run(scope)
-            .ok_or_else(|| V8CellError::Run("top-level script threw".to_string()))?;
+        let script = v8::Script::compile(scope, source, None).ok_or_else(|| {
+            watchdog.error_or(V8CellError::Compile(
+                "Script::compile returned None".to_string(),
+            ))
+        })?;
+        script.run(scope).ok_or_else(|| {
+            watchdog.error_or(V8CellError::Run("top-level script threw".to_string()))
+        })?;
 
         let main_name = v8::String::new(scope, "main").unwrap();
         let main_value = context
@@ -1154,7 +1352,9 @@ impl V8SandboxCell {
             .map_err(|_| V8CellError::Run("globalThis.main is not a function".to_string()))?;
         let undefined = v8::undefined(scope).into();
         let promise_value = main_fn.call(scope, undefined, &[]).ok_or_else(|| {
-            V8CellError::Run("main() threw before returning a Promise".to_string())
+            watchdog.error_or(V8CellError::Run(
+                "main() threw before returning a Promise".to_string(),
+            ))
         })?;
         let promise = v8::Local::<v8::Promise>::try_from(promise_value)
             .map_err(|_| V8CellError::NotAPromise)?;
@@ -1171,6 +1371,8 @@ impl V8SandboxCell {
             self.max_traps,
             &mut traps,
             &mut hydrate,
+            &mut mint_document_id,
+            &watchdog,
         )?;
         // The pump returns Ok only on Fulfilled (rejections and stuck
         // promises are typed errors), so the result is ready to read.
@@ -1197,6 +1399,8 @@ impl V8SandboxCell {
     /// The caller (`execute_module_with_broker_state_ptr`) supplies
     /// `hydrate` so the broker (real or in-process) can fulfil read traps
     /// without leaking the store handle into this method.
+    // The two capability callbacks stay distinct from immutable invocation data.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn execute_module_core(
         &self,
         state_ptr: *mut Mutex<V8CellState>,
@@ -1205,18 +1409,18 @@ impl V8SandboxCell {
         args_json: &str,
         invocation: ModuleInvocation,
         mut hydrate: impl FnMut(&DocumentId) -> Result<(), V8CellError>,
+        mut mint_document_id: impl FnMut(&str) -> Result<DocumentId, V8CellError>,
     ) -> Result<V8ExecutionResult, V8CellError> {
-        // Arm the query/mutation write gate before any JS runs (review C3):
-        // upstream Convex rejects db writes inside queries, and the export
-        // marker alone doesn't stop a hand-written `isQuery` export from
-        // reaching the mutating syscalls through `invokeQuery`.
+        // Module evaluation itself never gets write authority. After the
+        // requested export is inspected, only an actual mutation marker
+        // opens the write gate for the handler invocation.
         {
             let state = unsafe { &*state_ptr };
-            state.lock().expect("v8 state mutex poisoned").deny_writes =
-                matches!(invocation, ModuleInvocation::Query);
+            state.lock().expect("v8 state mutex poisoned").deny_writes = true;
         }
-        let create_params = v8::CreateParams::default();
+        let create_params = v8::CreateParams::default().heap_limits(0, self.max_heap_bytes);
         let mut isolate = v8::Isolate::new(create_params);
+        let watchdog = ExecutionWatchdog::start(&isolate, self.execution_limit);
         // Same explicit microtask policy as the legacy path. ESM evaluation
         // queues a microtask for the module's body even when there's no
         // top-level `await`; we drain that with `perform_microtask_checkpoint`
@@ -1312,7 +1516,7 @@ impl V8SandboxCell {
                         .exception()
                         .map(|v| value_to_string(try_catch, v))
                         .unwrap_or_else(|| "compile_module returned None".to_string());
-                    return Err(V8CellError::Compile(err));
+                    return Err(watchdog.error_or(V8CellError::Compile(err)));
                 }
             }
         };
@@ -1333,9 +1537,9 @@ impl V8SandboxCell {
                         .unwrap_or_else(|| {
                             "instantiate_module threw without exception".to_string()
                         });
-                    return Err(V8CellError::Compile(format!(
+                    return Err(watchdog.error_or(V8CellError::Compile(format!(
                         "module instantiate failed: {err}"
-                    )));
+                    ))));
                 }
             }
         };
@@ -1359,7 +1563,8 @@ impl V8SandboxCell {
                         .exception()
                         .map(|v| value_to_string(try_catch, v))
                         .unwrap_or_else(|| "evaluate returned None".to_string());
-                    return Err(V8CellError::Run(format!("module evaluate failed: {err}")));
+                    return Err(watchdog
+                        .error_or(V8CellError::Run(format!("module evaluate failed: {err}"))));
                 }
             }
         };
@@ -1381,6 +1586,8 @@ impl V8SandboxCell {
             self.max_traps,
             &mut traps,
             &mut hydrate,
+            &mut mint_document_id,
+            &watchdog,
         )?;
         // Defensive: a Module that hit Errored after Pending → Fulfilled
         // can't happen (V8 transitions Errored before resolving), but
@@ -1435,25 +1642,25 @@ impl V8SandboxCell {
             ))
         })?;
 
-        // Validate the export's shape against the invocation mode: each
-        // entry point runs exactly its own kind, so a mutation can never
-        // ride the query gate (and vice versa) and actions never run.
+        // Resolve the invocation from the trusted bundle shape when the
+        // production auto entry point is used. Explicit query/mutation entry
+        // points remain for tests and reject cross-kind dispatch.
         let shape = inspect_export_shape(scope, export_obj);
-        match (invocation, shape) {
-            (ModuleInvocation::Query, ExportShape::Query)
-            | (ModuleInvocation::Mutation, ExportShape::Mutation) => {}
+        let invocation = match (invocation, shape) {
+            (ModuleInvocation::Auto, ExportShape::Query)
+            | (ModuleInvocation::Query, ExportShape::Query) => ModuleInvocation::Query,
+            (ModuleInvocation::Auto, ExportShape::Mutation)
+            | (ModuleInvocation::Mutation, ExportShape::Mutation) => ModuleInvocation::Mutation,
             (ModuleInvocation::Query, ExportShape::Mutation) => {
                 return Err(V8CellError::Run(format!(
                     "module export {function_name:?} is a mutation; this entry point runs \
-                     queries — invoke it through the mutation path \
-                     (execute_module_mutation_with_broker), whose writes accumulate in the \
-                     in-cell write set for fenced commit (never direct DB write capability)"
+                     queries — invoke it through the mutation or auto-dispatch path"
                 )));
             }
             (ModuleInvocation::Mutation, ExportShape::Query) => {
                 return Err(V8CellError::Run(format!(
                     "module export {function_name:?} is a query; this entry point runs \
-                     mutations — invoke it through execute_module_query_with_broker"
+                     mutations — invoke it through the query or auto-dispatch path"
                 )));
             }
             (_, ExportShape::Action) => {
@@ -1468,16 +1675,20 @@ impl V8SandboxCell {
                      missing isQuery/isMutation/isAction marker"
                 )));
             }
+        };
+        {
+            let state = unsafe { &*state_ptr };
+            state.lock().expect("v8 state mutex poisoned").deny_writes =
+                matches!(invocation, ModuleInvocation::Query);
         }
 
         // Read `<export>.invokeQuery` / `.invokeMutation` and call with the
         // args JSON string.
-        // /tmp/aster-research-bundle-ground-truth.md §3.3 + memo #3 §3.
         let invoke_key_name = invocation.invoke_key();
         let invoke_key = v8::String::new(scope, invoke_key_name).unwrap();
-        let invoke = export_obj.get(scope, invoke_key.into()).ok_or_else(|| {
-            V8CellError::Run(format!("export has no {invoke_key_name} property"))
-        })?;
+        let invoke = export_obj
+            .get(scope, invoke_key.into())
+            .ok_or_else(|| V8CellError::Run(format!("export has no {invoke_key_name} property")))?;
         let invoke_fn = v8::Local::<v8::Function>::try_from(invoke).map_err(|_| {
             V8CellError::Run(format!(
                 "export {function_name:?} has {invoke_key_name} property but it is not a function"
@@ -1498,10 +1709,10 @@ impl V8SandboxCell {
                         .exception()
                         .map(|v| value_to_string(try_catch, v))
                         .unwrap_or_else(|| "invokeQuery threw without exception".to_string());
-                    return Err(V8CellError::Run(format!(
+                    return Err(watchdog.error_or(V8CellError::Run(format!(
                         "{invoke_key_name}({function_name:?}) threw before returning a \
                          Promise: {err}"
-                    )));
+                    ))));
                 }
             }
         };
@@ -1520,6 +1731,8 @@ impl V8SandboxCell {
             self.max_traps,
             &mut traps,
             &mut hydrate,
+            &mut mint_document_id,
+            &watchdog,
         )?;
 
         // Pull the resolved string. invokeQuery and invokeMutation both
@@ -1595,6 +1808,9 @@ fn inspect_export_shape(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>)
 /// module evaluation, and the invoke dispatch — so the view rules
 /// (write set over capsule, consumption on snapshot observation) live in
 /// exactly one place.
+// This hot loop receives borrowed V8 state and both capability callbacks;
+// bundling them would add indirection without reducing authority.
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_trap_pump_loop(
     scope: &mut v8::HandleScope,
     target: &v8::Global<v8::Promise>,
@@ -1602,6 +1818,8 @@ unsafe fn run_trap_pump_loop(
     max_traps: usize,
     traps: &mut usize,
     hydrate: &mut dyn FnMut(&DocumentId) -> Result<(), V8CellError>,
+    mint_document_id: &mut dyn FnMut(&str) -> Result<DocumentId, V8CellError>,
+    watchdog: &ExecutionWatchdog,
 ) -> Result<(), V8CellError> {
     // Two counters since the review-C5 fix: `pumped` bounds pump dispatches
     // (the anti-runaway guard must count every parked syscall, warm or not,
@@ -1612,6 +1830,9 @@ unsafe fn run_trap_pump_loop(
     let mut pumped = 0usize;
     loop {
         scope.perform_microtask_checkpoint();
+        if watchdog.timed_out() {
+            return Err(watchdog.error_or(V8CellError::Run("execution watchdog fired".into())));
+        }
         let promise = v8::Local::new(scope, target);
         match promise.state() {
             v8::PromiseState::Fulfilled => return Ok(()),
@@ -1676,6 +1897,15 @@ unsafe fn run_trap_pump_loop(
                                 state.dispatch_convex_syscall(name, args_json)?
                             };
                         }
+                        if let SyscallAnswer::NeedsDocumentId(table) = &answer {
+                            *traps += 1;
+                            let key = mint_document_id(table)?;
+                            answer = {
+                                let state = &*state_ptr;
+                                let mut state = state.lock().expect("v8 state mutex poisoned");
+                                state.complete_insert(args_json, key, true)?
+                            };
+                        }
                         match answer {
                             SyscallAnswer::Resolve(json_str) => {
                                 let js_str = v8::String::new(scope, &json_str)
@@ -1697,6 +1927,11 @@ unsafe fn run_trap_pump_loop(
                                     "hydrate did not install an entry for {:?} — \
                                      broker hydration must answer every key, absence included",
                                     key.0
+                                )));
+                            }
+                            SyscallAnswer::NeedsDocumentId(table) => {
+                                return Err(V8CellError::Run(format!(
+                                    "document id allocator did not complete insert for table {table:?}"
                                 )));
                             }
                         }
@@ -1878,7 +2113,7 @@ fn convex_async_syscall_callback(
                 return;
             }
         }
-        Ok(SyscallAnswer::NeedsHydration(_)) | Err(_) => {
+        Ok(SyscallAnswer::NeedsHydration(_) | SyscallAnswer::NeedsDocumentId(_)) | Err(_) => {
             let resolver_global = v8::Global::new(scope, resolver);
             state
                 .lock()
@@ -2017,7 +2252,10 @@ mod tests {
             ..Default::default()
         };
         for (name, args) in [
-            ("1.0/insert", r#"{"table":"docs","value":{"_id":"docs/aa"}}"#),
+            (
+                "1.0/insert",
+                r#"{"table":"docs","value":{"_id":"docs/aa"}}"#,
+            ),
             ("1.0/shallowMerge", r#"{"id":"docs/aa","value":{}}"#),
             ("1.0/replace", r#"{"id":"docs/aa","value":{}}"#),
             ("1.0/remove", r#"{"id":"docs/aa"}"#),
@@ -2055,11 +2293,8 @@ mod tests {
     /// for the legacy read — it answers Null, consumes, and never re-traps.
     #[test]
     fn legacy_read_of_held_absence_is_warm_and_consumed() {
-        let mut capsule = SnapshotCapsule::empty(
-            TenantId::new("tenant-a"),
-            DeploymentId::new("dep-a"),
-            7,
-        );
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 7);
         let key = DocumentId::new("k/absent");
         capsule.hydrate_point(key.clone(), aster_capsule::VersionedDocument::missing());
         let mut state = V8CellState {
@@ -2470,8 +2705,8 @@ mod tests {
         }
     }
 
-    /// `db.insert` (with an explicit `_id` — the prototype's supported
-    /// shape) accumulates in the write set without any broker traffic, and
+    /// `db.insert` with an explicit `_id` accumulates in the write set
+    /// without ID-minting broker traffic, and
     /// a `1.0/get` of the key answers the written value with no trap and
     /// no consumption: the value observed came from the transaction
     /// itself, not the snapshot (ORDERING RULE).
@@ -2641,7 +2876,10 @@ mod tests {
             serde_json::json!({ "_id": "docs/p", "b": 9, "c": 3 }),
             "shallow merge overwrites b, adds c, and $undefined removes a"
         );
-        assert_eq!(result.traps, 1, "the patch's implicit base read hydrates once");
+        assert_eq!(
+            result.traps, 1,
+            "the patch's implicit base read hydrates once"
+        );
         assert_eq!(
             result.consumed_reads,
             vec![key],
@@ -2775,11 +3013,10 @@ mod tests {
         );
     }
 
-    /// `db.insert` without an explicit `_id` needs server-side id minting,
-    /// which the prototype does not have — a clear, catchable
-    /// not-yet-supported rejection, never a silently invented id scheme.
+    /// `db.insert` without an explicit `_id` asks the broker for an opaque
+    /// local ID, then writes that same ID into the invocation write set.
     #[test]
-    fn v8_convex_insert_without_id_rejects_as_not_supported() {
+    fn v8_convex_insert_without_id_mints_and_writes() {
         let _v8 = v8_test_guard();
         let tenant = TenantId::new("tenant-mint");
         let deployment = DeploymentId::new("dep-mint");
@@ -2788,31 +3025,31 @@ mod tests {
         let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
         let source = r#"
             async function main() {
-              try {
-                await Convex.asyncSyscall("1.0/insert", JSON.stringify({
-                  table: "docs",
-                  value: { n: 1 },
-                }));
-                return "insert unexpectedly succeeded";
-              } catch (e) {
-                return "caught: " + e.message;
-              }
+              return await Convex.asyncSyscall("1.0/insert", JSON.stringify({
+                table: "docs",
+                value: { n: 1 },
+              }));
             }
         "#;
         let result = cell
             .execute_async_main(&store, tenant, deployment, ts, vec![], source)
-            .expect("the rejection must be catchable — execution completes");
-        match &result.output {
-            Value::Text(msg) => {
-                assert!(
-                    msg.contains("not supported yet") && msg.contains("_id"),
-                    "expected the id-minting rejection, got {msg:?}"
-                );
-            }
-            other => panic!("expected Text output, got {other:?}"),
-        }
-        assert_eq!(result.traps, 0, "the rejection is local — no broker traffic");
+            .expect("server-side id minting should complete");
+        let Value::Text(raw_answer) = &result.output else {
+            panic!("expected serialized insert answer, got {:?}", result.output);
+        };
+        let answer: serde_json::Value =
+            serde_json::from_str(raw_answer).expect("insert answer is JSON");
+        let id = answer["_id"].as_str().expect("insert answer carries _id");
+        let suffix = id
+            .strip_prefix("docs/")
+            .expect("in-memory allocator preserves table prefix");
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(result.traps, 1, "id minting is one broker round trip");
         assert!(result.consumed_reads.is_empty());
-        assert!(result.write_set.is_empty(), "nothing may be written");
+        assert_eq!(result.write_set.len(), 1);
+        let (written_id, written_document) = &result.write_set[0];
+        assert_eq!(written_id.0, id);
+        assert!(written_document.is_some(), "insert must stage a document");
     }
 }

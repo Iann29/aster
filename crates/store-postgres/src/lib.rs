@@ -1,8 +1,7 @@
-//! Postgres-backed implementation of `aster_broker::CapsuleStore`.
-//!
-//! Reads from the same Postgres database the Convex backend writes to.
-//! The schema is captured verbatim in `docs/CONVEX_POSTGRES_REFERENCE.md`
-//! — this module follows its DDL and SQL templates.
+//! Postgres storage for Aster's authoritative history and Convex deployment
+//! inputs. Mainline transaction reads use [`AuthoritativeCapsuleStore`] over
+//! the same `aster.log` as the commit fence. `PostgresCapsuleStore` remains
+//! the module/table-metadata source and a legacy direct Convex-read adapter.
 //!
 //! Design pillars:
 //!
@@ -18,7 +17,7 @@
 //!    `db.get(id)`. `resolve_document_id` dispatches between them; the
 //!    IDv6 path consults a `_tables`-backed mapping cache.
 //!
-//! Coverage today (v0.5):
+//! Legacy Convex-read adapter coverage:
 //! - `snapshot_ts()` — `max(latest documents.ts, persistence_globals['max_repeatable_ts'])`.
 //! - `read_point()` — direct `documents` query with `DISTINCT ON (id)`,
 //!   `ORDER BY ts DESC LIMIT 1`. Skips the by_id index for now (gotcha
@@ -57,26 +56,23 @@
 //! everything else. Garbage falls through to a clear error message
 //! that mentions both forms.
 //!
-//! ALIASING CAVEAT (review C1): the two forms are two spellings of the
-//! same row, but every layer above keys by the raw string — the cell's
-//! view/ledger/write set and the fence's conflict scan treat
-//! `"<hex>/<hex>"` and the IDv6 as different keys. A transaction that
-//! mixes forms for one document can miss read-your-own-writes and
-//! pairwise conflict detection across the spellings. A real Convex
-//! bundle cannot do this (JS only ever holds IDv6 strings); the hazard
-//! is confined to hand-rolled native callers, and the fix — broker-side
-//! canonicalization at the hydrate/commit seam — is named future work.
+//! ALIASING NOTE: this low-level adapter accepts both spellings for direct
+//! integration tests, but the production broker rejects raw wire-form point
+//! IDs before dispatch. Transaction capsules, ledgers, write sets, and
+//! conflict scans therefore admit only canonical Convex IDv6 keys.
 //!
 //! Why not `sqlx`: its `query!` macro requires a live database at
 //! compile time, which CI cannot satisfy without a service container
 //! and a checked-in offline-query-data file. We hand-write the SQL
 //! against the Convex reference doc instead.
 
+mod authoritative;
 mod module_index;
 mod modules_storage;
 mod table_mapping;
 pub mod write_plane;
 
+pub use authoritative::AuthoritativeCapsuleStore;
 pub use module_index::ModuleDescriptor;
 pub use write_plane::{CommitOutcome, FenceInput, WritePlane, WritePlaneConfig};
 
@@ -298,6 +294,10 @@ impl CapsuleStore for PostgresCapsuleStore {
             }
             Ok(max as u64)
         })
+    }
+
+    fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        PostgresCapsuleStore::mint_document_id(self, table)
     }
 
     fn read_point(&self, key: &DocumentId, ts: Timestamp) -> Result<VersionedDocument, StoreError> {
@@ -602,6 +602,32 @@ impl PostgresCapsuleStore {
         Ok(self.table_mapping.lookup(table_number))
     }
 
+    /// Emit a real Convex IDv6 for a user-table insert. The table number
+    /// comes from the same `_tables` mapping used to decode reads; the
+    /// 128-bit internal id is generated from OS entropy.
+    pub fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        let table_number = self.block_on(async {
+            if let Some(number) = self.table_mapping.lookup_number_by_name(table) {
+                return Ok(number);
+            }
+            let client = self.checkout().await?;
+            self.table_mapping.refresh(&client, &self.schema).await?;
+            self.table_mapping
+                .lookup_number_by_name(table)
+                .ok_or_else(|| {
+                    StoreError::Backend(format!(
+                    "cannot mint document id: active table {table:?} is not present in `_tables`"
+                ))
+                })
+        })?;
+        let mut internal_id = [0_u8; 16];
+        getrandom::fill(&mut internal_id)
+            .map_err(|error| StoreError::Unavailable(format!("document id entropy: {error}")))?;
+        Ok(DocumentId::new(
+            DocumentIdV6::new(table_number, internal_id).encode(),
+        ))
+    }
+
     /// Resolve a Convex module path (e.g. `"messages.js"`,
     /// `"_generated/api.js"`) to the descriptor the storage adapter
     /// will use to fetch bundle bytes. Cache miss triggers one
@@ -713,7 +739,7 @@ fn as_i64(value: u64) -> Result<i64, StoreError> {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -723,11 +749,13 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    s
+    encoded
 }
 
 /// Wrap raw Convex `json_value` bytes in an Aster `Document` so the
@@ -947,6 +975,30 @@ mod tests {
             .expect("cache hit");
         assert_eq!(table_id, tablet.to_vec());
         assert_eq!(doc_id, internal.to_vec());
+    }
+
+    #[test]
+    fn mint_document_id_uses_cached_table_number_and_os_entropy() {
+        use std::collections::BTreeMap;
+
+        let cfg = PostgresConfig {
+            url: "postgres://stub:stub@127.0.0.1:1/stub".into(),
+            ..PostgresConfig::default()
+        };
+        let store = PostgresCapsuleStore::connect(cfg).expect("config parses");
+        let tablet = [0xAB; 16];
+        store.table_mapping.install_named_for_test(
+            BTreeMap::from([(10_001, tablet)]),
+            BTreeMap::from([("messages".to_string(), tablet)]),
+        );
+
+        let first = store.mint_document_id("messages").expect("mint");
+        let second = store.mint_document_id("messages").expect("mint");
+        let first = DocumentIdV6::decode(&first.0).expect("canonical IDv6");
+        let second = DocumentIdV6::decode(&second.0).expect("canonical IDv6");
+        assert_eq!(first.table_number, 10_001);
+        assert_eq!(second.table_number, 10_001);
+        assert_ne!(first.internal_id, second.internal_id);
     }
 
     /// Module index hot path: pre-installed descriptor returns

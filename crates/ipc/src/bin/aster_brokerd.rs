@@ -1,22 +1,31 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aster_broker::{
     BrokerError, CapsuleBrokerClient, CapsuleStore, CommitFence, FenceInput, MemoryFence,
 };
 use aster_capsule::{
     CapsuleSealKey, DeploymentId, Document, DocumentId, MvccStore, ObservedWindow, SealContext,
-    SealedCapsule, SessionBinding, TenantId, Value,
+    SealedCapsule, SessionBinding, TenantId, Timestamp, Value,
 };
 use aster_ipc::{
+    launch::{LaunchAuthorizer, LaunchTokenKey},
+    policy::DeploymentPolicy,
     read_frame, write_frame, InitialCapsuleGrant, IpcError, IpcRequest, IpcResponse, ModuleBundle,
     WireBrokerError, WireCommitOutcome,
 };
-use aster_store_postgres::{WritePlane, WritePlaneConfig};
+use aster_store_postgres::{AuthoritativeCapsuleStore, WritePlane, WritePlaneConfig};
+use base64::Engine as _;
 
 fn main() {
     if let Err(error) = run() {
@@ -64,7 +73,9 @@ struct BrokerConfig {
     snapshot_ts: u64,
     seeds: Vec<(DocumentId, Document)>,
     seal_key: CapsuleSealKey,
+    launch_key: Option<LaunchTokenKey>,
     store_kind: StoreKind,
+    policy: DeploymentPolicy,
     /// Postgres connection URL when `store_kind == Postgres`. None for memory.
     db_url: Option<String>,
     /// Postgres schema where Convex tables live. Convex calls this `@db_name`;
@@ -82,6 +93,16 @@ struct BrokerConfig {
     /// (C-CHANNEL obligation #2: the epoch is never self-asserted where a
     /// real authority exists).
     lease_epoch: Option<u64>,
+    /// Only this effective UID may speak the UDS protocol. Defaults to the
+    /// broker's own euid, so an omitted setting stays fail-closed.
+    allowed_peer_uid: u32,
+}
+
+struct BrokerAuthority {
+    store: Arc<dyn CapsuleStore + Send + Sync>,
+    module_source: Arc<dyn ModuleBundleSource + Send + Sync>,
+    fence: Arc<dyn CommitFence>,
+    epoch: u64,
 }
 
 impl BrokerConfig {
@@ -91,9 +112,20 @@ impl BrokerConfig {
         let deployment = DeploymentId::new(env_string("ASTER_DEPLOYMENT")?);
         let snapshot_ts = env_optional_u64("ASTER_SNAPSHOT_TS")?.unwrap_or(0);
         let seeds = parse_seeds(&env_optional_string("ASTER_SEED_I64")?.unwrap_or_default())?;
-        let seal_key = CapsuleSealKey::derive_for_tests(env_string("ASTER_SEAL_SEED")?.as_bytes());
         let store_kind =
             StoreKind::from_env_value(&env_optional_string("ASTER_STORE")?.unwrap_or_default())?;
+        let seal_key = resolve_seal_key(store_kind)?;
+        let launch_key = resolve_launch_key(store_kind)?;
+        let policy = match env_optional_string("ASTER_POLICY_FILE")? {
+            Some(path) => DeploymentPolicy::from_path(&path)?,
+            None if store_kind == StoreKind::Memory => DeploymentPolicy::allow_all_for_tests(),
+            None => {
+                return Err(
+                    "ASTER_STORE=postgres requires ASTER_POLICY_FILE with explicit authority"
+                        .into(),
+                )
+            }
+        };
         let db_url = match store_kind {
             StoreKind::Memory => None,
             StoreKind::Postgres => Some(resolve_db_url()?),
@@ -102,6 +134,7 @@ impl BrokerConfig {
             env_optional_string("ASTER_DB_SCHEMA")?.unwrap_or_else(|| "public".to_string());
         let modules_dir = env_optional_string("ASTER_MODULES_DIR")?.map(PathBuf::from);
         let lease_epoch = env_optional_u64("ASTER_LEASE_EPOCH")?;
+        let allowed_peer_uid = resolve_allowed_peer_uid()?;
         Ok(Self {
             socket_path,
             tenant,
@@ -109,13 +142,26 @@ impl BrokerConfig {
             snapshot_ts,
             seeds,
             seal_key,
+            launch_key,
             store_kind,
+            policy,
             db_url,
             db_schema,
             modules_dir,
             lease_epoch,
+            allowed_peer_uid,
         })
     }
+}
+
+fn resolve_allowed_peer_uid() -> Result<u32, Box<dyn std::error::Error>> {
+    if let Some(uid) = env_optional_u64("ASTER_ALLOWED_PEER_UID")? {
+        return u32::try_from(uid)
+            .map_err(|_| format!("ASTER_ALLOWED_PEER_UID={uid} exceeds u32").into());
+    }
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    Ok(unsafe { libc::geteuid() })
 }
 
 trait ModuleBundleSource: Send + Sync {
@@ -144,6 +190,14 @@ impl ModuleBundleSource for aster_store_postgres::PostgresCapsuleStore {
 /// secret at a path readable only by the brokerd UID.
 fn resolve_db_url() -> Result<String, Box<dyn std::error::Error>> {
     if let Some(path) = env_optional_string("ASTER_DB_URL_FILE")? {
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("stat ASTER_DB_URL_FILE={path}: {error}"))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(
+                format!("ASTER_DB_URL_FILE={path} has mode {mode:04o}; use 0400 or 0600").into(),
+            );
+        }
         let raw = fs::read_to_string(&path)
             .map_err(|err| format!("read ASTER_DB_URL_FILE={path}: {err}"))?;
         return Ok(raw.trim().to_string());
@@ -152,6 +206,105 @@ fn resolve_db_url() -> Result<String, Box<dyn std::error::Error>> {
         return Ok(url);
     }
     Err("ASTER_STORE=postgres requires ASTER_DB_URL_FILE or ASTER_DB_URL".into())
+}
+
+fn resolve_seal_key(store_kind: StoreKind) -> Result<CapsuleSealKey, Box<dyn std::error::Error>> {
+    if let Some(key) = read_secret_key("ASTER_SEAL_KEY_FILE")? {
+        return Ok(CapsuleSealKey::from_bytes(key));
+    }
+    match store_kind {
+        StoreKind::Memory => Ok(CapsuleSealKey::derive_for_tests(
+            env_string("ASTER_SEAL_SEED")?.as_bytes(),
+        )),
+        StoreKind::Postgres => Err(
+            "ASTER_STORE=postgres requires ASTER_SEAL_KEY_FILE; deterministic \
+             ASTER_SEAL_SEED is restricted to memory-mode tests"
+                .into(),
+        ),
+    }
+}
+
+fn resolve_launch_key(
+    store_kind: StoreKind,
+) -> Result<Option<LaunchTokenKey>, Box<dyn std::error::Error>> {
+    if let Some(key) = read_secret_key("ASTER_LAUNCH_KEY_FILE")? {
+        return Ok(Some(LaunchTokenKey::from_bytes(key)));
+    }
+    match store_kind {
+        StoreKind::Memory => Ok(None),
+        StoreKind::Postgres => Err("ASTER_STORE=postgres requires ASTER_LAUNCH_KEY_FILE".into()),
+    }
+}
+
+fn read_secret_key(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+    let Some(path) = env_optional_string(name)? else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(&path).map_err(|error| format!("stat {name}={path}: {error}"))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{name}={path} has mode {mode:04o}; group/other permissions must be zero \
+             (use 0400 or 0600)"
+        )
+        .into());
+    }
+    let raw = fs::read(&path).map_err(|error| format!("read {name}={path}: {error}"))?;
+    decode_secret_key(&raw, name).map(Some).map_err(Into::into)
+}
+
+fn decode_secret_key(raw: &[u8], name: &str) -> Result<[u8; 32], String> {
+    if raw.len() == 32 {
+        return raw
+            .try_into()
+            .map_err(|_| format!("{name} must contain exactly 32 bytes"));
+    }
+
+    let encoded = std::str::from_utf8(raw)
+        .map(str::trim)
+        .map_err(|error| format!("{name} is neither 32 raw bytes nor UTF-8 text: {error}"))?;
+    if encoded.len() == 64 && encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut key = [0_u8; 32];
+        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(pair).expect("hex pair is ASCII");
+            key[index] = u8::from_str_radix(pair, 16)
+                .map_err(|error| format!("invalid hex {name}: {error}"))?;
+        }
+        return Ok(key);
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .map_err(|error| format!("{name} is not valid hex/base64: {error}"))?;
+    decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("decoded {name} is {} bytes, expected 32", decoded.len()))
+}
+
+fn publish_authority_epoch(epoch: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = env_optional_string("ASTER_AUTHORITY_EPOCH_FILE")? else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    writeln!(file, "{epoch}")?;
+    file.sync_all()?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
+    fs::rename(&temporary, &path)?;
+    Ok(())
 }
 
 fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -169,12 +322,12 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     // match. The commit fence rides the same dispatch: the write path's
     // lease authority is inseparable from where commits land.
     let configured_ts = config.snapshot_ts;
-    let (store, module_source, fence, authority_epoch): (
-        Arc<dyn CapsuleStore + Send + Sync>,
-        Arc<dyn ModuleBundleSource + Send + Sync>,
-        Arc<dyn CommitFence>,
-        u64,
-    ) = match config.store_kind {
+    let BrokerAuthority {
+        store,
+        module_source,
+        fence,
+        epoch: authority_epoch,
+    } = match config.store_kind {
         StoreKind::Memory => {
             let mvcc = Arc::new(MvccStore::new());
             for (key, document) in config.seeds {
@@ -187,14 +340,14 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
             let epoch = config.lease_epoch.unwrap_or(1);
             let fence = MemoryFence::new(mvcc.clone());
             fence.seed_lease(&config.tenant.0, &config.deployment.0, epoch);
-            (
-                mvcc,
-                Arc::new(NoModuleBundleSource {
+            BrokerAuthority {
+                store: mvcc,
+                module_source: Arc::new(NoModuleBundleSource {
                     reason: "module loading requires ASTER_STORE=postgres",
                 }),
-                Arc::new(fence),
+                fence: Arc::new(fence),
                 epoch,
-            )
+            }
         }
         StoreKind::Postgres => {
             let url = config
@@ -207,22 +360,17 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
                 modules_dir: config.modules_dir.clone(),
                 ..aster_store_postgres::PostgresConfig::default()
             };
-            // Connect is lazy — `connect()` builds the runtime + pool but
-            // does NOT open a TCP connection. First snapshot_ts call
-            // below is the one that actually checks if Postgres is up.
-            // Failure here is a config error (bad URL, missing host),
-            // worth dying at startup.
-            let store = Arc::new(
+            // Module bundles remain deployment inputs sourced from Convex's
+            // module tables and hash-verified local storage. Transaction
+            // documents do not: reads and commits below share aster.log.
+            let module_source = Arc::new(
                 aster_store_postgres::PostgresCapsuleStore::connect(pg_cfg)
-                    .map_err(|err| format!("postgres connect: {err}"))?,
+                    .map_err(|err| format!("module store connect: {err}"))?,
             );
-            // Lease authority (C-CHANNEL obligation #2): acquire the
-            // single-writer lease at boot. The resulting epoch is BOTH
-            // this broker's committer epoch and the lease_epoch stamped
-            // into every minted session — the env variable is not
-            // consulted. Sessions minted before a failover die naturally:
-            // once a new holder acquires, the fence's V2 check rejects
-            // their context epoch.
+            // One WritePlane instance owns the lease, snapshots, document
+            // reads, retention, conflict validation, and append. This is the
+            // shared-history premise required by T2; the v0.7 split between
+            // Convex reads and aster.log writes no longer exists here.
             let plane = Arc::new(
                 WritePlane::connect(WritePlaneConfig {
                     url,
@@ -243,12 +391,18 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
                      the storage lease authority owns the epoch"
                 );
             }
-            (
-                store.clone() as Arc<dyn CapsuleStore + Send + Sync>,
-                store as Arc<dyn ModuleBundleSource + Send + Sync>,
-                plane,
+            let store = Arc::new(AuthoritativeCapsuleStore::with_id_allocator(
+                plane.clone(),
+                config.tenant.clone(),
+                config.deployment.clone(),
+                module_source.clone(),
+            ));
+            BrokerAuthority {
+                store: store as Arc<dyn CapsuleStore + Send + Sync>,
+                module_source: module_source as Arc<dyn ModuleBundleSource + Send + Sync>,
+                fence: plane,
                 epoch,
-            )
+            }
         }
     };
     // Harnesses parse this line to launch cells with the matching epoch
@@ -261,84 +415,216 @@ fn run_broker(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
             StoreKind::Postgres => "lease-authority",
         }
     );
-    let snapshot_ts = if configured_ts == 0 {
-        store
-            .snapshot_ts()
-            .map_err(|err| format!("snapshot_ts: {err}"))?
+    let head = store
+        .snapshot_ts()
+        .map_err(|err| format!("snapshot_ts: {err}"))?;
+    let fixed_snapshot_ts = (configured_ts != 0).then_some(configured_ts);
+    if let Some(fixed) = fixed_snapshot_ts {
+        if fixed > head {
+            return Err(format!(
+                "ASTER_SNAPSHOT_TS={fixed} is beyond the authoritative store head {head}"
+            )
+            .into());
+        }
+        eprintln!(
+            "aster_brokerd: store={} snapshot_mode=fixed snapshot_ts={} head={}",
+            match config.store_kind {
+                StoreKind::Memory => "memory",
+                StoreKind::Postgres => "postgres",
+            },
+            fixed,
+            head
+        );
     } else {
-        configured_ts
-    };
-    eprintln!(
-        "aster_brokerd: store={} snapshot_ts={}",
-        match config.store_kind {
-            StoreKind::Memory => "memory",
-            StoreKind::Postgres => "postgres",
-        },
-        snapshot_ts
-    );
+        eprintln!(
+            "aster_brokerd: store={} snapshot_mode=latest head={}",
+            match config.store_kind {
+                StoreKind::Memory => "memory",
+                StoreKind::Postgres => "postgres",
+            },
+            head
+        );
+    }
     let broker = ProcessBroker {
         store,
         module_source,
         seal_key: config.seal_key,
+        launch_authorizer: config.launch_key.map(LaunchAuthorizer::new),
+        policy: config.policy,
+        allow_shutdown: config.store_kind == StoreKind::Memory,
         tenant: config.tenant,
         deployment: config.deployment,
-        snapshot_ts,
+        fixed_snapshot_ts,
         sessions: SessionTable::default(),
         fence,
         authority_epoch,
     };
 
+    let max_connections = broker.policy.max_concurrent_sessions;
+    let wake_socket = broker
+        .allow_shutdown
+        .then(|| Arc::new(config.socket_path.clone()));
+    let broker = Arc::new(broker);
     let listener = UnixListener::bind(&config.socket_path)?;
+    fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
+    publish_authority_epoch(authority_epoch)?;
     eprintln!(
-        "aster_brokerd: ready socket={} snapshot_ts={}",
+        "aster_brokerd: ready socket={} snapshot_mode={} peer_uid={} max_connections={}",
         config.socket_path.display(),
-        snapshot_ts
+        if fixed_snapshot_ts.is_some() {
+            "fixed"
+        } else {
+            "latest"
+        },
+        config.allowed_peer_uid,
+        max_connections
     );
 
-    // One connection per request, served serially until a Shutdown verb.
-    // v0.6 capped total connections served since boot (ASTER_MAX_CONNECTIONS)
-    // and exited past the cap — with one connection per read trap, a busy
-    // broker killed itself mid-workload. The write path multiplies traps, so
-    // the lifetime budget is gone; concurrency control belongs at the
-    // accept/queue layer if the broker ever goes parallel.
-    //
-    // Per-connection I/O failures stay per-connection: a `?` on the response
-    // write let ONE bad client (a peer that hung up before reading — EPIPE,
-    // Rust ignores SIGPIPE — or a response that outgrew the frame cap) kill
-    // the broker and with it the in-process session table every other live
-    // cell depends on. Only accept errors remain fatal.
-    for stream in listener.incoming() {
-        let mut stream = stream?;
-        // The loop is serial: a peer that connects and then goes silent
-        // (never writes a frame, or never drains the response) would wedge
-        // every other cell behind it forever — the same denial the C4
-        // containment closed for errored sockets. Bound both directions;
-        // an expired deadline surfaces as a read/write error and is
-        // contained per-connection like any other I/O failure.
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-        let request = read_frame::<IpcRequest>(&mut stream);
-        let should_shutdown = match request {
-            Ok(request) => {
-                let (response, should_shutdown) = handle_request(&broker, request);
-                send_response(&mut stream, &response);
-                should_shutdown
+    // One request per connection. Requests run concurrently up to the policy's
+    // active-session bound; a silent peer can consume one slot until its I/O
+    // deadline, but cannot head-of-line block every other cell.
+    let live_connections = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    while !shutdown.load(Ordering::Acquire) {
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let deadline = Some(Duration::from_secs(10));
+        let _ = stream.set_read_timeout(deadline);
+        let _ = stream.set_write_timeout(deadline);
+
+        match peer_uid(&stream) {
+            Ok(uid) if uid == config.allowed_peer_uid => {}
+            Ok(uid) => {
+                send_response(
+                    &mut stream,
+                    &IpcResponse::Error(WireBrokerError::new(
+                        "peer_uid_denied",
+                        format!("peer uid {uid} is not authorized"),
+                    )),
+                );
+                continue;
             }
             Err(error) => {
-                let response =
-                    IpcResponse::Error(WireBrokerError::new("bad_request", error.to_string()));
-                send_response(&mut stream, &response);
-                false
+                send_response(
+                    &mut stream,
+                    &IpcResponse::Error(WireBrokerError::new(
+                        "peer_credential_error",
+                        error.to_string(),
+                    )),
+                );
+                continue;
             }
-        };
-        if should_shutdown {
-            eprintln!("aster_brokerd: shutdown requested");
-            break;
+        }
+
+        if live_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < max_connections).then_some(current + 1)
+            })
+            .is_err()
+        {
+            send_response(
+                &mut stream,
+                &IpcResponse::Error(WireBrokerError::new(
+                    "broker_busy",
+                    format!("active connection limit {max_connections} reached"),
+                )),
+            );
+            continue;
+        }
+
+        let worker_broker = Arc::clone(&broker);
+        let worker_live = Arc::clone(&live_connections);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_wake = wake_socket.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("aster-broker-connection".into())
+            .spawn(move || {
+                let _active = ActiveConnection(worker_live);
+                if serve_connection(&worker_broker, &mut stream) {
+                    worker_shutdown.store(true, Ordering::Release);
+                    if let Some(socket) = worker_wake {
+                        let _ = UnixStream::connect(socket.as_ref());
+                    }
+                }
+            })
+        {
+            live_connections.fetch_sub(1, Ordering::AcqRel);
+            eprintln!("aster_brokerd: connection worker spawn failed: {error}");
         }
     }
 
+    while live_connections.load(Ordering::Acquire) != 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    eprintln!("aster_brokerd: shutdown requested");
     let _ = fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+struct ActiveConnection(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn serve_connection(broker: &ProcessBroker, stream: &mut UnixStream) -> bool {
+    match read_frame::<IpcRequest>(stream) {
+        Ok(request) => {
+            let (response, should_shutdown) = handle_request(broker, request);
+            send_response(stream, &response);
+            should_shutdown
+        }
+        Err(error) => {
+            let response =
+                IpcResponse::Error(WireBrokerError::new("bad_request", error.to_string()));
+            send_response(stream, &response);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` points to writable storage of `length` bytes,
+    // `length` itself is valid, and `stream` owns a live socket descriptor.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned an unexpected credential size",
+        ));
+    }
+    // SAFETY: getsockopt succeeded and initialized the complete ucred value.
+    Ok(unsafe { credentials.assume_init() }.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer credential authentication requires Linux SO_PEERCRED",
+    ))
 }
 
 /// Write one response, containing every failure to that connection.
@@ -373,21 +659,26 @@ fn send_response(stream: &mut UnixStream, response: &IpcResponse) {
     }
 }
 
+fn unix_time_s() -> Result<u64, WireBrokerError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| WireBrokerError::new("clock_error", error.to_string()))
+}
+
 fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, bool) {
     match request {
         IpcRequest::InitialCapsule {
+            launch_token,
             context,
             tenant,
             deployment,
             snapshot_ts,
             prewarm,
         } => {
-            // Only brokerd mints session bindings — a pre-bound context in
-            // an InitialCapsule request is confused or hostile, never
-            // legitimate. The request's cell_id stands in for trusted
-            // launch metadata in this prototype (a production broker reads
-            // it from the launch channel, not the payload — the remaining
-            // C-CHANNEL obligation #1).
+            // Only brokerd mints session bindings. In production, the
+            // one-time launch token below authenticates the cell id and
+            // binds it to this tenant, deployment, and lease epoch.
             if context.session.is_some() {
                 return (
                     IpcResponse::InitialCapsule(Err(WireBrokerError::new(
@@ -414,14 +705,70 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                     false,
                 );
             }
+            if tenant != broker.tenant {
+                return (
+                    IpcResponse::InitialCapsule(Err(WireBrokerError::from(
+                        BrokerError::TenantMismatch,
+                    ))),
+                    false,
+                );
+            }
+            if deployment != broker.deployment {
+                return (
+                    IpcResponse::InitialCapsule(Err(WireBrokerError::from(
+                        BrokerError::DeploymentMismatch,
+                    ))),
+                    false,
+                );
+            }
             for key in &prewarm {
                 if let Err(error) = reject_noncanonical_point_id(key) {
                     return (IpcResponse::InitialCapsule(Err(error)), false);
                 }
             }
-            let session = broker
-                .sessions
-                .mint(&context.cell_id, broker.authority_epoch);
+            if let Err(error) = broker.authorize_initial(&prewarm) {
+                return (IpcResponse::InitialCapsule(Err(error)), false);
+            }
+            if let Some(authorizer) = &broker.launch_authorizer {
+                let Some(token) = launch_token.as_deref() else {
+                    return (
+                        IpcResponse::InitialCapsule(Err(WireBrokerError::new(
+                            "launch_token_required",
+                            "postgres broker requires a one-time launch token",
+                        ))),
+                        false,
+                    );
+                };
+                let now = match unix_time_s() {
+                    Ok(now) => now,
+                    Err(error) => return (IpcResponse::InitialCapsule(Err(error)), false),
+                };
+                if let Err(error) = authorizer.verify(
+                    token,
+                    &context.cell_id,
+                    &broker.tenant.0,
+                    &broker.deployment.0,
+                    broker.authority_epoch,
+                    now,
+                ) {
+                    return (
+                        IpcResponse::InitialCapsule(Err(WireBrokerError::new(
+                            "launch_token_rejected",
+                            error.to_string(),
+                        ))),
+                        false,
+                    );
+                }
+            }
+            let session = match broker.sessions.mint(
+                &context.cell_id,
+                broker.authority_epoch,
+                broker.policy.max_concurrent_sessions,
+                broker.policy.session_ttl_seconds,
+            ) {
+                Ok(session) => session,
+                Err(error) => return (IpcResponse::InitialCapsule(Err(error)), false),
+            };
             let bound = SealContext::bound(context.cell_id, broker.authority_epoch, session);
             let result =
                 match broker.initial_capsule(&bound, tenant, deployment, snapshot_ts, prewarm) {
@@ -445,6 +792,7 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             IpcResponse::HydratePoint(broker.resolve_bound_context(session, &context).and_then(
                 |bound| {
                     reject_noncanonical_point_id(&key)?;
+                    broker.authorize_point_hydrate(&capsule, &key)?;
                     broker
                         .hydrate_point(&bound, capsule, key)
                         .map_err(WireBrokerError::from)
@@ -461,8 +809,24 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
         } => (
             IpcResponse::HydratePrefix(broker.resolve_bound_context(session, &context).and_then(
                 |bound| {
+                    broker.authorize_scan(&capsule, &prefix, limit)?;
                     broker
                         .hydrate_prefix(&bound, capsule, prefix, limit)
+                        .map_err(WireBrokerError::from)
+                },
+            )),
+            false,
+        ),
+        IpcRequest::MintDocumentId {
+            context,
+            session,
+            table,
+        } => (
+            IpcResponse::MintDocumentId(broker.resolve_bound_context(session, &context).and_then(
+                |bound| {
+                    broker.authorize_insert(&table)?;
+                    broker
+                        .mint_document_id(&bound, &table)
                         .map_err(WireBrokerError::from)
                 },
             )),
@@ -478,6 +842,7 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                 broker
                     .resolve_bound_context(session, &context)
                     .and_then(|bound| {
+                        broker.authorize_module(&path)?;
                         broker
                             .load_module_bundle(&bound, capsule, path)
                             .map(|bundle| {
@@ -504,7 +869,7 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
                 lease_epoch: capsule.seal().lease_epoch,
                 session: capsule.seal().session,
             };
-            let resolved = broker.resolve_bound_context(session, &claimed);
+            let resolved = broker.consume_bound_context(session, &claimed);
             // One session = one commit ATTEMPT, and the attempt SPENDS the
             // session BEFORE the fence runs (review C6 + re-referee F4):
             // consumption is keyed to presenting a registered id, not to
@@ -515,25 +880,22 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             // every structured Commit answer. Replay of the ISSUED capsule
             // bytes is inevitable under bearer semantics (theorem CE2.1);
             // spending the session here is what bounds it.
-            if let Some(session) = session {
-                let _ = broker.sessions.remove(&session);
-            }
             let result = resolved.and_then(|bound| {
-                    let outcome = broker.commit(&bound, capsule, &declared_reads, &writes);
-                    // Fail-closed but never silent (review B1): StaleEpoch
-                    // means the lease moved and every commit this broker
-                    // relays is dead — say so on stderr so the operator
-                    // learns before the cells do.
-                    if let Ok(WireCommitOutcome::StaleEpoch { lease_epoch }) = &outcome {
-                        eprintln!(
-                            "aster-brokerd: fence refused commit — stale lease epoch \
+                let outcome = broker.commit(&bound, capsule, &declared_reads, &writes);
+                // Fail-closed but never silent (review B1): StaleEpoch
+                // means the lease moved and every commit this broker
+                // relays is dead — say so on stderr so the operator
+                // learns before the cells do.
+                if let Ok(WireCommitOutcome::StaleEpoch { lease_epoch }) = &outcome {
+                    eprintln!(
+                        "aster-brokerd: fence refused commit — stale lease epoch \
                              (authority is at epoch {lease_epoch}, this broker holds {}); \
                              the lease moved, relaunch brokerd to re-acquire",
-                            broker.authority_epoch
-                        );
-                    }
-                    outcome
-                });
+                        broker.authority_epoch
+                    );
+                }
+                outcome
+            });
             (IpcResponse::Commit(result), false)
         }
         // Abort is the no-commit end-of-life for a session: same closure
@@ -550,26 +912,25 @@ fn handle_request(broker: &ProcessBroker, request: IpcRequest) -> (IpcResponse, 
             };
             (IpcResponse::Abort(result), false)
         }
-        // Shutdown is process-lifecycle scaffolding for the prototype
-        // harnesses, not a capsule verb — it carries no capsule and grants
-        // no data authority, so it stays outside the session gate.
-        IpcRequest::Shutdown => (IpcResponse::ShutdownAck, true),
+        // Production lifecycle is controlled by the container supervisor.
+        // Keeping an unauthenticated shutdown verb on the cell socket would
+        // turn every tenant into a deployment-wide DoS principal.
+        IpcRequest::Shutdown if broker.allow_shutdown => (IpcResponse::ShutdownAck, true),
+        IpcRequest::Shutdown => (
+            IpcResponse::Error(WireBrokerError::new(
+                "shutdown_disabled",
+                "shutdown over the cell socket is disabled for this broker",
+            )),
+            false,
+        ),
     }
 }
 
-/// Broker-side registry of live sessions: session id → the immutable
-/// context the id was minted for. This is the C-CHANNEL repair's trusted
-/// table: capsule verbs present a session id, and the broker rebuilds the
-/// expected bound `SealContext` from THIS table — the request's serialized
-/// context is only checked for equality against the record and then
-/// discarded, never used as authority.
-///
-/// End-of-life (S9a): one session = one transaction attempt — Commit (any
-/// structured answer) and Abort both remove the entry, and subsequent
-/// verbs on the id get `unknown_session`. What remains unbounded is the
-/// MINT side: a hostile cell can still grow the table by hammering
-/// InitialCapsule and never finishing — accepted for the prototype,
-/// alongside launch-token minting (C-CHANNEL obligation #1).
+/// Broker-side registry of live sessions: session id → immutable context.
+/// Capsule verbs present a session id; the broker rebuilds the bound
+/// `SealContext` from this trusted table and treats serialized context only
+/// as a consistency check. Commit/Abort consumes one attempt, while a policy
+/// cap plus monotonic TTL bounds abandoned grants and disconnected clients.
 #[derive(Default)]
 struct SessionTable {
     sessions: Mutex<HashMap<SessionBinding, SessionEntry>>,
@@ -579,6 +940,7 @@ struct SessionTable {
 struct SessionEntry {
     cell_id: String,
     lease_epoch: u64,
+    expires_at: Instant,
 }
 
 impl SessionTable {
@@ -587,20 +949,37 @@ impl SessionTable {
     /// so anything predictable (time, counters, constant seeds) would let
     /// one cell impersonate another's channel. If the OS RNG fails the
     /// broker cannot operate securely; dying is the only safe behavior.
-    fn mint(&self, cell_id: &str, lease_epoch: u64) -> SessionBinding {
+    fn mint(
+        &self,
+        cell_id: &str,
+        lease_epoch: u64,
+        max_sessions: usize,
+        ttl_seconds: u64,
+    ) -> Result<SessionBinding, WireBrokerError> {
+        let now = Instant::now();
+        let expires_at = now
+            .checked_add(Duration::from_secs(ttl_seconds))
+            .ok_or_else(|| WireBrokerError::new("session_ttl_invalid", "session TTL overflow"))?;
         let mut sessions = self.sessions.lock().expect("session table lock");
+        sessions.retain(|_, entry| entry.expires_at > now);
+        if sessions.len() >= max_sessions {
+            return Err(WireBrokerError::new(
+                "session_capacity_exceeded",
+                format!("deployment already has {max_sessions} live sessions"),
+            ));
+        }
         loop {
             let mut id = [0_u8; 32];
-            getrandom::fill(&mut id).expect("OS entropy for session id");
-            // 256-bit collision is astronomically unlikely; the loop is for
-            // totality, not an expected path.
+            getrandom::fill(&mut id)
+                .map_err(|error| WireBrokerError::new("entropy_unavailable", error.to_string()))?;
             if let Entry::Vacant(vacant) = sessions.entry(SessionBinding::from_bytes(id)) {
                 let session = *vacant.key();
                 vacant.insert(SessionEntry {
                     cell_id: cell_id.to_string(),
                     lease_epoch,
+                    expires_at,
                 });
-                return session;
+                return Ok(session);
             }
         }
     }
@@ -613,14 +992,20 @@ impl SessionTable {
             .lock()
             .expect("session table lock")
             .remove(session)
+            .filter(|entry| entry.expires_at > Instant::now())
     }
 
     fn lookup(&self, session: &SessionBinding) -> Option<SessionEntry> {
-        self.sessions
-            .lock()
-            .expect("session table lock")
-            .get(session)
-            .cloned()
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().expect("session table lock");
+        match sessions.get(session) {
+            Some(entry) if entry.expires_at > now => Some(entry.clone()),
+            Some(_) => {
+                sessions.remove(session);
+                None
+            }
+            None => None,
+        }
     }
 }
 
@@ -628,9 +1013,12 @@ struct ProcessBroker {
     store: Arc<dyn CapsuleStore + Send + Sync>,
     module_source: Arc<dyn ModuleBundleSource + Send + Sync>,
     seal_key: CapsuleSealKey,
+    launch_authorizer: Option<LaunchAuthorizer>,
+    policy: DeploymentPolicy,
+    allow_shutdown: bool,
     tenant: TenantId,
     deployment: DeploymentId,
-    snapshot_ts: u64,
+    fixed_snapshot_ts: Option<u64>,
     sessions: SessionTable,
     /// The commit fence commits land through: the Postgres `WritePlane`
     /// in postgres mode, `MemoryFence` over the read store otherwise.
@@ -654,18 +1042,52 @@ impl ProcessBroker {
         session: Option<SessionBinding>,
         claimed: &SealContext,
     ) -> Result<SealContext, WireBrokerError> {
-        let Some(session) = session else {
-            return Err(WireBrokerError::new(
+        let session = session.ok_or_else(|| {
+            WireBrokerError::new(
                 "session_required",
                 "capsule verbs must present the session id minted at InitialCapsule",
-            ));
-        };
-        let Some(entry) = self.sessions.lookup(&session) else {
-            return Err(WireBrokerError::new(
+            )
+        })?;
+        let entry = self.sessions.lookup(&session).ok_or_else(|| {
+            WireBrokerError::new(
                 "unknown_session",
                 "session id is not registered with this broker",
-            ));
-        };
+            )
+        })?;
+        Self::validate_session_context(session, claimed, entry)
+    }
+
+    /// Atomically spend a session before a commit reaches the fence.
+    ///
+    /// Lookup-then-remove is insufficient once the UDS accept loop is
+    /// concurrent: two requests can both resolve the same bearer session.
+    /// Taking the entry in one locked map operation gives exactly one request
+    /// the authority to attempt a commit; every racer gets unknown_session.
+    fn consume_bound_context(
+        &self,
+        session: Option<SessionBinding>,
+        claimed: &SealContext,
+    ) -> Result<SealContext, WireBrokerError> {
+        let session = session.ok_or_else(|| {
+            WireBrokerError::new(
+                "session_required",
+                "commit must present the session id minted at InitialCapsule",
+            )
+        })?;
+        let entry = self.sessions.remove(&session).ok_or_else(|| {
+            WireBrokerError::new(
+                "unknown_session",
+                "session id is not registered with this broker",
+            )
+        })?;
+        Self::validate_session_context(session, claimed, entry)
+    }
+
+    fn validate_session_context(
+        session: SessionBinding,
+        claimed: &SealContext,
+        entry: SessionEntry,
+    ) -> Result<SealContext, WireBrokerError> {
         let claimed_binding_ok = match claimed.session {
             None => true,
             Some(claimed_session) => claimed_session == session,
@@ -685,9 +1107,158 @@ impl ProcessBroker {
             session,
         ))
     }
+
+    fn authorize_initial(&self, prewarm: &[DocumentId]) -> Result<(), WireBrokerError> {
+        if prewarm.len() > self.policy.max_reads_per_transaction {
+            return Err(self.policy_limit(
+                "policy_read_limit",
+                "prewarm reads",
+                prewarm.len(),
+                self.policy.max_reads_per_transaction,
+            ));
+        }
+        for key in prewarm {
+            self.authorize_read(key)?;
+        }
+        Ok(())
+    }
+
+    fn authorize_read(&self, key: &DocumentId) -> Result<(), WireBrokerError> {
+        if self.policy.allows_read(&key.0) {
+            Ok(())
+        } else {
+            Err(self.policy_denied("policy_read_denied", "read", &key.0))
+        }
+    }
+
+    fn authorize_point_hydrate(
+        &self,
+        capsule: &SealedCapsule,
+        key: &DocumentId,
+    ) -> Result<(), WireBrokerError> {
+        self.authorize_read(key)?;
+        let current = capsule.capsule().docs.len();
+        if !capsule.capsule().docs.contains_key(key)
+            && current >= self.policy.max_reads_per_transaction
+        {
+            return Err(self.policy_limit(
+                "policy_read_limit",
+                "observed point reads",
+                current.saturating_add(1),
+                self.policy.max_reads_per_transaction,
+            ));
+        }
+        Ok(())
+    }
+
+    fn authorize_scan(
+        &self,
+        capsule: &SealedCapsule,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<(), WireBrokerError> {
+        if !self.policy.allows_scan(prefix) {
+            return Err(self.policy_denied("policy_read_denied", "scan", prefix));
+        }
+        if limit > self.policy.max_scan_limit {
+            return Err(self.policy_limit(
+                "policy_scan_limit",
+                "scan limit",
+                limit,
+                self.policy.max_scan_limit,
+            ));
+        }
+        let requested_total = capsule.capsule().docs.len().saturating_add(limit);
+        if requested_total > self.policy.max_reads_per_transaction {
+            return Err(self.policy_limit(
+                "policy_read_limit",
+                "maximum observed reads after scan",
+                requested_total,
+                self.policy.max_reads_per_transaction,
+            ));
+        }
+        Ok(())
+    }
+
+    fn authorize_module(&self, path: &str) -> Result<(), WireBrokerError> {
+        if self.policy.allows_module(path) {
+            Ok(())
+        } else {
+            Err(self.policy_denied("policy_module_denied", "module load", path))
+        }
+    }
+
+    fn authorize_insert(&self, table: &str) -> Result<(), WireBrokerError> {
+        if self.policy.allows_insert(table) {
+            Ok(())
+        } else {
+            Err(self.policy_denied("policy_insert_denied", "insert", table))
+        }
+    }
+
+    fn policy_denied(&self, code: &str, operation: &str, target: &str) -> WireBrokerError {
+        WireBrokerError::new(
+            code,
+            format!(
+                "{operation} of {target:?} is outside deployment policy version {}",
+                self.policy.version
+            ),
+        )
+    }
+
+    fn policy_limit(
+        &self,
+        code: &str,
+        subject: &str,
+        actual: usize,
+        maximum: usize,
+    ) -> WireBrokerError {
+        WireBrokerError::new(
+            code,
+            format!(
+                "{subject}={actual} exceeds policy maximum {maximum} (version {})",
+                self.policy.version
+            ),
+        )
+    }
 }
 
 impl ProcessBroker {
+    /// Resolve the snapshot for a new session. Production clients request
+    /// `0`, meaning the current authoritative head. An explicit broker pin
+    /// remains available for deterministic replay and benchmark harnesses.
+    fn issue_snapshot(&self, requested: Timestamp) -> Result<Timestamp, BrokerError> {
+        match self.fixed_snapshot_ts {
+            Some(fixed) if requested == 0 || requested == fixed => Ok(fixed),
+            Some(fixed) => Err(BrokerError::Remote(format!(
+                "snapshot_ts {requested} is not broker fixed snapshot {fixed}"
+            ))),
+            None => {
+                let head = self.store.snapshot_ts().map_err(BrokerError::from)?;
+                if requested == 0 {
+                    return Ok(head);
+                }
+                if requested > head {
+                    return Err(BrokerError::Remote(format!(
+                        "snapshot_ts {requested} is beyond authoritative head {head}"
+                    )));
+                }
+                Ok(requested)
+            }
+        }
+    }
+
+    fn enforce_snapshot_mode(&self, snapshot: Timestamp) -> Result<(), BrokerError> {
+        if let Some(fixed) = self.fixed_snapshot_ts {
+            if snapshot != fixed {
+                return Err(BrokerError::Remote(format!(
+                    "capsule snapshot_ts {snapshot} is not broker fixed snapshot {fixed}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn verify_capsule(
         &self,
         context: &SealContext,
@@ -700,12 +1271,7 @@ impl ProcessBroker {
         if capsule.deployment != self.deployment {
             return Err(BrokerError::DeploymentMismatch);
         }
-        if capsule.ts != self.snapshot_ts {
-            return Err(BrokerError::Remote(format!(
-                "capsule snapshot_ts {} is not broker snapshot {}",
-                capsule.ts, self.snapshot_ts
-            )));
-        }
+        self.enforce_snapshot_mode(capsule.ts)?;
         Ok(())
     }
 
@@ -747,12 +1313,8 @@ impl ProcessBroker {
         if capsule.deployment != self.deployment {
             return Err(WireBrokerError::from(BrokerError::DeploymentMismatch));
         }
-        if capsule.ts != self.snapshot_ts {
-            return Err(WireBrokerError::from(BrokerError::Remote(format!(
-                "capsule snapshot_ts {} is not broker snapshot {}",
-                capsule.ts, self.snapshot_ts
-            ))));
-        }
+        self.enforce_snapshot_mode(capsule.ts)
+            .map_err(WireBrokerError::from)?;
         // (b) Variante B declaration check (Repair B-SUBSET): every
         // declared point must reference an observation atom the sealed
         // capsule actually carries, without duplicates. The INVERSE is
@@ -760,9 +1322,20 @@ impl ProcessBroker {
         // dependency to an authorized blind write — T2 still orders it;
         // omission costs the cell its own conflict protection, never
         // anyone else's safety.
+        if capsule.docs.len() > self.policy.max_reads_per_transaction
+            || declared_reads.len() > self.policy.max_reads_per_transaction
+        {
+            return Err(self.policy_limit(
+                "policy_read_limit",
+                "authenticated or declared reads",
+                capsule.docs.len().max(declared_reads.len()),
+                self.policy.max_reads_per_transaction,
+            ));
+        }
         let mut declared = BTreeSet::new();
         for key in declared_reads {
             reject_noncanonical_point_id(key)?;
+            self.authorize_read(key)?;
             if !capsule.docs.contains_key(key) {
                 return Err(WireBrokerError::new(
                     "declared_read_not_in_capsule",
@@ -785,9 +1358,20 @@ impl ProcessBroker {
         // structured rejection here. The cell runtime's write set is a
         // BTreeMap so it can't produce one — this guards hand-rolled
         // clients.
+        if writes.len() > self.policy.max_writes_per_transaction {
+            return Err(self.policy_limit(
+                "policy_write_limit",
+                "writes",
+                writes.len(),
+                self.policy.max_writes_per_transaction,
+            ));
+        }
         let mut write_keys = BTreeSet::new();
         for (key, _) in writes {
             reject_noncanonical_point_id(key)?;
+            if !self.policy.allows_write(&key.0) {
+                return Err(self.policy_denied("policy_write_denied", "write", &key.0));
+            }
             if !write_keys.insert(key) {
                 return Err(WireBrokerError::new(
                     "duplicate_write_key",
@@ -872,12 +1456,7 @@ impl CapsuleBrokerClient for ProcessBroker {
         if deployment != self.deployment {
             return Err(BrokerError::DeploymentMismatch);
         }
-        if snapshot_ts != self.snapshot_ts {
-            return Err(BrokerError::Remote(format!(
-                "snapshot_ts {snapshot_ts} is not broker snapshot {}",
-                self.snapshot_ts
-            )));
-        }
+        let snapshot_ts = self.issue_snapshot(snapshot_ts)?;
         let capsule = self
             .store
             .build_capsule(tenant, deployment, snapshot_ts, prewarm)?;
@@ -897,12 +1476,7 @@ impl CapsuleBrokerClient for ProcessBroker {
         if capsule.deployment != self.deployment {
             return Err(BrokerError::DeploymentMismatch);
         }
-        if capsule.ts != self.snapshot_ts {
-            return Err(BrokerError::Remote(format!(
-                "capsule snapshot_ts {} is not broker snapshot {}",
-                capsule.ts, self.snapshot_ts
-            )));
-        }
+        self.enforce_snapshot_mode(capsule.ts)?;
         let value = self.store.read_point(&key, capsule.ts)?;
         capsule.hydrate_point(key, value);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
@@ -925,18 +1499,21 @@ impl CapsuleBrokerClient for ProcessBroker {
         if capsule.deployment != self.deployment {
             return Err(BrokerError::DeploymentMismatch);
         }
-        if capsule.ts != self.snapshot_ts {
-            return Err(BrokerError::Remote(format!(
-                "capsule snapshot_ts {} is not broker snapshot {}",
-                capsule.ts, self.snapshot_ts
-            )));
-        }
-        // Certificates are evidence about the capsule snapshot: scan at
-        // capsule.ts (== broker snapshot after the check above), never at
-        // whatever the store head has advanced to.
+        self.enforce_snapshot_mode(capsule.ts)?;
+        // Certificates are evidence about the capsule snapshot: always scan
+        // at capsule.ts, never at the store head that may advance later.
         let (certificate, entries) = self.store.scan_prefix(&prefix, limit, capsule.ts)?;
         capsule.hydrate_range(certificate, entries);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
+    }
+    fn mint_document_id(
+        &self,
+        _context: &SealContext,
+        table: &str,
+    ) -> Result<DocumentId, BrokerError> {
+        self.store
+            .mint_document_id(table)
+            .map_err(BrokerError::from)
     }
 }
 
@@ -1000,12 +1577,48 @@ mod tests {
     use aster_capsule::{doc_with_i64, SnapshotCapsule, VersionedDocument};
     use std::sync::Mutex;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_uid_reads_kernel_credentials() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let expected = unsafe { libc::geteuid() };
+        assert_eq!(peer_uid(&stream).expect("SO_PEERCRED"), expected);
+    }
+
     #[test]
     fn parses_seed_documents() {
         let seeds = parse_seeds("items/a:value:20,items/b:value:22").expect("parse");
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].0, DocumentId::new("items/a"));
         assert_eq!(seeds[1].1.get("value"), Some(&Value::Int(22)));
+    }
+
+    #[test]
+    fn session_table_enforces_capacity_and_reclaims_expired_entries() {
+        let table = SessionTable::default();
+        let first = table
+            .mint("cell-a", 1, 1, 60)
+            .expect("first session within capacity");
+        let error = table
+            .mint("cell-b", 1, 1, 60)
+            .expect_err("second live session must exceed capacity");
+        assert_eq!(error.code, "session_capacity_exceeded");
+
+        table
+            .sessions
+            .lock()
+            .expect("session table lock")
+            .get_mut(&first)
+            .expect("first entry")
+            .expires_at = Instant::now();
+        assert!(
+            table.lookup(&first).is_none(),
+            "expired session is rejected"
+        );
+        table
+            .mint("cell-b", 1, 1, 60)
+            .expect("expired slot is reclaimed");
     }
 
     /// Drive the full wire path for InitialCapsule: mint + grant. Session
@@ -1023,6 +1636,7 @@ mod tests {
         match handle_request(
             broker,
             IpcRequest::InitialCapsule {
+                launch_token: None,
                 context: context.clone(),
                 tenant: TenantId::new("tenant-test"),
                 deployment: DeploymentId::new("dep-test"),
@@ -1068,6 +1682,7 @@ mod tests {
         let response = handle_request(
             &broker,
             IpcRequest::InitialCapsule {
+                launch_token: None,
                 context,
                 tenant: TenantId::new("tenant-test"),
                 deployment: DeploymentId::new("dep-test"),
@@ -1090,6 +1705,7 @@ mod tests {
         let response = handle_request(
             &broker,
             IpcRequest::InitialCapsule {
+                launch_token: None,
                 context: SealContext::new("cell-a", 1),
                 tenant: TenantId::new("tenant-other"),
                 deployment: DeploymentId::new("dep-test"),
@@ -1273,9 +1889,12 @@ mod tests {
             store: store.clone(),
             module_source: Arc::new(FakeModuleSource::new(None)),
             seal_key: CapsuleSealKey::derive_for_tests(b"test-seed"),
+            launch_authorizer: None,
+            policy: DeploymentPolicy::allow_all_for_tests(),
+            allow_shutdown: true,
             tenant: TenantId::new("tenant-test"),
             deployment: DeploymentId::new("dep-test"),
-            snapshot_ts,
+            fixed_snapshot_ts: Some(snapshot_ts),
             sessions: SessionTable::default(),
             fence: Arc::new(MemoryFence::new(store.clone())),
             authority_epoch: 1,
@@ -1583,6 +2202,7 @@ mod tests {
         let response = handle_request(
             &broker,
             IpcRequest::InitialCapsule {
+                launch_token: None,
                 context: SealContext::new("cell-a", 9),
                 tenant: TenantId::new("tenant-test"),
                 deployment: DeploymentId::new("dep-test"),
@@ -1770,6 +2390,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concurrent_commits_cannot_double_spend_one_session() {
+        let (broker, store, _fence) = test_broker_parts(Arc::new(FakeModuleSource::new(None)));
+        store.seed(DocumentId::new("docs/1"), doc_with_i64("value", 7));
+        let broker = Arc::new(broker);
+        let grant = initial_grant(&broker, &SealContext::new("cell-a", 1));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let broker = Arc::clone(&broker);
+            let barrier = Arc::clone(&barrier);
+            let capsule = grant.capsule.clone();
+            let session = grant.session;
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                commit_request(
+                    &broker,
+                    Some(session),
+                    capsule,
+                    Vec::new(),
+                    vec![put("docs/2", 1)],
+                )
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("commit worker"))
+            .collect();
+
+        let committed = results
+            .iter()
+            .filter(|result| matches!(result, Ok(WireCommitOutcome::Committed { .. })))
+            .count();
+        let rejected = results
+            .iter()
+            .filter(|result| matches!(result, Err(error) if error.code == "unknown_session"))
+            .count();
+        assert_eq!((committed, rejected), (1, 1), "results: {results:?}");
+    }
+
     /// Abort closes the session without committing; a second abort (or any
     /// later verb) sees unknown_session.
     #[test]
@@ -1881,6 +2543,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deployment_policy_denies_every_unauthorized_authority_surface() {
+        let mut broker = test_broker(Arc::new(FakeModuleSource::new(Some(b"zip".to_vec()))));
+        broker.policy = DeploymentPolicy {
+            version: 9,
+            read_prefixes: vec!["docs/public/".into()],
+            write_prefixes: vec!["docs/public/".into()],
+            module_prefixes: vec!["functions/".into()],
+            insert_tables: vec!["public_docs".into()],
+            max_reads_per_transaction: 8,
+            max_writes_per_transaction: 4,
+            max_scan_limit: 4,
+            max_concurrent_sessions: 8,
+            session_ttl_seconds: 60,
+        };
+        let context = SealContext::new("cell-policy", 1);
+        let grant = initial_grant(&broker, &context);
+
+        let point = handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context: context.clone(),
+                session: Some(grant.session),
+                capsule: grant.capsule.clone(),
+                key: DocumentId::new("docs/private/x"),
+            },
+        )
+        .0;
+        assert!(matches!(
+            &point,
+            IpcResponse::HydratePoint(Err(WireBrokerError { code, .. }))
+                if code == "policy_read_denied"
+        ));
+
+        let scan = handle_request(
+            &broker,
+            IpcRequest::HydratePrefix {
+                context: context.clone(),
+                session: Some(grant.session),
+                capsule: grant.capsule.clone(),
+                prefix: "docs/".into(),
+                limit: 4,
+            },
+        )
+        .0;
+        assert!(matches!(
+            &scan,
+            IpcResponse::HydratePrefix(Err(WireBrokerError { code, .. }))
+                if code == "policy_read_denied"
+        ));
+
+        let denied_insert = handle_request(
+            &broker,
+            IpcRequest::MintDocumentId {
+                context: context.clone(),
+                session: Some(grant.session),
+                table: "private_docs".into(),
+            },
+        )
+        .0;
+        assert!(matches!(
+            &denied_insert,
+            IpcResponse::MintDocumentId(Err(WireBrokerError { code, .. }))
+                if code == "policy_insert_denied"
+        ));
+        let allowed_insert = handle_request(
+            &broker,
+            IpcRequest::MintDocumentId {
+                context: context.clone(),
+                session: Some(grant.session),
+                table: "public_docs".into(),
+            },
+        )
+        .0;
+        let IpcResponse::MintDocumentId(Ok(minted)) = allowed_insert else {
+            panic!("authorized table should mint an id");
+        };
+        assert!(minted.0.starts_with("public_docs/"));
+
+        let module = handle_request(
+            &broker,
+            IpcRequest::LoadModuleBundle {
+                context,
+                session: Some(grant.session),
+                capsule: grant.capsule.clone(),
+                path: "admin/root.js".into(),
+            },
+        )
+        .0;
+        assert!(matches!(
+            &module,
+            IpcResponse::LoadModuleBundle(Err(WireBrokerError { code, .. }))
+                if code == "policy_module_denied"
+        ));
+
+        let write = commit_request(
+            &broker,
+            Some(grant.session),
+            grant.capsule,
+            Vec::new(),
+            vec![put("docs/private/x", 1)],
+        )
+        .expect_err("private write must be rejected before the fence");
+        assert_eq!(write.code, "policy_write_denied");
+    }
+
     fn test_broker(module_source: Arc<dyn ModuleBundleSource + Send + Sync>) -> ProcessBroker {
         let (broker, _store, _fence) = test_broker_parts(module_source);
         broker
@@ -1901,9 +2669,12 @@ mod tests {
             store: store.clone(),
             module_source,
             seal_key: CapsuleSealKey::derive_for_tests(b"test-seed"),
+            launch_authorizer: None,
+            policy: DeploymentPolicy::allow_all_for_tests(),
+            allow_shutdown: true,
             tenant: TenantId::new("tenant-test"),
             deployment: DeploymentId::new("dep-test"),
-            snapshot_ts: 1,
+            fixed_snapshot_ts: Some(1),
             sessions: SessionTable::default(),
             fence: fence.clone(),
             authority_epoch: 1,
@@ -1930,14 +2701,12 @@ mod tests {
     }
 }
 
-/// Postgres-gated commit e2e: the SAME `handle_request` fence admission
-/// path the default suite exercises over `MemoryFence`, against the REAL
-/// `WritePlane` — boot-acquired lease epoch, capsules sealed with it,
-/// point/window conflicts judged by the Postgres fence, and session
-/// end-of-life bounding capsule replay. The read side stays the in-memory
-/// store (the Convex read adapter is not what is under test here); every
-/// conflict is seeded through the write plane itself, so the admission
-/// decision is 100% Postgres.
+/// Postgres-gated transaction e2e over one authoritative history. The SAME
+/// `WritePlane` owns capsule reads, retention, conflict validation, and append;
+/// `handle_request` adds the session-bound seal and declaration gate. This is
+/// the executable T2 composition proof: a committed write is visible to the
+/// next freshly issued capsule, and an interposed write is visible to the
+/// fence's `(s,h]` conflict scan.
 ///
 /// Run with:
 ///     ASTER_DB_URL=postgres://aster:aster@127.0.0.1:5433/aster \
@@ -1974,9 +2743,8 @@ mod pg_commit_e2e {
     /// `handle_request` directly because a binary's internals are not
     /// linkable from `tests/`.
     ///
-    /// One blind write seeds `docs/a` on BOTH sides (write-plane log and
-    /// the in-memory read store), so the broker's pinned snapshot (1) is
-    /// a committed prefix of the real log (S-SNAPSHOT).
+    /// One blind write seeds `docs/a` in the sole authoritative history.
+    /// The broker issues each unpinned session at the current WritePlane tip.
     fn pg_broker(deployment: &str) -> (ProcessBroker, Arc<WritePlane>, u64) {
         let plane = Arc::new(
             WritePlane::connect(WritePlaneConfig {
@@ -2005,17 +2773,25 @@ mod pg_commit_e2e {
         .expect("seed write");
         assert_eq!(seeded, CommitOutcome::Committed { ts: 1 });
 
-        let store = Arc::new(MvccStore::new());
-        store.seed(DocumentId::new("docs/a"), doc_with_i64("value", 1));
+        let tenant = TenantId::new(TENANT);
+        let deployment_id = DeploymentId::new(deployment.to_string());
+        let store = Arc::new(AuthoritativeCapsuleStore::new(
+            plane.clone(),
+            tenant.clone(),
+            deployment_id.clone(),
+        ));
         let broker = ProcessBroker {
             store,
             module_source: Arc::new(NoModuleBundleSource {
                 reason: "no module loading in the commit e2e",
             }),
             seal_key: CapsuleSealKey::derive_for_tests(b"pg-commit-e2e-seed"),
-            tenant: TenantId::new(TENANT),
-            deployment: DeploymentId::new(deployment.to_string()),
-            snapshot_ts: 1,
+            policy: DeploymentPolicy::allow_all_for_tests(),
+            launch_authorizer: None,
+            allow_shutdown: false,
+            tenant,
+            deployment: deployment_id,
+            fixed_snapshot_ts: None,
             sessions: SessionTable::default(),
             fence: plane.clone(),
             authority_epoch: epoch,
@@ -2027,10 +2803,11 @@ mod pg_commit_e2e {
         match handle_request(
             broker,
             IpcRequest::InitialCapsule {
+                launch_token: None,
                 context: SealContext::new("cell-pg", epoch),
                 tenant: TenantId::new(TENANT),
                 deployment: DeploymentId::new(deployment.to_string()),
-                snapshot_ts: 1,
+                snapshot_ts: 0,
                 prewarm: vec![DocumentId::new("docs/a")],
             },
         )
@@ -2128,6 +2905,44 @@ mod pg_commit_e2e {
             .snapshot_ts(TENANT, &deployment)
             .expect("tip after replay");
         assert_eq!(after, 2, "rejected replay must not append");
+
+        // A fresh session is issued at the new authoritative tip and reads
+        // the committed value through the SAME store the fence appended to.
+        let fresh = grant(&broker, &deployment, epoch);
+        assert_eq!(fresh.capsule.capsule().ts, 2);
+        let visible = match handle_request(
+            &broker,
+            IpcRequest::HydratePoint {
+                context: SealContext::new("cell-pg", epoch),
+                session: Some(fresh.session),
+                capsule: fresh.capsule,
+                key: DocumentId::new("docs/out"),
+            },
+        )
+        .0
+        {
+            IpcResponse::HydratePoint(Ok(capsule)) => capsule,
+            other => panic!("fresh authoritative read should succeed, got {other:?}"),
+        };
+        assert_eq!(
+            visible
+                .capsule()
+                .docs
+                .get(&DocumentId::new("docs/out"))
+                .expect("committed key in fresh capsule")
+                .version,
+            Some(2)
+        );
+        assert!(matches!(
+            handle_request(
+                &broker,
+                IpcRequest::Abort {
+                    session: fresh.session,
+                },
+            )
+            .0,
+            IpcResponse::Abort(Ok(()))
+        ));
     }
 
     /// A write-plane commit between issuance and commit conflicts a
@@ -2269,6 +3084,7 @@ mod pg_commit_e2e {
             match handle_request(
                 self.broker,
                 IpcRequest::InitialCapsule {
+                    launch_token: None,
                     context: context.clone(),
                     tenant,
                     deployment,
@@ -2282,10 +3098,13 @@ mod pg_commit_e2e {
                     *self.session.lock().expect("session slot") = Some(grant.session);
                     Ok(grant.capsule)
                 }
-                IpcResponse::InitialCapsule(Err(error)) => {
-                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
-                }
-                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+                IpcResponse::InitialCapsule(Err(error)) => Err(BrokerError::Remote(format!(
+                    "{}: {}",
+                    error.code, error.message
+                ))),
+                other => Err(BrokerError::Remote(format!(
+                    "unexpected response {other:?}"
+                ))),
             }
         }
 
@@ -2307,10 +3126,39 @@ mod pg_commit_e2e {
             .0
             {
                 IpcResponse::HydratePoint(Ok(sealed)) => Ok(sealed),
-                IpcResponse::HydratePoint(Err(error)) => {
-                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
-                }
-                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+                IpcResponse::HydratePoint(Err(error)) => Err(BrokerError::Remote(format!(
+                    "{}: {}",
+                    error.code, error.message
+                ))),
+                other => Err(BrokerError::Remote(format!(
+                    "unexpected response {other:?}"
+                ))),
+            }
+        }
+
+        fn mint_document_id(
+            &self,
+            context: &SealContext,
+            table: &str,
+        ) -> Result<DocumentId, BrokerError> {
+            match handle_request(
+                self.broker,
+                IpcRequest::MintDocumentId {
+                    context: context.clone(),
+                    session: self.session(),
+                    table: table.to_string(),
+                },
+            )
+            .0
+            {
+                IpcResponse::MintDocumentId(Ok(id)) => Ok(id),
+                IpcResponse::MintDocumentId(Err(error)) => Err(BrokerError::Remote(format!(
+                    "{}: {}",
+                    error.code, error.message
+                ))),
+                other => Err(BrokerError::Remote(format!(
+                    "unexpected response {other:?}"
+                ))),
             }
         }
 
@@ -2334,10 +3182,13 @@ mod pg_commit_e2e {
             .0
             {
                 IpcResponse::HydratePrefix(Ok(sealed)) => Ok(sealed),
-                IpcResponse::HydratePrefix(Err(error)) => {
-                    Err(BrokerError::Remote(format!("{}: {}", error.code, error.message)))
-                }
-                other => Err(BrokerError::Remote(format!("unexpected response {other:?}"))),
+                IpcResponse::HydratePrefix(Err(error)) => Err(BrokerError::Remote(format!(
+                    "{}: {}",
+                    error.code, error.message
+                ))),
+                other => Err(BrokerError::Remote(format!(
+                    "unexpected response {other:?}"
+                ))),
             }
         }
     }

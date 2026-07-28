@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use aster_broker::CapsuleBrokerClient;
 use aster_capsule::{DeploymentId, DocumentId, SealContext, TenantId};
-use aster_ipc::{bundle, UdsCapsuleBrokerClient};
-use aster_v8cell::V8SandboxCell;
+use aster_ipc::{bundle, UdsCapsuleBrokerClient, WireCommitOutcome};
+use aster_v8cell::{V8ExecutionResult, V8SandboxCell};
 
 fn main() {
     if let Err(error) = run() {
@@ -15,43 +16,89 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = CellConfig::from_env()?;
-    let broker = UdsCapsuleBrokerClient::new(&config.socket_path);
-
-    let cell = V8SandboxCell::new(
+    let broker = match config.launch_token.as_deref() {
+        Some(token) => UdsCapsuleBrokerClient::with_launch_token(&config.socket_path, token),
+        None => UdsCapsuleBrokerClient::new(&config.socket_path),
+    };
+    let cell = V8SandboxCell::with_resource_limits(
         config.tenant.clone(),
         config.deployment.clone(),
         config.max_traps,
+        config.max_heap_bytes,
+        config.execution_timeout,
     );
-    let result = match &config.source {
-        SourceLocation::Path(p) => {
-            let source = fs::read_to_string(p)?;
-            cell.execute_async_main_with_broker(
-                &broker,
-                config.cell_id,
-                config.lease_epoch,
-                config.tenant,
-                config.deployment,
-                config.snapshot_ts,
-                config.prewarm,
-                &source,
-            )?
+    let executable = prepare_source(&config, &broker)?;
+    let max_attempts = config.max_retries.saturating_add(1);
+
+    for attempt in 1..=max_attempts {
+        let mut result = match execute_prepared(&cell, &broker, &config, &executable) {
+            Ok(result) => result,
+            Err(error) => {
+                if broker.session().is_some() {
+                    if let Err(abort_error) = broker.abort() {
+                        eprintln!(
+                            "aster_v8cell: failed to abort session after execution error: \
+                             {abort_error}"
+                        );
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+
+        if result.write_set.is_empty() {
+            broker.abort()?;
+            print_execution_envelope(&result, None, attempt)?;
+            return Ok(());
         }
-        SourceLocation::Inline(s) => cell.execute_async_main_with_broker(
-            &broker,
-            config.cell_id,
-            config.lease_epoch,
-            config.tenant,
-            config.deployment,
-            config.snapshot_ts,
-            config.prewarm,
-            s,
-        )?,
+
+        let sealed = result
+            .sealed_capsule
+            .take()
+            .ok_or("broker-backed execution returned no sealed capsule")?;
+        let outcome = broker.commit(
+            sealed,
+            result.consumed_reads.clone(),
+            result.write_set.clone(),
+        )?;
+        let retryable = matches!(
+            outcome,
+            WireCommitOutcome::Conflict { .. } | WireCommitOutcome::RetentionViolated { .. }
+        ) && config.snapshot_ts == 0
+            && attempt < max_attempts;
+        if retryable {
+            continue;
+        }
+
+        print_execution_envelope(&result, Some(&outcome), attempt)?;
+        return Ok(());
+    }
+
+    unreachable!("attempt loop always returns on its final iteration")
+}
+
+enum PreparedSource {
+    Raw(String),
+    Module {
+        source: String,
+        function_name: String,
+        args_json: String,
+    },
+}
+
+fn prepare_source(
+    config: &CellConfig,
+    broker: &UdsCapsuleBrokerClient,
+) -> Result<PreparedSource, Box<dyn std::error::Error>> {
+    match &config.source {
+        SourceLocation::Path(path) => Ok(PreparedSource::Raw(fs::read_to_string(path)?)),
+        SourceLocation::Inline(source) => Ok(PreparedSource::Raw(source.clone())),
         SourceLocation::Bundle {
             module_path,
             invoke,
         } => {
             let source = load_bundle_source(
-                &broker,
+                broker,
                 &config.cell_id,
                 config.lease_epoch,
                 &config.tenant,
@@ -61,80 +108,93 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 module_path,
             )?;
             match invoke {
-                None => cell.execute_async_main_with_broker(
-                    &broker,
-                    config.cell_id,
-                    config.lease_epoch,
-                    config.tenant,
-                    config.deployment,
-                    config.snapshot_ts,
-                    config.prewarm,
-                    &source,
-                )?,
-                Some(BundleInvocation {
-                    function_name,
-                    args_json,
-                }) => cell.execute_module_query_with_broker(
-                    &broker,
-                    config.cell_id,
-                    config.lease_epoch,
-                    config.tenant,
-                    config.deployment,
-                    config.snapshot_ts,
-                    config.prewarm,
-                    &source,
-                    function_name,
-                    args_json,
-                )?,
+                None => Ok(PreparedSource::Raw(source)),
+                Some(invoke) => Ok(PreparedSource::Module {
+                    source,
+                    function_name: invoke.function_name.clone(),
+                    args_json: invoke.args_json.clone(),
+                }),
             }
         }
-    };
+    }
+}
 
-    // Serialise the Value via serde_json so strings, bools and null
-    // round-trip — the original i64-only formatter silently dropped
-    // anything that wasn't an integer (Text → 0, masking real
-    // results the JS function actually returned).
-    let output_json = match &result.output {
-        aster_capsule::Value::Int(n) => serde_json::Value::from(*n),
-        aster_capsule::Value::Text(s) => serde_json::Value::from(s.as_str()),
-        aster_capsule::Value::Bool(b) => serde_json::Value::from(*b),
+fn execute_prepared(
+    cell: &V8SandboxCell,
+    broker: &UdsCapsuleBrokerClient,
+    config: &CellConfig,
+    executable: &PreparedSource,
+) -> Result<V8ExecutionResult, aster_v8cell::V8CellError> {
+    match executable {
+        PreparedSource::Raw(source) => cell.execute_async_main_with_broker(
+            broker,
+            config.cell_id.clone(),
+            config.lease_epoch,
+            config.tenant.clone(),
+            config.deployment.clone(),
+            config.snapshot_ts,
+            config.prewarm.clone(),
+            source,
+        ),
+        PreparedSource::Module {
+            source,
+            function_name,
+            args_json,
+        } => cell.execute_module_function_with_broker(
+            broker,
+            config.cell_id.clone(),
+            config.lease_epoch,
+            config.tenant.clone(),
+            config.deployment.clone(),
+            config.snapshot_ts,
+            config.prewarm.clone(),
+            source,
+            function_name,
+            args_json,
+        ),
+    }
+}
+
+fn print_execution_envelope(
+    result: &V8ExecutionResult,
+    commit: Option<&WireCommitOutcome>,
+    attempts: usize,
+) -> Result<(), serde_json::Error> {
+    let output = match &result.output {
+        aster_capsule::Value::Int(value) => serde_json::Value::from(*value),
+        aster_capsule::Value::Text(value) => serde_json::Value::from(value.as_str()),
+        aster_capsule::Value::Bool(value) => serde_json::Value::from(*value),
         aster_capsule::Value::Null => serde_json::Value::Null,
     };
+    let transaction_status = match commit {
+        None | Some(WireCommitOutcome::EmptyWriteSet) => "read_only",
+        Some(WireCommitOutcome::Committed { .. }) => "committed",
+        Some(WireCommitOutcome::Conflict { .. }) => "conflict",
+        Some(WireCommitOutcome::StaleEpoch { .. }) => "stale_epoch",
+        Some(WireCommitOutcome::SnapshotBeyondHorizon { .. }) => "invalid_snapshot",
+        Some(WireCommitOutcome::RetentionViolated { .. }) => "retention_retry_exhausted",
+    };
     let envelope = serde_json::json!({
-        "output": output_json,
+        "output": output,
         "traps": result.traps,
         "capsule_hash": result.capsule_hash,
-        // Review finding R4 (S9): the runtime's consumption ledger —
-        // deduped, BTreeSet-ordered — rides the envelope so a harness can
-        // drive the Commit verb's declared_reads from what the JS
-        // actually observed (Variante B), not from prewarm guesses.
-        // Additive field; existing consumers keep parsing.
         "consumed_reads": result.consumed_reads,
-        // S9b: the write set born in the cell — `[key, document|null]`
-        // pairs in deterministic BTreeMap order, serialized with exactly
-        // the serde shape of the Commit verb's `writes` field
-        // (`Vec<(DocumentId, Option<Document>)>`, documents in the
-        // capsule `Value` encoding), so a harness can deserialize and
-        // pass it through unchanged. Additive field.
         "write_set": result.write_set,
+        "commit": commit,
+        "transaction_status": transaction_status,
+        "attempts": attempts,
     });
-    println!("{}", serde_json::to_string(&envelope).unwrap());
+    println!("{}", serde_json::to_string(&envelope)?);
     Ok(())
 }
 
 /// Fetch a Convex bundle ZIP for `module_path` from the broker, unpack
 /// the matching entry, and hand back the JS source string.
 ///
-/// The broker requires a sealed capsule for any `LoadModuleBundle` —
-/// that's the security gate added by Iann29/aster#19. So we bootstrap
-/// our own capsule through the same `InitialCapsule` IPC the regular
-/// execute path uses internally; the broker's `initial_capsule` is
-/// idempotent, so the inner cell call later builds another capsule
-/// without conflict.
-///
-/// Empty / `Some(None)` from the broker — module path resolved cleanly
-/// but the bundle row isn't present — surfaces as a typed startup
-/// error here. The cell never attempts to V8-execute "no source".
+/// The broker requires a sealed capsule for `LoadModuleBundle`, so source
+/// acquisition uses a short-lived session. That session is always aborted
+/// after the load attempt; execution starts a separate transaction session
+/// at the latest authoritative snapshot.
 #[allow(clippy::too_many_arguments)]
 fn load_bundle_source(
     broker: &UdsCapsuleBrokerClient,
@@ -154,11 +214,12 @@ fn load_bundle_source(
         snapshot_ts,
         prewarm.to_vec(),
     )?;
-    let bytes = broker
-        .load_module_bundle(&context, capsule, module_path)?
+    let loaded = broker.load_module_bundle(&context, capsule, module_path);
+    let aborted = broker.abort();
+    let bytes = loaded?
         .ok_or_else(|| format!("module {module_path:?} not present in broker's source packages"))?;
-    let source = bundle::extract_module_source(&bytes, module_path)?;
-    Ok(source)
+    aborted?;
+    Ok(bundle::extract_module_source(&bytes, module_path)?)
 }
 
 /// What to do once the bundle source is loaded.
@@ -167,9 +228,8 @@ fn load_bundle_source(
 /// matching the legacy `ASTER_JS` / `ASTER_JS_INLINE` shape. Used by
 /// PR #20-vintage smoke harnesses.
 ///
-/// `Some(_)` → invoke a named export with caller-supplied args via the
-/// new `execute_module_query_with_broker` entry point. The export
-/// must be a Convex `query()`; `mutation` / `action` are rejected.
+/// `Some(_)` → inspect the named Convex export and invoke it as a query or
+/// mutation according to its bundle marker. Actions remain rejected.
 #[derive(Debug)]
 struct BundleInvocation {
     function_name: String,
@@ -189,9 +249,8 @@ struct BundleInvocation {
 ///   matching entry. The path matches the way the user named the
 ///   module (e.g. `messages` or `convex/messages.js`); the bundle
 ///   adapter on the broker side has already hash-verified the bytes.
-///   When paired with `ASTER_FUNCTION_NAME` + `ASTER_ARGS_JSON`, the
-///   cell switches to the module-query path: compile bundle as ES
-///   module, look up the named export, call `invokeQuery(args)`.
+///   cell compiles the bundle as ESM, inspects the named export, and calls
+///   `invokeQuery(args)` or `invokeMutation(args)` accordingly.
 ///
 /// Exactly one of {Path, Inline, Bundle} must be set. Setting more
 /// than one rejects so callers don't silently pick the wrong source.
@@ -212,28 +271,69 @@ struct CellConfig {
     deployment: DeploymentId,
     snapshot_ts: u64,
     cell_id: String,
+    launch_token: Option<String>,
     lease_epoch: u64,
     prewarm: Vec<DocumentId>,
     source: SourceLocation,
     max_traps: usize,
+    max_heap_bytes: usize,
+    execution_timeout: Duration,
+    max_retries: usize,
 }
 
 impl CellConfig {
     fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let source = SourceLocation::from_env_map(EnvMap::from_process())?;
+        let snapshot_ts = match std::env::var("ASTER_SNAPSHOT_TS") {
+            Ok(value) if !value.is_empty() => value.parse()?,
+            Ok(_) | Err(std::env::VarError::NotPresent) => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let max_traps = match std::env::var("ASTER_MAX_TRAPS") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => 64,
+            Err(error) => return Err(error.into()),
+        };
+        let max_heap_bytes = match std::env::var("ASTER_MAX_HEAP_BYTES") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => 128 * 1024 * 1024,
+            Err(error) => return Err(error.into()),
+        };
+        if !(16 * 1024 * 1024..=1024 * 1024 * 1024).contains(&max_heap_bytes) {
+            return Err("ASTER_MAX_HEAP_BYTES must be between 16MiB and 1GiB".into());
+        }
+        let execution_timeout_ms = match std::env::var("ASTER_EXECUTION_TIMEOUT_MS") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => 30_000_u64,
+            Err(error) => return Err(error.into()),
+        };
+        if !(10..=300_000).contains(&execution_timeout_ms) {
+            return Err("ASTER_EXECUTION_TIMEOUT_MS must be in 10..=300000".into());
+        }
+        let max_retries = match std::env::var("ASTER_MAX_RETRIES") {
+            Ok(value) => value.parse()?,
+            Err(std::env::VarError::NotPresent) => 3,
+            Err(error) => return Err(error.into()),
+        };
+        let launch_token = match std::env::var("ASTER_LAUNCH_TOKEN") {
+            Ok(value) if !value.is_empty() => Some(value),
+            Ok(_) | Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             socket_path: PathBuf::from(env_string("ASTER_BROKER_SOCK")?),
             tenant: TenantId::new(env_string("ASTER_TENANT")?),
             deployment: DeploymentId::new(env_string("ASTER_DEPLOYMENT")?),
-            snapshot_ts: env_string("ASTER_SNAPSHOT_TS")?.parse()?,
+            snapshot_ts,
             cell_id: env_string("ASTER_CELL_ID")?,
+            launch_token,
             lease_epoch: env_string("ASTER_LEASE_EPOCH")?.parse()?,
             prewarm: parse_prewarm(&std::env::var("ASTER_PREWARM").unwrap_or_default()),
             source,
-            max_traps: std::env::var("ASTER_MAX_TRAPS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(64),
+            max_traps,
+            max_heap_bytes,
+            execution_timeout: Duration::from_millis(execution_timeout_ms),
+            max_retries,
         })
     }
 }

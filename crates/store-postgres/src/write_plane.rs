@@ -103,9 +103,7 @@ pub struct WritePlane {
 impl WritePlane {
     pub fn connect(config: WritePlaneConfig) -> Result<Self, StoreError> {
         if config.url.is_empty() {
-            return Err(StoreError::Backend(
-                "WritePlaneConfig.url is empty".into(),
-            ));
+            return Err(StoreError::Backend("WritePlaneConfig.url is empty".into()));
         }
         let pg_config = parse_pg_config(&config.url)?;
         let runtime = Builder::new_multi_thread()
@@ -129,9 +127,7 @@ impl WritePlane {
             runtime: Arc::new(runtime),
             pool,
             statement_timeout_ms: config.statement_timeout.as_millis() as u64,
-            idle_in_transaction_ms: config
-                .idle_in_transaction_session_timeout
-                .as_millis() as u64,
+            idle_in_transaction_ms: config.idle_in_transaction_session_timeout.as_millis() as u64,
         })
     }
 
@@ -265,11 +261,7 @@ impl WritePlane {
         })
     }
 
-    pub fn current_epoch(
-        &self,
-        tenant: &str,
-        deployment: &str,
-    ) -> Result<Option<u64>, StoreError> {
+    pub fn current_epoch(&self, tenant: &str, deployment: &str) -> Result<Option<u64>, StoreError> {
         self.block_on(async {
             let client = self.client().await?;
             let row = client
@@ -485,9 +477,7 @@ impl WritePlane {
                 tx.rollback()
                     .await
                     .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
-                return Ok(CommitOutcome::SnapshotBeyondHorizon {
-                    horizon: h as u64,
-                });
+                return Ok(CommitOutcome::SnapshotBeyondHorizon { horizon: h as u64 });
             }
 
             // V3 (coverage form) + retention pin: lock the watermark row so
@@ -513,11 +503,7 @@ impl WritePlane {
             // V4: no committed write in (s, h] may intersect a declared
             // observation — point keys first, then range windows.
             if !input.read_points.is_empty() {
-                let keys: Vec<&str> = input
-                    .read_points
-                    .iter()
-                    .map(|key| key.0.as_str())
-                    .collect();
+                let keys: Vec<&str> = input.read_points.iter().map(|key| key.0.as_str()).collect();
                 let conflict = tx
                     .query_opt(
                         "SELECT key FROM aster.log
@@ -548,7 +534,11 @@ impl WritePlane {
                     .map_err(|err| StoreError::Backend(format!("fence window scan: {err}")))?;
                 for row in rows {
                     let key = DocumentId::new(row.get::<_, String>(0));
-                    if input.read_windows.iter().any(|window| window.contains(&key)) {
+                    if input
+                        .read_windows
+                        .iter()
+                        .any(|window| window.contains(&key))
+                    {
                         tx.rollback()
                             .await
                             .map_err(|err| StoreError::Backend(format!("fence rollback: {err}")))?;
@@ -564,9 +554,8 @@ impl WritePlane {
                 let encoded = document
                     .as_ref()
                     .map(|document| {
-                        serde_json::to_string(document).map_err(|err| {
-                            StoreError::Backend(format!("encode document: {err}"))
-                        })
+                        serde_json::to_string(document)
+                            .map_err(|err| StoreError::Backend(format!("encode document: {err}")))
                     })
                     .transpose()?;
                 tx.execute(
@@ -740,7 +729,10 @@ mod tests {
             pg_config.get_keepalives_interval(),
             Some(TCP_KEEPALIVE_INTERVAL)
         );
-        assert_eq!(pg_config.get_keepalives_retries(), Some(TCP_KEEPALIVE_RETRIES));
+        assert_eq!(
+            pg_config.get_keepalives_retries(),
+            Some(TCP_KEEPALIVE_RETRIES)
+        );
     }
 }
 
@@ -757,8 +749,7 @@ mod pg_it {
     /// test pins the config → session wiring it relies on.
     #[test]
     fn client_checkout_stamps_statement_and_idle_timeouts() {
-        let url = std::env::var("ASTER_DB_URL")
-            .expect("set ASTER_DB_URL to run postgres-it tests");
+        let url = std::env::var("ASTER_DB_URL").expect("set ASTER_DB_URL to run postgres-it tests");
         // Millisecond values chosen to not reduce to whole seconds so
         // SHOW echoes them back in ms and the assertion stays exact.
         let plane = WritePlane::connect(WritePlaneConfig {

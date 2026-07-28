@@ -61,7 +61,13 @@ fn put(key: &str, value: i64) -> (DocumentId, Option<aster_capsule::Document>) {
     (DocumentId::new(key), Some(doc_with_i64("value", value)))
 }
 
-fn commit_blind(plane: &WritePlane, epoch: u64, snapshot: u64, key: &str, value: i64) -> CommitOutcome {
+fn commit_blind(
+    plane: &WritePlane,
+    epoch: u64,
+    snapshot: u64,
+    key: &str,
+    value: i64,
+) -> CommitOutcome {
     plane
         .commit(&FenceInput {
             tenant: TENANT,
@@ -80,19 +86,33 @@ fn commit_blind(plane: &WritePlane, epoch: u64, snapshot: u64, key: &str, value:
 fn lease_epochs_strictly_increase_and_never_reuse() {
     let plane = fresh_plane();
     // Referee finding F1: failback A→B→A must never reuse an epoch.
-    let a1 = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-a").expect("acquire a");
-    let b = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-b").expect("acquire b");
-    let a2 = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-a").expect("acquire a again");
+    let a1 = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire a");
+    let b = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-b")
+        .expect("acquire b");
+    let a2 = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire a again");
     assert_eq!((a1, b, a2), (1, 2, 3));
 }
 
 #[test]
 fn write_skew_ce39_is_impossible_through_the_fence() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     // Seed x = 0, y = 0 as two commits; snapshot after both.
-    assert!(matches!(commit_blind(&plane, epoch, 0, "docs/x", 0), CommitOutcome::Committed { .. }));
-    assert!(matches!(commit_blind(&plane, epoch, 1, "docs/y", 0), CommitOutcome::Committed { .. }));
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/x", 0),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        commit_blind(&plane, epoch, 1, "docs/y", 0),
+        CommitOutcome::Committed { .. }
+    ));
     let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
 
     // Counterexample 3.9: T1 reads y writes x, T2 reads x writes y, same
@@ -134,9 +154,17 @@ fn write_skew_ce39_is_impossible_through_the_fence() {
 #[test]
 fn concurrent_write_skew_pair_commits_exactly_once() {
     let plane = Arc::new(fresh_plane());
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
-    assert!(matches!(commit_blind(&plane, epoch, 0, "docs/x", 0), CommitOutcome::Committed { .. }));
-    assert!(matches!(commit_blind(&plane, epoch, 1, "docs/y", 0), CommitOutcome::Committed { .. }));
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/x", 0),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        commit_blind(&plane, epoch, 1, "docs/y", 0),
+        CommitOutcome::Committed { .. }
+    ));
     let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
 
     // Both fences race on real connections; the lease row lock must
@@ -182,16 +210,25 @@ fn concurrent_write_skew_pair_commits_exactly_once() {
 #[test]
 fn stale_epoch_cannot_append_after_failover() {
     let plane = fresh_plane();
-    let epoch_a = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-a").expect("acquire a");
+    let epoch_a = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire a");
     assert!(matches!(
         commit_blind(&plane, epoch_a, 0, "docs/a", 1),
         CommitOutcome::Committed { .. }
     ));
 
-    let epoch_b = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-b").expect("acquire b");
+    let epoch_b = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-b")
+        .expect("acquire b");
     // Old-epoch committer AND old-epoch capsule context are both fenced.
     let stale = commit_blind(&plane, epoch_a, 1, "docs/a", 2);
-    assert_eq!(stale, CommitOutcome::StaleEpoch { lease_epoch: epoch_b });
+    assert_eq!(
+        stale,
+        CommitOutcome::StaleEpoch {
+            lease_epoch: epoch_b
+        }
+    );
     let mixed = plane
         .commit(&FenceInput {
             tenant: TENANT,
@@ -204,7 +241,12 @@ fn stale_epoch_cannot_append_after_failover() {
             writes: &[put("docs/a", 2)],
         })
         .expect("mixed epoch commit");
-    assert_eq!(mixed, CommitOutcome::StaleEpoch { lease_epoch: epoch_b });
+    assert_eq!(
+        mixed,
+        CommitOutcome::StaleEpoch {
+            lease_epoch: epoch_b
+        }
+    );
 
     assert!(matches!(
         commit_blind(&plane, epoch_b, 1, "docs/a", 3),
@@ -213,7 +255,12 @@ fn stale_epoch_cannot_append_after_failover() {
     // Lemma 3.11 (epoch block order): no old-epoch row may carry a
     // timestamp above any new-epoch row.
     let value = plane
-        .read_point(TENANT, DEPLOYMENT, &DocumentId::new("docs/a"), u64::MAX >> 1)
+        .read_point(
+            TENANT,
+            DEPLOYMENT,
+            &DocumentId::new("docs/a"),
+            u64::MAX >> 1,
+        )
         .expect("read");
     assert_eq!(
         value.document.and_then(|doc| doc.get("value").cloned()),
@@ -224,7 +271,9 @@ fn stale_epoch_cannot_append_after_failover() {
 #[test]
 fn gc_blocks_on_inflight_fence_and_enforces_coverage() {
     let plane = Arc::new(fresh_plane());
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     for (i, value) in [1, 2, 3].iter().enumerate() {
         assert!(matches!(
             commit_blind(&plane, epoch, i as u64, "docs/k", *value),
@@ -276,7 +325,10 @@ fn gc_blocks_on_inflight_fence_and_enforces_coverage() {
 
     // Coverage rule g <= s: a snapshot below the watermark must be refused.
     let refused = commit_blind(&plane, epoch, 1, "docs/other", 9);
-    assert_eq!(refused, CommitOutcome::RetentionViolated { low_watermark: 2 });
+    assert_eq!(
+        refused,
+        CommitOutcome::RetentionViolated { low_watermark: 2 }
+    );
     // A covered snapshot still commits.
     let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
     assert!(matches!(
@@ -295,7 +347,9 @@ fn gc_blocks_on_inflight_fence_and_enforces_coverage() {
 #[test]
 fn fence_blocks_on_retention_lock_holder_until_release() {
     let plane = Arc::new(fresh_plane());
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     assert!(matches!(
         commit_blind(&plane, epoch, 0, "docs/seed", 1),
         CommitOutcome::Committed { .. }
@@ -372,7 +426,9 @@ fn fence_blocks_on_retention_lock_holder_until_release() {
 #[test]
 fn idle_wedged_lock_holder_is_killed_so_failover_resumes() {
     let plane = fresh_plane();
-    let epoch_a = plane.acquire_lease(TENANT, DEPLOYMENT, "committer-a").expect("acquire a");
+    let epoch_a = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer-a")
+        .expect("acquire a");
     assert!(matches!(
         commit_blind(&plane, epoch_a, 0, "docs/w", 1),
         CommitOutcome::Committed { .. }
@@ -427,7 +483,9 @@ fn idle_wedged_lock_holder_is_killed_so_failover_resumes() {
 #[test]
 fn replay_commits_as_a_second_transaction() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     // Attack 13: a replayed blind-write request is revalidated and becomes
     // another legal serial transaction — no nonce, no at-most-once claim.
     let first = commit_blind(&plane, epoch, 0, "docs/r", 1);
@@ -443,7 +501,9 @@ fn replay_commits_as_a_second_transaction() {
 #[test]
 fn phantom_insert_conflicts_with_exhausted_window_but_not_past_boundary() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     for (i, key) in ["docs/a", "docs/b", "docs/c"].iter().enumerate() {
         assert!(matches!(
             commit_blind(&plane, epoch, i as u64, key, 1),
@@ -525,8 +585,13 @@ fn phantom_insert_conflicts_with_exhausted_window_but_not_past_boundary() {
 #[test]
 fn absence_and_tombstone_reads_conflict_on_later_writes() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
-    assert!(matches!(commit_blind(&plane, epoch, 0, "docs/seed", 1), CommitOutcome::Committed { .. }));
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/seed", 1),
+        CommitOutcome::Committed { .. }
+    ));
     let s = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
 
     // Another transaction inserts the key this reader observed as absent.
@@ -563,7 +628,9 @@ fn absence_and_tombstone_reads_conflict_on_later_writes() {
 #[test]
 fn tombstone_write_in_window_conflicts_with_point_read() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
     assert!(matches!(
         commit_blind(&plane, epoch, 0, "docs/t", 1),
         CommitOutcome::Committed { .. }
@@ -609,8 +676,13 @@ fn tombstone_write_in_window_conflicts_with_point_read() {
 #[test]
 fn read_point_and_live_prefix_scan_follow_mvcc_semantics() {
     let plane = fresh_plane();
-    let epoch = plane.acquire_lease(TENANT, DEPLOYMENT, "committer").expect("acquire");
-    assert!(matches!(commit_blind(&plane, epoch, 0, "docs/a", 1), CommitOutcome::Committed { .. }));
+    let epoch = plane
+        .acquire_lease(TENANT, DEPLOYMENT, "committer")
+        .expect("acquire");
+    assert!(matches!(
+        commit_blind(&plane, epoch, 0, "docs/a", 1),
+        CommitOutcome::Committed { .. }
+    ));
     let s_before_delete = plane.snapshot_ts(TENANT, DEPLOYMENT).expect("tip");
     // Delete docs/a (tombstone), then add docs/b and docs/c.
     let outcome = plane
@@ -626,12 +698,23 @@ fn read_point_and_live_prefix_scan_follow_mvcc_semantics() {
         })
         .expect("delete");
     assert!(matches!(outcome, CommitOutcome::Committed { .. }));
-    assert!(matches!(commit_blind(&plane, epoch, 2, "docs/b", 2), CommitOutcome::Committed { .. }));
-    assert!(matches!(commit_blind(&plane, epoch, 3, "docs/c", 3), CommitOutcome::Committed { .. }));
+    assert!(matches!(
+        commit_blind(&plane, epoch, 2, "docs/b", 2),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        commit_blind(&plane, epoch, 3, "docs/c", 3),
+        CommitOutcome::Committed { .. }
+    ));
 
     // Point read at the old snapshot still sees the pre-delete document.
     let old = plane
-        .read_point(TENANT, DEPLOYMENT, &DocumentId::new("docs/a"), s_before_delete)
+        .read_point(
+            TENANT,
+            DEPLOYMENT,
+            &DocumentId::new("docs/a"),
+            s_before_delete,
+        )
         .expect("old read");
     assert!(old.document.is_some());
     // At the tip it is an explicit tombstone: versioned absence.
@@ -882,7 +965,10 @@ fn reads_below_the_retention_floor_are_stale() {
         "got {point:?}"
     );
     let scan = plane.read_prefix_live(TENANT, DEPLOYMENT, "docs/", 10, t1);
-    assert!(matches!(scan, Err(StoreError::Stale { .. })), "got {scan:?}");
+    assert!(
+        matches!(scan, Err(StoreError::Stale { .. })),
+        "got {scan:?}"
+    );
 }
 
 /// Re-referee F7: one total key order end-to-end. Under the postgres image

@@ -173,7 +173,10 @@ impl std::fmt::Display for DecodeError {
             Self::InvalidUtf8 => write!(f, "canonical string is not valid UTF-8"),
             Self::InvalidTag(tag) => write!(f, "invalid canonical tag byte 0x{tag:02x}"),
             Self::NonCanonicalOrder => {
-                write!(f, "map keys are duplicated or not in strict canonical order")
+                write!(
+                    f,
+                    "map keys are duplicated or not in strict canonical order"
+                )
             }
             Self::CountTooLarge => write!(f, "declared count exceeds remaining input"),
             Self::LengthTooLarge => write!(f, "declared length exceeds remaining input"),
@@ -388,15 +391,9 @@ mod tests {
     use crate::doc_with_i64;
 
     fn fixture_capsule() -> SnapshotCapsule {
-        let mut capsule = SnapshotCapsule::empty(
-            TenantId::new("tenant-a"),
-            DeploymentId::new("dep-a"),
-            42,
-        );
-        capsule.hydrate_point(
-            DocumentId::new("docs/absent"),
-            VersionedDocument::missing(),
-        );
+        let mut capsule =
+            SnapshotCapsule::empty(TenantId::new("tenant-a"), DeploymentId::new("dep-a"), 42);
+        capsule.hydrate_point(DocumentId::new("docs/absent"), VersionedDocument::missing());
         capsule.hydrate_point(
             DocumentId::new("docs/tombstone"),
             VersionedDocument {

@@ -25,14 +25,25 @@ use aster_v8cell::{V8CellError, V8SandboxCell};
 
 const BUNDLE: &str = include_str!("fixtures/messages.bundled.js");
 
-/// V8 isolates on parallel test-harness threads segfault intermittently
-/// (SIGSEGV, roughly 1 in 3 full-suite runs). Production runs a single
-/// isolate per cell process, so serializing is a harness-only concern.
-fn v8_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static V8_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    V8_TEST_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Production uses one isolate per cell process. rusty_v8 teardown is not
+/// reliable across several fixture-heavy isolates in one Rust test process,
+/// so each contract test mirrors production and executes in a fresh child.
+fn run_v8_test_in_subprocess(name: &str) -> bool {
+    if std::env::var("ASTER_V8_TEST_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .env("ASTER_V8_TEST_CHILD", name)
+        .args(["--exact", name, "--nocapture"])
+        .output()
+        .expect("spawn isolated V8 test");
+    assert!(
+        output.status.success(),
+        "isolated V8 test {name} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 /// Build a document the way the Postgres adapter does in production —
@@ -48,7 +59,9 @@ fn doc_with_raw_json(raw_json: &str) -> Document {
 
 #[test]
 fn module_get_by_id_through_fake_broker_returns_doc() {
-    let _v8 = v8_test_guard();
+    if run_v8_test_in_subprocess("module_get_by_id_through_fake_broker_returns_doc") {
+        return;
+    }
     let tenant = TenantId::new("tenant-bundle-e2e");
     let deployment = DeploymentId::new("dep-bundle-e2e");
 
@@ -78,7 +91,7 @@ fn module_get_by_id_through_fake_broker_returns_doc() {
     let args_json = format!(r#"[{{"id":"{id_str}"}}]"#);
 
     let result = cell
-        .execute_module_query_with_broker(
+        .execute_module_function_with_broker(
             &broker,
             "cell-bundle-e2e",
             1,
@@ -134,7 +147,9 @@ fn module_get_by_id_through_fake_broker_returns_doc() {
 
 #[test]
 fn module_rejects_seed_ian_as_mutation() {
-    let _v8 = v8_test_guard();
+    if run_v8_test_in_subprocess("module_rejects_seed_ian_as_mutation") {
+        return;
+    }
     // Same bundle, but ask for the mutation THROUGH THE QUERY ENTRY
     // POINT. Since S9b mutations run via their own entry point
     // (`execute_module_mutation_with_broker`, write-set semantics); the
@@ -219,12 +234,17 @@ export const bumpOrSeed = {
 /// sealed_capsule): the whole transaction bundle the Commit verb takes.
 #[test]
 fn module_mutation_handwritten_births_write_set() {
-    let _v8 = v8_test_guard();
+    if run_v8_test_in_subprocess("module_mutation_handwritten_births_write_set") {
+        return;
+    }
     let tenant = TenantId::new("tenant-mut-ws");
     let deployment = DeploymentId::new("dep-mut-ws");
     let store = MvccStore::new();
     let key = DocumentId::new("docs/seed");
-    store.seed(key.clone(), doc_with_raw_json(r#"{"_id":"docs/seed","n":1}"#));
+    store.seed(
+        key.clone(),
+        doc_with_raw_json(r#"{"_id":"docs/seed","n":1}"#),
+    );
     let ts = store.snapshot_ts();
     let broker = LocalCapsuleBroker::new(
         &store,
@@ -233,7 +253,7 @@ fn module_mutation_handwritten_births_write_set() {
     let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
 
     let result = cell
-        .execute_module_mutation_with_broker(
+        .execute_module_function_with_broker(
             &broker,
             "cell-mut-ws",
             1,
@@ -254,7 +274,10 @@ fn module_mutation_handwritten_births_write_set() {
         ),
         other => panic!("expected Text output from invokeMutation, got {other:?}"),
     }
-    assert_eq!(result.traps, 1, "one hydration for the get; the patch is local");
+    assert_eq!(
+        result.traps, 1,
+        "one hydration for the get; the patch is local"
+    );
     assert_eq!(
         result.consumed_reads,
         vec![key.clone()],
@@ -281,7 +304,9 @@ fn module_mutation_handwritten_births_write_set() {
 /// cannot ride the mutation entry point.
 #[test]
 fn module_mutation_path_rejects_query_export() {
-    let _v8 = v8_test_guard();
+    if run_v8_test_in_subprocess("module_mutation_path_rejects_query_export") {
+        return;
+    }
     let tenant = TenantId::new("tenant-mut-gate");
     let deployment = DeploymentId::new("dep-mut-gate");
     let store = MvccStore::new();
@@ -317,14 +342,13 @@ fn module_mutation_path_rejects_query_export() {
     }
 }
 
-/// The REAL bundle's `seedIan` mutation (db.insert with no `_id`) runs the
-/// genuine `mutationGeneric`/`invokeMutation` machinery against the cell
-/// and lands on the documented id-minting limit as a typed rejection —
-/// proving the real-bundle mutation path works up to exactly the missing
-/// feature, and that nothing is silently invented.
+/// A real bundle insert carries no `_id`: the broker mints one, the cell
+/// returns it to JS, and the pending write carries Convex system fields.
 #[test]
-fn module_real_bundle_seed_ian_hits_id_minting_limit() {
-    let _v8 = v8_test_guard();
+fn module_real_bundle_seed_ian_mints_id_and_builds_write_set() {
+    if run_v8_test_in_subprocess("module_real_bundle_seed_ian_mints_id_and_builds_write_set") {
+        return;
+    }
     let tenant = TenantId::new("tenant-mut-real");
     let deployment = DeploymentId::new("dep-mut-real");
     let store = MvccStore::new();
@@ -335,7 +359,7 @@ fn module_real_bundle_seed_ian_hits_id_minting_limit() {
     );
     let cell = V8SandboxCell::new(tenant.clone(), deployment.clone(), 8);
 
-    let err = cell
+    let result = cell
         .execute_module_mutation_with_broker(
             &broker,
             "cell-mut-real",
@@ -348,21 +372,34 @@ fn module_real_bundle_seed_ian_hits_id_minting_limit() {
             "seedIan",
             "[{}]",
         )
-        .expect_err("seedIan's mint-me insert must reject");
-    match err {
-        V8CellError::Rejected(msg) => {
-            assert!(
-                msg.contains("not supported yet") && msg.contains("_id"),
-                "expected the id-minting rejection through the real bundle, got {msg:?}"
-            );
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+        .expect("real bundle insert");
+    assert_eq!(result.traps, 1, "id allocation is one broker round trip");
+    assert!(result.consumed_reads.is_empty());
+    assert_eq!(result.write_set.len(), 1);
+    let (id, document) = &result.write_set[0];
+    assert!(id.0.starts_with("messages/"), "minted id: {}", id.0);
+    let document = document.as_ref().expect("insert is a put");
+    let Value::Text(raw) = document.get("_raw").expect("raw Convex document") else {
+        panic!("inserted document must carry _raw JSON");
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).expect("inserted JSON");
+    assert_eq!(value["_id"], id.0);
+    assert_eq!(value["name"], "ian");
+    assert_eq!(value["body"], "hello");
+    assert!(value.get("_creationTime").is_some());
+
+    let Value::Text(output) = result.output else {
+        panic!("invokeMutation output must be encoded text");
+    };
+    let returned: String = serde_json::from_str(&output).expect("returned id");
+    assert_eq!(returned, id.0);
 }
 
 #[test]
 fn module_missing_export_lists_available() {
-    let _v8 = v8_test_guard();
+    if run_v8_test_in_subprocess("module_missing_export_lists_available") {
+        return;
+    }
     // Typo'd export name should produce a typed error that surfaces
     // the actually-available exports, so an operator can spot the
     // mismatch without round-tripping the cell.

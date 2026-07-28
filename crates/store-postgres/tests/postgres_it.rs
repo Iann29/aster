@@ -231,7 +231,11 @@ fn scan_prefix_returns_every_live_doc_with_exhausted_certificate() {
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
 
     let (cert, entries) = store.scan_prefix(&prefix, 100, 200).expect("scan_prefix");
-    assert_eq!(entries.len(), 2, "expected both seeded docs, got {entries:?}");
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected both seeded docs, got {entries:?}"
+    );
     cert.validate().expect("valid certificate");
     assert_eq!(cert.interval, KeyInterval::Prefix(prefix.clone()));
     assert_eq!(cert.direction, ScanDirection::Ascending);
@@ -404,7 +408,9 @@ fn scan_prefix_below_retention_floor_returns_stale() {
         other => panic!("expected Stale below the floor, got {other:?}"),
     }
 
-    let (cert, entries) = store.scan_prefix(&prefix, 100, 200).expect("above-floor scan");
+    let (cert, entries) = store
+        .scan_prefix(&prefix, 100, 200)
+        .expect("above-floor scan");
     cert.validate().expect("valid certificate");
     assert_eq!(entries.len(), 2);
 }
@@ -419,12 +425,17 @@ fn reads_with_absent_or_low_retention_floor_behave_normally() {
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
 
     let value = store.read_point(&key, 50).expect("absent floor read");
-    assert!(value.version.is_none(), "pre-insert snapshot is missing, not Stale");
+    assert!(
+        value.version.is_none(),
+        "pre-insert snapshot is missing, not Stale"
+    );
 
     set_min_document_snapshot_ts(50);
     let value = store.read_point(&key, 100).expect("low-floor read");
     assert_eq!(value.version, Some(100));
-    let (cert, entries) = store.scan_prefix(&prefix, 100, 150).expect("low-floor scan");
+    let (cert, entries) = store
+        .scan_prefix(&prefix, 100, 150)
+        .expect("low-floor scan");
     cert.validate().expect("valid certificate");
     assert_eq!(entries.len(), 1, "ts=150 sees only the first insert");
 }
@@ -461,7 +472,10 @@ fn scan_prefix_rejects_zero_limit() {
     let prefix = format!("{TEST_TABLE_ID_HEX}/");
     match store.scan_prefix(&prefix, 0, 200) {
         Err(StoreError::Backend(msg)) => {
-            assert!(msg.contains("limit"), "message should name the limit: {msg}")
+            assert!(
+                msg.contains("limit"),
+                "message should name the limit: {msg}"
+            )
         }
         other => panic!("limit=0 must be a Backend error, got {other:?}"),
     }

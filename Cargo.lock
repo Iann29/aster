@@ -55,6 +55,7 @@ name = "aster-broker"
 version = "0.2.0"
 dependencies = [
  "aster-capsule",
+ "getrandom 0.4.2",
 ]
 
 [[package]]
@@ -89,12 +90,17 @@ version = "0.3.0"
 dependencies = [
  "aster-broker",
  "aster-capsule",
+ "aster-convex-codec",
  "aster-store-postgres",
  "aster-v8cell",
  "base64",
+ "blake3",
  "getrandom 0.4.2",
+ "libc",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-postgres",
  "zip",
 ]
 
@@ -114,6 +120,7 @@ dependencies = [
  "aster-convex-codec",
  "base64",
  "deadpool-postgres",
+ "getrandom 0.4.2",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

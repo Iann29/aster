@@ -27,6 +27,7 @@ serde_json = "1"
 # Convex stores the bootstrap tablet pointer as base64-url (no pad).
 # Decoder needed to lift those 16 bytes back out.
 base64 = "0.22"
+getrandom = "0.4"
 
 [features]
 # `postgres-it` gates the integration tests in tests/postgres_it.rs.

@@ -3,28 +3,24 @@
 //! Four modes, driven by `bench/run-v07.sh` (which owns process/DB
 //! choreography and writes raw logs to `bench/results/v07/`):
 //!
-//! - `reseal`     — EQ2: per-trap hydrate cost vs. capsule size, over the
-//!                  real UDS wire against a running brokerd. Grows a capsule
-//!                  to n distinct keys (timing the climb = the cumulative
-//!                  curve), then samples repeated hydrates of an
-//!                  already-present key — the capsule size stays exactly n
-//!                  (BTreeMap insert), so each sample is one full
-//!                  verify(n) + read + reseal(n) round trip.
-//! - `fence`      — EQ3: the commit fence in isolation, direct
-//!                  `WritePlane::commit` against real Postgres: blind
-//!                  commits (latency + sustained commits/s), p point-read
-//!                  validations, w window validations over a ~1k-event log,
-//!                  and the conflict-abort cost.
-//! - `fence-seed` — advance a (tenant, deployment) log tip to a target ts
-//!                  with blind commits, so a postgres-mode brokerd whose
-//!                  read snapshot is pinned at the Convex fixture ts can
-//!                  pass the fence's S-SNAPSHOT check (snapshot <= horizon).
-//! - `e2e`        — EQ3/EQ4: the full theorem loop per transaction —
-//!                  InitialCapsule (session mint) → real JS in a V8 isolate
-//!                  (`1.0/get` read trap + `1.0/insert` write) →
-//!                  consumed_reads + write_set → Commit verb over UDS →
-//!                  Postgres fence. Reports the exec/commit split and
-//!                  sustained serial tx/s.
+//! - `reseal` — EQ2: per-trap hydrate cost vs. capsule size over the real
+//!   UDS wire against a running brokerd. Grows a capsule to n distinct keys
+//!   (timing the climb = the cumulative curve), then samples repeated
+//!   hydrates of an already-present key. The capsule size stays exactly n,
+//!   so each sample is one full verify(n) + read + reseal(n) round trip.
+//! - `fence` — EQ3: the commit fence in isolation, direct
+//!   `WritePlane::commit` against real Postgres: blind commits (latency and
+//!   sustained commits/s), p point-read validations, w window validations
+//!   over a roughly 1k-event log, and the conflict-abort cost.
+//! - `fence-seed` — advance a `(tenant, deployment)` log tip to a target
+//!   timestamp with blind commits, so a postgres-mode brokerd whose read
+//!   snapshot is pinned at the Convex fixture timestamp can pass the fence's
+//!   S-SNAPSHOT check (`snapshot <= horizon`).
+//! - `e2e` — EQ3/EQ4: the full theorem loop per transaction:
+//!   InitialCapsule (session mint) → real JS in a V8 isolate (`1.0/get` read
+//!   trap + `1.0/insert` write) → consumed reads + write set → Commit over
+//!   UDS → Postgres fence. Reports the execution/commit split and sustained
+//!   serial transactions per second.
 //!
 //! Every phase prints one `RESULT {json}` line (machine-readable, kept in
 //! the committed raw logs) plus a human summary. Timings are captured with
@@ -345,13 +341,21 @@ fn fence(flags: &Flags) {
     // conflict window (s, h] is empty and the cost is pure fence + append.
     let mut snapshot = 0_u64;
     for i in 0..100 {
-        snapshot = blind_commit(&plane, &tenant, &deployment, epoch, snapshot, &format!("warm/{i:06}"));
+        snapshot = blind_commit(
+            &plane,
+            &tenant,
+            &deployment,
+            epoch,
+            snapshot,
+            &format!("warm/{i:06}"),
+        );
     }
     let mut ns = Vec::with_capacity(blind_n);
     let wall = Instant::now();
     for i in 0..blind_n {
         let key = format!("blind/{i:06}");
-        let (ts, elapsed) = time(|| blind_commit(&plane, &tenant, &deployment, epoch, snapshot, &key));
+        let (ts, elapsed) =
+            time(|| blind_commit(&plane, &tenant, &deployment, epoch, snapshot, &key));
         snapshot = ts;
         ns.push(elapsed);
     }
@@ -534,10 +538,7 @@ fn fence(flags: &Flags) {
         let s = tip;
         tip = blind_commit(&plane, &tenant, &deployment, epoch, s, &key);
         let declared = [DocumentId::new(key)];
-        let writes = [(
-            DocumentId::new(format!("cflw/{i:06}")),
-            Some(bench_doc(1)),
-        )];
+        let writes = [(DocumentId::new(format!("cflw/{i:06}")), Some(bench_doc(1)))];
         let (outcome, elapsed) = time(|| {
             plane
                 .commit(&FenceInput {
@@ -560,10 +561,7 @@ fn fence(flags: &Flags) {
     }
     raw_line("fence-conflict", &ns);
     let stats = Stats::from(ns);
-    println!(
-        "RESULT {{\"phase\":\"fence-conflict\",{}}}",
-        stats.json()
-    );
+    println!("RESULT {{\"phase\":\"fence-conflict\",{}}}", stats.json());
     println!(
         "  conflict-abort: median {:.3} ms  p95 {:.3} ms (N={conflict_n})",
         Stats::ms(stats.median_ns),
@@ -701,7 +699,10 @@ fn e2e(flags: &Flags) {
         rate
     );
     println!("RESULT {{\"phase\":\"e2e-exec\",{}}}", exec_stats.json());
-    println!("RESULT {{\"phase\":\"e2e-commit\",{}}}", commit_stats.json());
+    println!(
+        "RESULT {{\"phase\":\"e2e-commit\",{}}}",
+        commit_stats.json()
+    );
     println!(
         "  e2e tx: median {:.3} ms (exec {:.3} + commit {:.3})  p95 {:.3} ms  sustained {:.1} tx/s (N={samples})",
         Stats::ms(total_stats.median_ns),

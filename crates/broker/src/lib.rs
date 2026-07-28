@@ -17,7 +17,7 @@ pub mod fence;
 pub mod store;
 
 pub use fence::{CommitFence, CommitOutcome, FenceInput, MemoryFence};
-pub use store::{CapsuleStore, StoreError};
+pub use store::{mint_opaque_document_id, CapsuleStore, StoreError};
 
 use aster_capsule::{
     CapsuleSealKey, DeploymentId, DocumentId, SealContext, SealError, SealedCapsule, TenantId,
@@ -106,6 +106,15 @@ pub trait CapsuleBrokerClient {
         prefix: String,
         limit: usize,
     ) -> Result<SealedCapsule, BrokerError>;
+
+    /// Allocate a fresh id for `db.insert` within the active invocation.
+    /// This grants no write by itself; the id reaches storage only through
+    /// the sealed-capsule Commit fence.
+    fn mint_document_id(
+        &self,
+        context: &SealContext,
+        table: &str,
+    ) -> Result<DocumentId, BrokerError>;
 }
 
 /// In-process broker used by the prototype and tests.
@@ -170,6 +179,16 @@ impl<S: CapsuleStore> CapsuleBrokerClient for LocalCapsuleBroker<S> {
         let (certificate, entries) = self.store.scan_prefix(&prefix, limit, capsule.ts)?;
         capsule.hydrate_range(certificate, entries);
         Ok(SealedCapsule::new(capsule, &self.seal_key, context))
+    }
+
+    fn mint_document_id(
+        &self,
+        _context: &SealContext,
+        table: &str,
+    ) -> Result<DocumentId, BrokerError> {
+        self.store
+            .mint_document_id(table)
+            .map_err(BrokerError::from)
     }
 }
 

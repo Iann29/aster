@@ -63,6 +63,13 @@ pub trait CapsuleStore: Send + Sync {
         ts: Timestamp,
     ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError>;
 
+    /// Mint an invocation-local document id for `db.insert`. Production
+    /// backends override this to emit their native id format; the in-memory
+    /// default uses an opaque 128-bit id under the requested table prefix.
+    fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        mint_opaque_document_id(table)
+    }
+
     /// Build the capsule the cell starts with. Default impl loops through
     /// `prewarm` calling `read_point`; the Postgres impl will override with
     /// a single `SELECT WHERE id = ANY($1)` to amortise the round-trip.
@@ -80,6 +87,31 @@ pub trait CapsuleStore: Send + Sync {
         }
         Ok(capsule)
     }
+}
+
+pub fn mint_opaque_document_id(table: &str) -> Result<DocumentId, StoreError> {
+    if table.is_empty()
+        || table.len() > 64
+        || !table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(StoreError::Backend(format!(
+            "invalid Convex table name {table:?}"
+        )));
+    }
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| StoreError::Unavailable(format!("document id entropy: {error}")))?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(table.len() + 33);
+    encoded.push_str(table);
+    encoded.push('/');
+    for byte in random {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(DocumentId::new(encoded))
 }
 
 /// Errors a `CapsuleStore` may surface to the broker.
@@ -215,6 +247,10 @@ impl<S: CapsuleStore + ?Sized> CapsuleStore for Arc<S> {
         ts: Timestamp,
     ) -> Result<(RangeCertificate, Vec<(DocumentId, VersionedDocument)>), StoreError> {
         (**self).scan_prefix(prefix, limit, ts)
+    }
+
+    fn mint_document_id(&self, table: &str) -> Result<DocumentId, StoreError> {
+        (**self).mint_document_id(table)
     }
 
     fn build_capsule(
