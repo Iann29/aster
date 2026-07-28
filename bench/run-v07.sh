@@ -131,8 +131,10 @@ start_broker() { # $1 log file; rest: extra env as KEY=VALUE args
 }
 
 stop_broker() {
-    [[ -n "${BROKER_PID}" ]] && kill "${BROKER_PID}" >/dev/null 2>&1 || true
-    wait "${BROKER_PID}" 2>/dev/null || true
+    if [[ -n "${BROKER_PID}" ]]; then
+        kill "${BROKER_PID}" >/dev/null 2>&1 || true
+        wait "${BROKER_PID}" 2>/dev/null || true
+    fi
     BROKER_PID=""
     rm -f "${SOCK}"
 }
