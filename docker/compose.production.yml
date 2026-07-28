@@ -1,0 +1,126 @@
+name: aster
+
+services:
+  brokerd:
+    image: ${ASTER_BROKER_IMAGE:-aster-brokerd:0.8}
+    user: "${ASTER_RUNTIME_UID:?set ASTER_RUNTIME_UID}:${ASTER_RUNTIME_GID:?set ASTER_RUNTIME_GID}"
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=${ASTER_RUNTIME_UID},gid=${ASTER_RUNTIME_GID}
+    volumes:
+      - ${ASTER_RUNTIME_DIR:?set ASTER_RUNTIME_DIR}:/run/aster
+      - ${ASTER_DB_URL_FILE:?set ASTER_DB_URL_FILE}:/run/secrets/db_url:ro
+      - ${ASTER_SEAL_KEY_FILE:?set ASTER_SEAL_KEY_FILE}:/run/secrets/seal_key:ro
+      - ${ASTER_LAUNCH_KEY_FILE:?set ASTER_LAUNCH_KEY_FILE}:/run/secrets/launch_key:ro
+      - ${ASTER_POLICY_FILE:?set ASTER_POLICY_FILE}:/run/aster-policy/policy.json:ro
+      - ${ASTER_MODULES_DIR:?set ASTER_MODULES_DIR}:/run/aster-modules:ro
+    environment:
+      ASTER_BROKER_SOCK: /run/aster/broker.sock
+      ASTER_TENANT: ${ASTER_TENANT:?set ASTER_TENANT}
+      ASTER_DEPLOYMENT: ${ASTER_DEPLOYMENT:?set ASTER_DEPLOYMENT}
+      ASTER_STORE: postgres
+      ASTER_DB_URL_FILE: /run/secrets/db_url
+      ASTER_DB_SCHEMA: ${ASTER_DB_SCHEMA:-public}
+      ASTER_SEAL_KEY_FILE: /run/secrets/seal_key
+      ASTER_LAUNCH_KEY_FILE: /run/secrets/launch_key
+      ASTER_POLICY_FILE: /run/aster-policy/policy.json
+      ASTER_MODULES_DIR: /run/aster-modules
+      ASTER_AUTHORITY_EPOCH_FILE: /run/aster/authority_epoch
+    networks:
+      - database
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/aster/broker.sock && test -s /run/aster/authority_epoch"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  token-issuer:
+    image: ${ASTER_BROKER_IMAGE:-aster-brokerd:0.8}
+    profiles:
+      - tools
+    entrypoint: /usr/local/bin/aster_launch_token
+    user: "${ASTER_RUNTIME_UID:?set ASTER_RUNTIME_UID}:${ASTER_RUNTIME_GID:?set ASTER_RUNTIME_GID}"
+    read_only: true
+    init: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 16
+    mem_limit: 32m
+    cpus: 0.25
+    volumes:
+      - ${ASTER_RUNTIME_DIR:?set ASTER_RUNTIME_DIR}:/run/aster:ro
+      - ${ASTER_LAUNCH_KEY_FILE:?set ASTER_LAUNCH_KEY_FILE}:/run/secrets/launch_key:ro
+    environment:
+      ASTER_LAUNCH_KEY_FILE: /run/secrets/launch_key
+      ASTER_AUTHORITY_EPOCH_FILE: /run/aster/authority_epoch
+
+  v8cell:
+    image: ${ASTER_CELL_IMAGE:-aster-v8cell:0.8}
+    profiles:
+      - invoke
+    user: "${ASTER_RUNTIME_UID:?set ASTER_RUNTIME_UID}:${ASTER_RUNTIME_GID:?set ASTER_RUNTIME_GID}"
+    read_only: true
+    init: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 256m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 128
+        hard: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=${ASTER_RUNTIME_UID},gid=${ASTER_RUNTIME_GID}
+    volumes:
+      - ${ASTER_RUNTIME_DIR:?set ASTER_RUNTIME_DIR}:/run/aster:ro
+    environment:
+      ASTER_BROKER_SOCK: /run/aster/broker.sock
+      ASTER_TENANT: ${ASTER_TENANT:?set ASTER_TENANT}
+      ASTER_DEPLOYMENT: ${ASTER_DEPLOYMENT:?set ASTER_DEPLOYMENT}
+      ASTER_CELL_ID: ${ASTER_CELL_ID:?set ASTER_CELL_ID}
+      ASTER_LEASE_EPOCH: ${ASTER_LEASE_EPOCH:-0}
+      ASTER_LAUNCH_TOKEN: ${ASTER_LAUNCH_TOKEN:-missing}
+      ASTER_MODULE_PATH: ${ASTER_MODULE_PATH:?set ASTER_MODULE_PATH}
+      ASTER_FUNCTION_NAME: ${ASTER_FUNCTION_NAME:?set ASTER_FUNCTION_NAME}
+      ASTER_ARGS_JSON: ${ASTER_ARGS_JSON:-[]}
+      ASTER_MAX_TRAPS: ${ASTER_MAX_TRAPS:-4096}
+      ASTER_MAX_HEAP_BYTES: ${ASTER_MAX_HEAP_BYTES:-134217728}
+      ASTER_EXECUTION_TIMEOUT_MS: ${ASTER_EXECUTION_TIMEOUT_MS:-25000}
+      ASTER_MAX_RETRIES: ${ASTER_MAX_RETRIES:-3}
+    depends_on:
+      brokerd:
+        condition: service_healthy
+    stop_grace_period: 2s
+
+
+networks:
+  database:
+    external: true
+    name: ${ASTER_DATABASE_NETWORK:?set ASTER_DATABASE_NETWORK}

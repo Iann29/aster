@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+compose_file=${ASTER_COMPOSE_FILE:-"$script_dir/compose.production.yml"}
+
+ASTER_RUNTIME_UID=${ASTER_RUNTIME_UID:-$(id -u)}
+ASTER_RUNTIME_GID=${ASTER_RUNTIME_GID:-$(id -g)}
+export ASTER_RUNTIME_UID ASTER_RUNTIME_GID
+: "${ASTER_TENANT:?set ASTER_TENANT}"
+: "${ASTER_DEPLOYMENT:?set ASTER_DEPLOYMENT}"
+: "${ASTER_MODULE_PATH:?set ASTER_MODULE_PATH}"
+: "${ASTER_FUNCTION_NAME:?set ASTER_FUNCTION_NAME}"
+: "${ASTER_RUNTIME_DIR:?set ASTER_RUNTIME_DIR}"
+
+if [ -z "${ASTER_CELL_ID:-}" ]; then
+  ASTER_CELL_ID="cell-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+ASTER_LAUNCH_TOKEN_TTL=${ASTER_LAUNCH_TOKEN_TTL:-60}
+ASTER_INVOCATION_TIMEOUT_SECONDS=${ASTER_INVOCATION_TIMEOUT_SECONDS:-30}
+export ASTER_CELL_ID
+
+docker compose -f "$compose_file" up -d --wait brokerd
+
+ASTER_LEASE_EPOCH=$(
+  docker compose -f "$compose_file" exec -T brokerd \
+    sh -eu -c 'cat "$ASTER_AUTHORITY_EPOCH_FILE"'
+)
+ASTER_LAUNCH_TOKEN=$(
+  docker compose -f "$compose_file" --profile tools run --rm --no-deps -T \
+    token-issuer "$ASTER_CELL_ID" "$ASTER_TENANT" "$ASTER_DEPLOYMENT" \
+    current "$ASTER_LAUNCH_TOKEN_TTL"
+)
+export ASTER_LEASE_EPOCH ASTER_LAUNCH_TOKEN
+trap 'unset ASTER_LAUNCH_TOKEN' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+timeout --foreground --signal=TERM --kill-after=5s \
+  "${ASTER_INVOCATION_TIMEOUT_SECONDS}s" \
+  docker compose -f "$compose_file" --profile invoke run --rm --no-deps -T v8cell

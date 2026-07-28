@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+state_dir=${1:-.aster}
+umask 077
+mkdir -p "$state_dir/modules" "$state_dir/run"
+chmod 700 "$state_dir/run"
+
+create_key() {
+  path=$1
+  if [ ! -e "$path" ]; then
+    dd if=/dev/urandom of="$path" bs=32 count=1 status=none
+  fi
+  chmod 600 "$path"
+}
+
+create_key "$state_dir/seal.key"
+create_key "$state_dir/launch.key"
+if [ ! -e "$state_dir/policy.json" ]; then
+  cp "$script_dir/policy.production.example.json" "$state_dir/policy.json"
+  chmod 600 "$state_dir/policy.json"
+fi
+if [ ! -e "$state_dir/db_url" ]; then
+  : >"$state_dir/db_url"
+  chmod 600 "$state_dir/db_url"
+fi
+
+absolute_dir=$(CDPATH='' cd -- "$state_dir" && pwd)
+runtime_uid=$(id -u)
+runtime_gid=$(id -g)
+printf '%s\n' \
+  "Initialized $absolute_dir" \
+  "Set the Postgres URL in $absolute_dir/db_url." \
+  "Policy starts deny-all; grant only the required read/write/module prefixes and insert tables." \
+  "Use these environment values:" \
+  "ASTER_DB_URL_FILE=$absolute_dir/db_url" \
+  "ASTER_SEAL_KEY_FILE=$absolute_dir/seal.key" \
+  "ASTER_LAUNCH_KEY_FILE=$absolute_dir/launch.key" \
+  "ASTER_RUNTIME_DIR=$absolute_dir/run" \
+  "ASTER_RUNTIME_UID=$runtime_uid" \
+  "ASTER_RUNTIME_GID=$runtime_gid" \
+  "ASTER_POLICY_FILE=$absolute_dir/policy.json" \
+  "ASTER_MODULES_DIR=$absolute_dir/modules"

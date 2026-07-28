@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "read_prefixes": [],
+  "write_prefixes": [],
+  "module_prefixes": [],
+  "insert_tables": [],
+  "max_reads_per_transaction": 256,
+  "max_writes_per_transaction": 64,
+  "max_scan_limit": 100,
+  "max_concurrent_sessions": 32,
+  "session_ttl_seconds": 120
+}
